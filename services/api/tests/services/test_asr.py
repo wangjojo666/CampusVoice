@@ -214,6 +214,10 @@ def test_model_vad_preserves_start_and_end_inside_one_large_frame(
             self.is_speaking = False
             return [[0, 100]]
 
+    # The core CI profile intentionally excludes the optional multi-gigabyte
+    # Torch dependency.  This unit only verifies boundary aggregation; the
+    # runtime stub ignores the tensor representation.
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(from_numpy=lambda value: value))
     handle = SimpleNamespace(vad_lock=threading.Lock())
     monkeypatch.setattr(asr_adapters, "_get_funasr_model", lambda *args: handle)
     adapter = FunAsrAdapter(
