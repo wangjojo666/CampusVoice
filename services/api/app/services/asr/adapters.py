@@ -87,7 +87,7 @@ class _FunAsrModelHandle:
         device: str,
     ) -> None:
         try:
-            from funasr import AutoModel  # type: ignore[import-untyped]
+            from funasr import AutoModel
         except ImportError as exc:
             raise AsrProviderError(
                 "provider_dependency_missing",
@@ -187,7 +187,7 @@ class FunAsrAdapter:
         )
         if handle.vad_model is not None:
             try:
-                from funasr.models.fsmn_vad_streaming.dynamic_vad import (  # type: ignore[import-untyped]
+                from funasr.models.fsmn_vad_streaming.dynamic_vad import (
                     DynamicStreamingVAD,
                 )
 
@@ -395,7 +395,7 @@ class FunAsrAdapter:
 class _WhisperModelHandle:
     def __init__(self, model_name: str, device: str) -> None:
         try:
-            import whisper  # type: ignore[import-untyped]
+            import whisper
         except ImportError as exc:
             raise AsrProviderError(
                 "provider_dependency_missing",

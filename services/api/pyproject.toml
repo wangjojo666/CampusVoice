@@ -72,3 +72,16 @@ quote-style = "double"
 python_version = "3.11"
 strict = true
 plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = [
+  "funasr",
+  "funasr.*",
+  "sentence_transformers",
+  "sentence_transformers.*",
+  "torch",
+  "torch.*",
+  "whisper",
+  "whisper.*",
+]
+ignore_missing_imports = true
