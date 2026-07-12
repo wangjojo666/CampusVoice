@@ -1,0 +1,48 @@
+# JavaScript
+node_modules/
+.pnpm-store/
+.next/
+out/
+dist/
+coverage/
+playwright-report/
+test-results/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.egg-info/
+.venv/
+
+# Runtime data
+*.db
+*.db-shm
+*.db-wal
+data/runtime/
+services/api/data/runtime/
+data/evaluation/audio/*
+!data/evaluation/audio/.gitkeep
+data/evaluation/results/*
+!data/evaluation/results/.gitkeep
+data/evaluation/generated/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Models and caches
+.cache/
+/models/

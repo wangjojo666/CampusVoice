@@ -1,0 +1,8 @@
+.next
+coverage
+dist
+htmlcov
+node_modules
+.pnpm-store
+pnpm-lock.yaml
+data/evaluation/results
