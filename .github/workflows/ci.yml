@@ -21,6 +21,7 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: pnpm audit --audit-level=high
       - run: pnpm format:check
       - run: pnpm lint
       - run: pnpm typecheck
@@ -32,11 +33,22 @@ jobs:
 
   backend:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:8.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     env:
       CAMPUSVOICE_ENV: test
       CAMPUSVOICE_AUTH_MODE: demo
       CAMPUSVOICE_DATABASE_URL: sqlite+aiosqlite:///./ci.db
       CAMPUSVOICE_DATABASE_AUTO_CREATE: "false"
+      CAMPUSVOICE_TEST_REDIS_URL: redis://127.0.0.1:6379/15
     defaults:
       run:
         working-directory: services/api
@@ -54,10 +66,13 @@ jobs:
       - run: python -m ruff format --check app tests
       - run: python -m mypy app
       - run: python -m alembic upgrade head
+      - run: python -m app.jobs.retention
+      - run: python -m app.jobs.sqlite_backup create ci.db ci-backup.db
+      - run: python -m app.jobs.sqlite_backup verify ci-backup.db
       - run: python -m alembic check
       - run: python -m alembic downgrade base
       - run: python -m alembic upgrade head
-      - run: python -m pytest --cov=app --cov-report=term-missing --cov-report=json:coverage.json
+      - run: python -m pytest --cov=app --cov-fail-under=80 --cov-report=term-missing --cov-report=json:coverage.json
       - run: python scripts/check_critical_coverage.py coverage.json
 
   containers:
@@ -67,11 +82,12 @@ jobs:
       - run: docker compose config --quiet
       - run: docker compose -f docker-compose.yml -f docker-compose.gpu.yml config --quiet
       - run: docker compose -f docker-compose.yml -f docker-compose.smoke.yml config --quiet
+      - run: docker compose -f docker-compose.yml -f docker-compose.multi-worker.yml --profile multi-worker config --quiet
       - run: docker build --file services/api/Dockerfile --tag campusvoice-api:ci .
       - run: docker build --file apps/web/Dockerfile --tag campusvoice-web:ci .
 
   full-stack-smoke:
-    needs: [frontend, backend]
+    needs: [frontend, backend, containers]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -85,3 +101,6 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @campusvoice/web exec playwright install --with-deps chromium
       - run: bash scripts/run-compose-smoke.sh
+        env:
+          CAMPUSVOICE_EXTRA_COMPOSE_FILE: docker-compose.multi-worker.yml
+          COMPOSE_PROFILES: multi-worker

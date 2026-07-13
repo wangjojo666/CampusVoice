@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.core.config import Settings
 from app.core.metrics import InMemoryMetrics
 from app.models.entities import User, UserSettings
-from app.security.authentication import Authenticator, AuthPrincipal
+from app.security.authentication import Authenticator, AuthPrincipal, authenticate_oidc_session
 from app.security.write_challenges import consume_write_challenge
 from app.services.errors import DomainError
 
@@ -50,11 +50,19 @@ def get_authenticator(request: Request) -> Authenticator:
 
 async def current_principal(
     request: Request,
+    session: SessionDependency,
+    settings: SettingsDependency,
     authenticator: Annotated[Authenticator, Depends(get_authenticator)],
     credentials: Annotated[HTTPAuthorizationCredentials | None, Security(_BEARER)],
 ) -> AuthPrincipal:
-    token = credentials.credentials if credentials is not None else None
-    principal = await authenticator.authenticate(token)
+    if settings.auth_mode == "oidc":
+        principal = await authenticate_oidc_session(
+            session,
+            request.cookies.get(settings.oidc_session_cookie_name),
+        )
+    else:
+        token = credentials.credentials if credentials is not None else None
+        principal = await authenticator.authenticate(token)
     request.state.principal = principal
     return principal
 

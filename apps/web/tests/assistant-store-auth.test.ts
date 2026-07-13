@@ -7,7 +7,12 @@ import type {
 } from "@campusvoice/shared-types";
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { getAccessToken, setAccessToken, websocketProtocols } from "@/lib/auth";
+import {
+  getAccessToken,
+  loginRedirectForUnauthorized,
+  setAccessToken,
+  websocketProtocols,
+} from "@/lib/auth";
 import { useAssistantStore } from "@/stores/assistant-store";
 
 const intent: IntentResult = {
@@ -117,5 +122,29 @@ describe("in-memory browser authentication", () => {
       "campusvoice",
       "campusvoice.ticket.one-time-ticket",
     ]);
+  });
+
+  it("redirects OIDC 401 responses without looping on a callback error", () => {
+    expect(
+      loginRedirectForUnauthorized(
+        "https://api.campus.test",
+        "https://app.campus.test/tasks",
+        true,
+      ),
+    ).toBe("https://api.campus.test/api/auth/login");
+    expect(
+      loginRedirectForUnauthorized(
+        "https://api.campus.test",
+        "https://app.campus.test/?auth_error=nonce_mismatch",
+        true,
+      ),
+    ).toBeNull();
+    expect(
+      loginRedirectForUnauthorized(
+        "https://api.campus.test",
+        "https://app.campus.test/tasks",
+        false,
+      ),
+    ).toBeNull();
   });
 });

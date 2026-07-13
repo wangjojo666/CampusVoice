@@ -6,14 +6,18 @@ import {
   FileText,
   Home,
   ListTodo,
+  LogOut,
   Mic2,
   Settings2,
   Waves,
 } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useState, useSyncExternalStore } from "react";
 
 import { HealthStatus } from "@/components/system/health-status";
+import { api, API_BASE_URL } from "@/lib/api-client";
+import { OIDC_ENABLED } from "@/lib/auth";
 
 const navigation = [
   { href: "/", label: "首页", icon: Home },
@@ -28,8 +32,36 @@ function isActive(pathname: string, href: string) {
   return href === "/" ? pathname === "/" : pathname.startsWith(href);
 }
 
-export function AppShell({ children }: Readonly<{ children: React.ReactNode }>) {
+function subscribeToLocation() {
+  return () => undefined;
+}
+
+function currentAuthError() {
+  return new URL(window.location.href).searchParams.get("auth_error");
+}
+
+export function AppShell({
+  children,
+  oidcEnabled = OIDC_ENABLED,
+}: Readonly<{ children: React.ReactNode; oidcEnabled?: boolean }>) {
   const pathname = usePathname();
+  const authError = useSyncExternalStore(subscribeToLocation, currentAuthError, () => null);
+  const [loggingOut, setLoggingOut] = useState(false);
+  const [logoutError, setLogoutError] = useState(false);
+
+  async function logout() {
+    if (loggingOut) return;
+    setLoggingOut(true);
+    setLogoutError(false);
+    try {
+      const result = await api.auth.logout();
+      window.location.assign(result.logout_url);
+    } catch {
+      setLogoutError(true);
+    } finally {
+      setLoggingOut(false);
+    }
+  }
 
   return (
     <div className="min-h-screen lg:grid lg:grid-cols-[264px_minmax(0,1fr)]">
@@ -74,10 +106,25 @@ export function AppShell({ children }: Readonly<{ children: React.ReactNode }>) 
           <div className="flex items-center gap-3 rounded-2xl border border-mist-200 bg-mist-50 p-3">
             <CircleUserRound className="text-teal-600" size={28} />
             <div className="min-w-0">
-              <p className="truncate text-sm font-bold text-ink-800">本地演示用户</p>
-              <p className="truncate text-xs text-ink-400">单用户 · 数据仅存本机</p>
+              <p className="truncate text-sm font-bold text-ink-800">
+                {oidcEnabled ? "校园账户" : "本地演示用户"}
+              </p>
+              <p className="truncate text-xs text-ink-400">
+                {oidcEnabled ? "校园统一身份" : "单用户 · 数据仅存本机"}
+              </p>
             </div>
           </div>
+          {oidcEnabled ? (
+            <button
+              type="button"
+              onClick={() => void logout()}
+              disabled={loggingOut}
+              className="flex w-full items-center justify-center gap-2 rounded-xl border border-mist-200 px-3 py-2 text-sm font-semibold text-ink-600 hover:bg-mist-50"
+            >
+              <LogOut size={16} />
+              {loggingOut ? "正在退出" : "退出登录"}
+            </button>
+          ) : null}
         </div>
       </aside>
 
@@ -89,9 +136,49 @@ export function AppShell({ children }: Readonly<{ children: React.ReactNode }>) 
             </span>
             <span className="font-extrabold tracking-tight">声程</span>
           </Link>
-          <HealthStatus compact />
+          <div className="flex items-center gap-2">
+            <HealthStatus compact />
+            {oidcEnabled ? (
+              <button
+                type="button"
+                aria-label="退出登录"
+                title="退出登录"
+                onClick={() => void logout()}
+                disabled={loggingOut}
+                className="flex size-9 items-center justify-center rounded-xl border border-mist-200 text-ink-500"
+              >
+                <LogOut size={17} />
+              </button>
+            ) : null}
+          </div>
         </header>
         <main className="mx-auto w-full max-w-[1480px] px-4 py-6 pb-28 sm:px-6 lg:px-9 lg:py-9 lg:pb-12">
+          {authError ? (
+            <div
+              role="alert"
+              className="mb-5 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800"
+            >
+              校园登录未完成（{authError}）。若问题持续，请联系管理员。
+              <a className="ml-2 font-bold underline" href={`${API_BASE_URL}/api/auth/login`}>
+                重新登录
+              </a>
+            </div>
+          ) : null}
+          {logoutError ? (
+            <div
+              role="alert"
+              className="mb-5 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800"
+            >
+              退出登录未完成，当前会话仍然有效。请检查网络后重试。
+              <button
+                type="button"
+                className="ml-2 font-bold underline"
+                onClick={() => void logout()}
+              >
+                重试退出
+              </button>
+            </div>
+          ) : null}
           {children}
         </main>
       </div>

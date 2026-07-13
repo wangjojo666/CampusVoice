@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Callable
 
 from fastapi import APIRouter, WebSocket
@@ -12,6 +13,7 @@ from app.services.asr.persistence import SqlAlchemyAsrPersistence
 from app.services.asr.session import handle_asr_websocket
 
 router = APIRouter(tags=["asr"])
+logger = logging.getLogger("campusvoice.asr")
 
 
 @router.websocket("/ws/asr")
@@ -36,8 +38,8 @@ async def asr_websocket(websocket: WebSocket) -> None:
         await websocket.close(code=1008, reason="invalid_or_replayed_ticket")
         return
     registry = websocket.app.state.asr_connections
-    acquired = await registry.acquire(user_id, settings.asr_max_connections_per_user)
-    if not acquired:
+    lease_id = await registry.acquire(user_id, settings.asr_max_connections_per_user)
+    if lease_id is None:
         await websocket.accept(subprotocol="campusvoice")
         await websocket.send_json(
             {
@@ -81,7 +83,12 @@ async def asr_websocket(websocket: WebSocket) -> None:
                 max_audio_seconds=settings.asr_max_audio_seconds,
             )
     finally:
-        await registry.release(user_id)
+        try:
+            await registry.release(user_id, lease_id)
+        except Exception:
+            # Redis leases have a bounded TTL, so cleanup remains fail-closed.
+            # Do not include the user identifier or lease in logs.
+            logger.exception("asr_quota_release_failed")
 
 
 def _settings_hotwords(settings: UserSettings | None) -> tuple[str, ...]:

@@ -3,11 +3,44 @@
 The generated OpenAPI document at `/openapi.json` is the field-level source of truth. This note
 records the behavioral contract that is not fully expressible in JSON Schema.
 
+## Notice version radar and impact migrations
+
+All routes below use the authenticated current user and return `404` for foreign IDs. List endpoints are bounded and all request models forbid unknown fields.
+
+- `POST/GET /api/notice-radar/series` creates or lists explicit notice series.
+- `POST /api/notice-radar/series/{id}/versions` requires a revision number and, after v1, the exact current `supersedes_document_id`. It extracts deterministic claims and idempotently creates a change set.
+- `GET /api/notice-radar/series/{id}/timeline` returns the ordered version chain.
+- `GET /api/notice-radar/documents/{id}/claims` returns raw/normalized values plus chunk and Unicode evidence interval. `POST .../reanalyze` is version-preserving and idempotent.
+- `GET /api/notice-radar/changes/{id}` returns before/after evidence, confidence, severity, and review state. `PATCH /changes/items/{id}/review` resolves uncertain items.
+- `POST /changes/{id}/impacts/detect` and `GET /impacts` detect/list impacts without duplicating rows. Automatic patches require the exact old claim ID or a claim-specific business value that still equals the normalized before value; an old document ID alone never matches. Applicability transitions return `keep`, `cancel`, or `manual_review` plus `requires_manual_review` instead of disappearing.
+- `POST /changes/{id}/migration-preview` freezes entity versions, proposed patches, primary/supporting sources, and stable-sorted calendar conflicts without changing tasks or events. It returns `generation`; an unchanged ready plan may be reused, while rejected/undone/invalidated work requires a later generation.
+- `POST /migrations/{id}/execute` requires `plan_version`, `idempotency_key`, `allow_conflicts`, and `confirmation_stages`. A server challenge binds that exact body. The claimed transaction revalidates review, applicability, entity version, exact old-claim dependency and current conflicts before any write. Conflicts are blocked unless explicitly overridden through two separate UI interactions: issue/advance without mutation, then the final-stage business request.
+- `GET /migrations/{id}` exposes both immutable operation receipts and item-level execute/undo verification. After a response interruption, the client first fetches the latest plan. Only `applied|verification_failed` or `undo_applied|undo_verification_failed` may repeat the corresponding POST with the same plan version and idempotency key; the service opens a fresh database session and resumes only verification. `verified|undone` reads `/receipt?operation=execute|undo`, while `ready` must repeat the normal confirmation flow. The receipt endpoint returns not-found before one exists.
+- `POST /migrations/{id}/undo` requires the same separated two-stage interaction and restores the entire group before re-verifying it.
+
+Stable failures include `version_confirmation_required`, `ambiguous_version_chain`, `change_review_required`, `calendar_conflict`, `calendar_conflicts_changed`, `migration_plan_stale`, `migration_not_executable`, `entity_version_conflict`, `migration_execution_conflict`, `migration_undo_conflict`, `invalid_source_lineage`, and `invalid_write_challenge`. A changed preview condition or mid-bundle exception leaves the group at zero business writes and does not permanently reserve a failed idempotency key.
+
+## Campus OIDC browser session
+
+- `GET /api/auth/login` creates a short-lived flow and redirects to the discovered authorization
+  endpoint with `state`, `nonce`, and an S256 PKCE challenge.
+- `GET /api/auth/callback` consumes the flow, handles bounded provider errors, exchanges the code
+  from the API, validates the ID token and sets an opaque `HttpOnly` session cookie. Access tokens
+  and client secrets are never returned.
+- `GET /api/auth/session` returns the current bounded principal or `401` for missing, revoked, or
+  expired sessions.
+- `POST /api/auth/logout` revokes the local session, clears its cookie and returns the configured or
+  discovered logout URL; it requires an `Origin` from the configured browser allowlist.
+
+All OIDC responses are `no-store`. Production cookies are `Secure`; the supported browser
+deployment is same-site HTTPS behind a reverse proxy.
+
 ## Permission boundary and errors
 
 Every `/api/**` business endpoint resolves `AuthPrincipal` from the configured authenticator.
-Development and tests may explicitly use demo auth. Production accepts Bearer JWT only and verifies
-issuer, audience, JWKS signature, expiry and required claims before mapping issuer/subject to an
+Development and tests may explicitly use demo auth. Production forbids demo. Browser OIDC verifies
+state, PKCE, nonce, issuer, audience, JWKS signature, expiry and required claims before mapping
+issuer/subject to an opaque server-side session; Bearer JWT remains available for API clients.
 internal user ID. Endpoints do not accept `user_id` in a path, query, body or trusted ad-hoc header;
 all repository lookups are constrained by the server-derived current user. Cross-user object access
 uses the same `404` result as a missing object.

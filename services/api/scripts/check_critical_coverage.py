@@ -7,10 +7,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-CRITICAL_FILES = (
-    "app/services/actions/service.py",
-    "app/services/verification/service.py",
-)
+CRITICAL_FILES = {
+    "app/services/actions/service.py": 75.0,
+    "app/services/verification/service.py": 90.0,
+}
 
 
 def _arguments() -> argparse.Namespace:
@@ -22,7 +22,12 @@ def _arguments() -> argparse.Namespace:
         default=Path("coverage.json"),
         help="coverage.py JSON report (default: coverage.json)",
     )
-    parser.add_argument("--minimum", type=float, default=70.0)
+    parser.add_argument(
+        "--minimum",
+        type=float,
+        default=None,
+        help="override every per-file floor (intended only for local diagnostics)",
+    )
     return parser.parse_args()
 
 
@@ -37,7 +42,8 @@ def main() -> int:
     normalised = {_normalise(name): details for name, details in files.items()}
     failed = False
 
-    for target in CRITICAL_FILES:
+    for target, configured_minimum in CRITICAL_FILES.items():
+        minimum = configured_minimum if arguments.minimum is None else float(arguments.minimum)
         matches = [details for name, details in normalised.items() if name.endswith(target)]
         if len(matches) != 1:
             print(f"ERROR {target}: expected one coverage entry, found {len(matches)}")
@@ -51,8 +57,8 @@ def main() -> int:
         if branches == 0:
             print(f"ERROR {target}: branch coverage was not enabled")
             failed = True
-        if percent < arguments.minimum:
-            print(f"ERROR {target}: {percent:.2f}% is below the {arguments.minimum:.2f}% floor")
+        if percent < minimum:
+            print(f"ERROR {target}: {percent:.2f}% is below the {minimum:.2f}% floor")
             failed = True
 
     return 1 if failed else 0

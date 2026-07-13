@@ -1297,6 +1297,8 @@ def _task_business_fields(snapshot: dict[str, Any]) -> dict[str, Any]:
         "status",
         "source_type",
         "source_document_id",
+        "source_chunk_id",
+        "source_claim_id",
     }
     return {key: snapshot.get(key) for key in keys}
 
@@ -1313,6 +1315,8 @@ def _event_business_fields(snapshot: dict[str, Any]) -> dict[str, Any]:
         "reminder_minutes",
         "source_type",
         "source_document_id",
+        "source_chunk_id",
+        "source_claim_id",
     }
     return {key: snapshot.get(key) for key in keys}
 

@@ -43,6 +43,6 @@ deletes need two visible user interactions; an API helper must not silently comp
   campus identity provider remains responsible for MFA, token lifetime and revocation.
 - Process restarts invalidate unpersisted development confirmation secrets. Production must inject
   a stable secret through its secret manager, never through source control.
-- The current frontend exposes an in-memory token setter as an integration seam. A future campus
-  OIDC authorization-code + PKCE flow should populate that seam without introducing localStorage
-  token persistence.
+- The v0.3 browser flow is superseded by ADR 0004: the API performs Authorization Code + PKCE and
+  returns only an opaque `HttpOnly` session cookie. The in-memory bearer setter remains solely for
+  JWT-mode integration and is never populated by the OIDC flow.

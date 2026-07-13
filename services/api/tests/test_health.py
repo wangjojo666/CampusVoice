@@ -2,8 +2,10 @@ import sqlite3
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy.engine import make_url
 
+from app import __version__ as package_version
 from app.services.health import expected_alembic_heads
 
 
@@ -35,8 +37,9 @@ def test_liveness_is_process_only_and_returns_request_id(client: TestClient) -> 
     assert response.json() == {
         "status": "ok",
         "service": "CampusVoice API",
-        "version": "0.2.0",
+        "version": "0.3.0",
     }
+    assert package_version == response.json()["version"]
 
 
 def test_readiness_rejects_database_without_alembic_revision(client: TestClient) -> None:
@@ -76,4 +79,30 @@ def test_readiness_rejects_stale_alembic_revision(client: TestClient) -> None:
     assert response.json()["checks"]["migrations"] == {
         "status": "error",
         "message": "Database migration revision does not match the application head",
+    }
+
+
+def test_readiness_rejects_unreachable_shared_asr_quota(client: TestClient) -> None:
+    class _UnavailableQuota:
+        async def health_check(self) -> bool:
+            return False
+
+        async def close(self) -> None:
+            return None
+
+    _stamp_revisions(client, expected_alembic_heads())
+    client.app.state.settings = client.app.state.settings.model_copy(
+        update={
+            "asr_quota_backend": "redis",
+            "asr_redis_url": SecretStr("redis://redis:6379/0"),
+        }
+    )
+    client.app.state.asr_connections = _UnavailableQuota()
+
+    response = client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json()["checks"]["asr_quota"] == {
+        "status": "error",
+        "message": "Redis ASR quota backend is unreachable",
     }

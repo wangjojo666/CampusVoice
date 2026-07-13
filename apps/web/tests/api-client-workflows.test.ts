@@ -72,12 +72,321 @@ const settings: UserSettings = {
 describe("authenticated API workflows", () => {
   beforeEach(() => {
     vi.stubGlobal("fetch", vi.fn());
+    window.sessionStorage.clear();
     setAccessToken(null);
   });
 
   afterEach(() => {
+    window.sessionStorage.clear();
     setAccessToken(null);
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
+  });
+
+  it("reuses a plan-bound migration idempotency key after a lost response", async () => {
+    const plan = {
+      id: "mpl-retry",
+      change_set_id: "ncs-retry",
+      status: "ready",
+      risk_level: "low" as const,
+      required_confirmations: 1 as const,
+      conflicts: [],
+      items: [],
+      verification: {},
+      execute_receipt: {},
+      undo_receipt: {},
+      generation: 1,
+      version: 1,
+      executed_at: null,
+      undone_at: null,
+    };
+    const receipt = {
+      plan_id: plan.id,
+      status: "verified",
+      operation: "execute",
+      verified_count: 1,
+      total_count: 1,
+      all_verified: true,
+      items: [],
+      verified_at: "2026-07-13T01:00:00Z",
+    };
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(
+        jsonResponse({
+          challenge: "challenge-one",
+          stage: 1,
+          required_stages: 1,
+          expires_at: "2026-07-13T01:05:00Z",
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(receipt))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          challenge: "challenge-two",
+          stage: 1,
+          required_stages: 1,
+          expires_at: "2026-07-13T01:05:00Z",
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(receipt));
+
+    await api.radar.execute(plan, false);
+    await api.radar.execute(plan, false);
+
+    const first = JSON.parse(String(vi.mocked(fetch).mock.calls[1]?.[1]?.body));
+    const retried = JSON.parse(String(vi.mocked(fetch).mock.calls[3]?.[1]?.body));
+    expect(first.idempotency_key).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(retried.idempotency_key).toBe(first.idempotency_key);
+    expect(window.sessionStorage.getItem(`campusvoice:migration:execute:${plan.id}`)).toBe(
+      first.idempotency_key,
+    );
+  });
+
+  it("never auto-advances an initial high-risk migration write", async () => {
+    const plan = {
+      id: "mpl-high-risk-refused",
+      change_set_id: "ncs-high-risk-refused",
+      status: "ready",
+      risk_level: "high" as const,
+      required_confirmations: 2 as const,
+      conflicts: [],
+      items: [],
+      verification: {},
+      execute_receipt: {},
+      undo_receipt: {},
+      generation: 1,
+      version: 1,
+      executed_at: null,
+      undone_at: null,
+    };
+    vi.mocked(fetch).mockResolvedValueOnce(
+      jsonResponse({
+        challenge: "stage-one-only",
+        stage: 1,
+        required_stages: 2,
+        expires_at: "2026-07-13T01:05:00Z",
+      }),
+    );
+
+    await expect(api.radar.execute(plan, false)).rejects.toMatchObject({ status: 409 });
+    await expect(api.radar.resumeExecute(plan, false)).rejects.toMatchObject({ status: 409 });
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(String(vi.mocked(fetch).mock.calls[0]?.[0])).toContain("/api/auth/write-challenges");
+  });
+
+  it("separates high-risk challenge preparation from the business write", async () => {
+    const plan = {
+      id: "mpl-high-risk",
+      change_set_id: "ncs-high-risk",
+      status: "ready",
+      risk_level: "high" as const,
+      required_confirmations: 2 as const,
+      conflicts: [],
+      items: [],
+      verification: {},
+      execute_receipt: {},
+      undo_receipt: {},
+      generation: 1,
+      version: 1,
+      executed_at: null,
+      undone_at: null,
+    };
+    const receipt = {
+      plan_id: plan.id,
+      status: "verified",
+      operation: "execute",
+      verified_count: 0,
+      total_count: 0,
+      all_verified: true,
+      items: [],
+      verified_at: "2026-07-13T01:00:00Z",
+    };
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(
+        jsonResponse({
+          challenge: "execute-stage-one",
+          stage: 1,
+          required_stages: 2,
+          expires_at: "2026-07-13T01:05:00Z",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          challenge: "execute-stage-two",
+          stage: 2,
+          required_stages: 2,
+          expires_at: "2026-07-13T01:05:00Z",
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(receipt));
+
+    const prepared = await api.radar.beginExecute(plan, true);
+
+    expect(prepared.challenge).toBe("execute-stage-two");
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(
+      vi
+        .mocked(fetch)
+        .mock.calls.some(([url]) =>
+          String(url).includes(`/api/notice-radar/migrations/${plan.id}/execute`),
+        ),
+    ).toBe(false);
+
+    await api.radar.finishExecute(plan, true, prepared.challenge);
+
+    expect(fetch).toHaveBeenCalledTimes(3);
+    const [writeUrl, writeOptions] = vi.mocked(fetch).mock.calls[2] ?? [];
+    expect(String(writeUrl)).toContain(`/api/notice-radar/migrations/${plan.id}/execute`);
+    expect(new Headers(writeOptions?.headers).get("X-Write-Challenge")).toBe("execute-stage-two");
+    const issueBody = JSON.parse(String(vi.mocked(fetch).mock.calls[0]?.[1]?.body));
+    const writeBody = JSON.parse(String(writeOptions?.body));
+    expect(writeBody).toEqual(issueBody.body);
+    expect(writeBody.confirmation_stages).toBe(2);
+  });
+
+  it("keeps the two-stage payload stable when session storage is blocked", async () => {
+    const plan = {
+      id: "mpl-storage-blocked",
+      change_set_id: "ncs-storage-blocked",
+      status: "ready",
+      risk_level: "high" as const,
+      required_confirmations: 2 as const,
+      conflicts: [],
+      items: [],
+      verification: {},
+      execute_receipt: {},
+      undo_receipt: {},
+      generation: 1,
+      version: 1,
+      executed_at: null,
+      undone_at: null,
+    };
+    vi.spyOn(window.sessionStorage, "getItem")
+      .mockImplementationOnce(() => {
+        throw new DOMException("Storage access denied", "SecurityError");
+      })
+      .mockImplementationOnce(() => null)
+      .mockImplementation(() => {
+        throw new DOMException("Storage access denied", "SecurityError");
+      });
+    vi.spyOn(window.sessionStorage, "setItem").mockImplementation(() => {
+      throw new DOMException("Storage access denied", "SecurityError");
+    });
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(
+        jsonResponse({
+          challenge: "blocked-storage-stage-one",
+          stage: 1,
+          required_stages: 2,
+          expires_at: "2026-07-13T01:05:00Z",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          challenge: "blocked-storage-stage-two",
+          stage: 2,
+          required_stages: 2,
+          expires_at: "2026-07-13T01:05:00Z",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          plan_id: plan.id,
+          status: "verified",
+          operation: "execute",
+          verified_count: 0,
+          total_count: 0,
+          all_verified: true,
+          items: [],
+          verified_at: "2026-07-13T01:00:00Z",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          challenge: "blocked-storage-retry-one",
+          stage: 1,
+          required_stages: 2,
+          expires_at: "2026-07-13T01:05:00Z",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          challenge: "blocked-storage-retry-two",
+          stage: 2,
+          required_stages: 2,
+          expires_at: "2026-07-13T01:05:00Z",
+        }),
+      );
+
+    const prepared = await api.radar.beginExecute(plan, true);
+    await api.radar.finishExecute(plan, true, prepared.challenge);
+    await api.radar.beginExecute(plan, true);
+
+    const firstIssueBody = JSON.parse(String(vi.mocked(fetch).mock.calls[0]?.[1]?.body)).body;
+    const writeBody = JSON.parse(String(vi.mocked(fetch).mock.calls[2]?.[1]?.body));
+    const retryIssueBody = JSON.parse(String(vi.mocked(fetch).mock.calls[3]?.[1]?.body)).body;
+    expect(firstIssueBody.idempotency_key).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(writeBody.idempotency_key).toBe(firstIssueBody.idempotency_key);
+    expect(retryIssueBody.idempotency_key).toBe(firstIssueBody.idempotency_key);
+  });
+
+  it("auto-rebuilds two-stage challenges only for an already applied verification recovery", async () => {
+    const plan = {
+      id: "mpl-applied-recovery",
+      change_set_id: "ncs-applied-recovery",
+      status: "applied",
+      risk_level: "high" as const,
+      required_confirmations: 2 as const,
+      conflicts: [],
+      items: [],
+      verification: {},
+      execute_receipt: {},
+      undo_receipt: {},
+      generation: 1,
+      version: 2,
+      executed_at: "2026-07-13T01:00:00Z",
+      undone_at: null,
+    };
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(
+        jsonResponse({
+          challenge: "recovery-stage-one",
+          stage: 1,
+          required_stages: 2,
+          expires_at: "2026-07-13T01:05:00Z",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          challenge: "recovery-stage-two",
+          stage: 2,
+          required_stages: 2,
+          expires_at: "2026-07-13T01:05:00Z",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          plan_id: plan.id,
+          status: "verified",
+          operation: "execute",
+          verified_count: 0,
+          total_count: 0,
+          all_verified: true,
+          items: [],
+          verified_at: "2026-07-13T01:01:00Z",
+        }),
+      );
+
+    await api.radar.resumeExecute(plan, false);
+
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(String(vi.mocked(fetch).mock.calls[1]?.[0])).toContain(
+      "/api/auth/write-challenges/advance",
+    );
+    expect(new Headers(vi.mocked(fetch).mock.calls[2]?.[1]?.headers).get("X-Write-Challenge")).toBe(
+      "recovery-stage-two",
+    );
   });
 
   it("exchanges the bearer token for a one-time WebSocket ticket without URL leakage", async () => {

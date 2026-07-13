@@ -54,7 +54,7 @@ def _token_hash(challenge: str) -> str:
     return hashlib.sha256(challenge.encode()).hexdigest()
 
 
-def _required_stages(method: str, path: str, api_prefix: str) -> int:
+def _required_stages(method: str, path: str, api_prefix: str, body: Any) -> int:
     prefix = api_prefix.rstrip("/")
     if not path.startswith("/") or "?" in path or "#" in path:
         raise _unsupported_write()
@@ -84,6 +84,28 @@ def _required_stages(method: str, path: str, api_prefix: str) -> int:
         and _RESOURCE_SEGMENT.fullmatch(parts[1])
     ):
         return 2
+    if parts[:1] == ["notice-radar"]:
+        if (
+            method == "POST"
+            and len(parts) == 4
+            and parts[1] == "migrations"
+            and parts[3] == "execute"
+            and _RESOURCE_SEGMENT.fullmatch(parts[2])
+        ):
+            requested = body.get("confirmation_stages") if isinstance(body, dict) else None
+            if requested in {1, 2}:
+                return int(requested)
+            raise _unsupported_write()
+        if (
+            method == "POST"
+            and len(parts) == 4
+            and parts[1] == "migrations"
+            and parts[3] == "undo"
+            and _RESOURCE_SEGMENT.fullmatch(parts[2])
+        ):
+            return 2
+        if method in {"POST", "PATCH"}:
+            return 1
     raise _unsupported_write()
 
 
@@ -107,7 +129,7 @@ def _binding(
         method=normalized_method,
         path=path,
         body_hash=canonical_body_hash(body),
-        required_stages=_required_stages(normalized_method, path, api_prefix),
+        required_stages=_required_stages(normalized_method, path, api_prefix, body),
     )
 
 

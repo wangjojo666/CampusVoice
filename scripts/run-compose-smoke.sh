@@ -4,7 +4,15 @@ set -Eeuo pipefail
 readonly project_name="${CAMPUSVOICE_SMOKE_PROJECT:-campusvoice-smoke}"
 readonly compose_file="${CAMPUSVOICE_COMPOSE_FILE:-docker-compose.yml}"
 readonly smoke_file="${CAMPUSVOICE_SMOKE_COMPOSE_FILE:-docker-compose.smoke.yml}"
+readonly extra_compose_file="${CAMPUSVOICE_EXTRA_COMPOSE_FILE:-docker-compose.multi-worker.yml}"
+readonly compose_profile="${CAMPUSVOICE_SMOKE_PROFILE:-multi-worker}"
 compose=(docker compose --project-name "${project_name}" --file "${compose_file}" --file "${smoke_file}")
+if [[ -n "${extra_compose_file}" ]]; then
+  compose+=(--file "${extra_compose_file}")
+fi
+if [[ -n "${compose_profile}" ]]; then
+  compose+=(--profile "${compose_profile}")
+fi
 
 cleanup() {
   local exit_code=$?

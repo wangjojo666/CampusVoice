@@ -39,7 +39,11 @@ async def ready(
     response: Response,
     settings: SettingsDependency,
 ) -> ReadinessResponse:
-    report = await readiness_report(request.app.state.database_engine, settings)
+    report = await readiness_report(
+        request.app.state.database_engine,
+        settings,
+        request.app.state.asr_connections,
+    )
     if report.status == "error":
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     return report

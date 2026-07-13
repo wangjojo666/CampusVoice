@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.config import Settings
 from app.schemas.health import HealthCheck, ReadinessResponse
+from app.services.asr.connections import AsrQuotaRegistry
 
 _API_ROOT = Path(__file__).resolve().parents[2]
 
@@ -68,8 +69,29 @@ def _configured_component_checks(settings: Settings) -> dict[str, HealthCheck]:
     return {"asr": asr, "retriever": retriever, "llm": llm}
 
 
-async def readiness_report(engine: AsyncEngine, settings: Settings) -> ReadinessResponse:
+async def readiness_report(
+    engine: AsyncEngine,
+    settings: Settings,
+    quota_registry: AsrQuotaRegistry | None = None,
+) -> ReadinessResponse:
     checks = _configured_component_checks(settings)
+    if settings.asr_quota_backend == "redis":
+        try:
+            quota_healthy = quota_registry is not None and await quota_registry.health_check()
+        except Exception:
+            quota_healthy = False
+        checks["asr_quota"] = HealthCheck(
+            status="ok" if quota_healthy else "error",
+            message=(
+                "Redis ASR quota backend is reachable"
+                if quota_healthy
+                else "Redis ASR quota backend is unreachable"
+            ),
+        )
+    else:
+        checks["asr_quota"] = HealthCheck(
+            status="ok", message="Single-worker local ASR quota backend is configured"
+        )
     try:
         async with engine.connect() as connection:
             await connection.execute(text("SELECT 1"))

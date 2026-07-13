@@ -24,7 +24,7 @@ import type {
 } from "@campusvoice/shared-types";
 
 import { mergeContextHotwords } from "@/lib/asr/context-hotwords";
-import { getAccessToken } from "@/lib/auth";
+import { getAccessToken, handleUnauthorized } from "@/lib/auth";
 
 interface WirePendingAction {
   id: string;
@@ -119,6 +119,185 @@ interface WriteChallenge {
   expires_at: string;
 }
 
+export interface RadarCard {
+  card_type: "new_notice" | "version_change" | "upcoming_deadline" | "needs_review";
+  change_set_id: string | null;
+  series_id: string;
+  document_id: string | null;
+  title: string;
+  from_revision: number;
+  to_revision: number;
+  change_count: number;
+  affected_tasks: number;
+  affected_events: number;
+  needs_review: boolean;
+  message: string;
+  deadline_at: string | null;
+  applicability: "applicable" | "not_applicable" | "needs_review";
+  applicability_reason: string | null;
+  created_at: string;
+}
+
+export interface NoticeSeries {
+  id: string;
+  canonical_key: string;
+  normalized_title: string;
+  department: string | null;
+  source_key: string | null;
+  version_count: number;
+  current_document_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NoticeClaim {
+  id: string;
+  document_id: string;
+  chunk_id: string;
+  claim_key: string;
+  claim_type: string;
+  value: Record<string, unknown>;
+  normalized_value: Record<string, unknown>;
+  audience_rule: Record<string, unknown>;
+  confidence: number;
+  evidence_text: string;
+  evidence_start: number;
+  evidence_end: number;
+  extractor_version: string;
+  review_state: string;
+}
+
+export interface NoticeVersion {
+  id: string;
+  series_id: string;
+  supersedes_document_id: string | null;
+  revision_number: number;
+  title: string;
+  version_label: string;
+  effective_at: string | null;
+  publish_date: string | null;
+  is_current: boolean;
+  ingest_source: string;
+  claims: NoticeClaim[];
+  created_at: string;
+}
+
+export interface NoticeTimeline {
+  series: NoticeSeries;
+  versions: NoticeVersion[];
+}
+
+export interface NoticeSeriesCreate {
+  canonical_key: string;
+  title: string;
+  department?: string | null;
+  source_key?: string | null;
+}
+
+export interface NoticeVersionCreate {
+  title: string;
+  content: string;
+  revision_number: number;
+  version_label: string;
+  supersedes_document_id: string | null;
+  department?: string | null;
+  publish_date?: string | null;
+  effective_at?: string | null;
+  applicable_group?: string | null;
+  source_url?: string | null;
+  ingest_source: "manual" | "seed" | "upload" | "api";
+}
+
+export interface ChangeEvidence {
+  claim_id: string;
+  document_id: string;
+  chunk_id: string;
+  value: Record<string, unknown>;
+  normalized_value: Record<string, unknown>;
+  evidence_text: string;
+  evidence_start: number;
+  evidence_end: number;
+}
+
+export interface NoticeChangeItem {
+  id: string;
+  claim_key: string;
+  change_type: "added" | "removed" | "changed";
+  severity: "low" | "medium" | "high";
+  confidence: number;
+  review_state: string;
+  before: ChangeEvidence | null;
+  after: ChangeEvidence | null;
+}
+
+export interface NoticeChangeSet {
+  id: string;
+  series_id: string;
+  from_document_id: string;
+  to_document_id: string;
+  algorithm_version: string;
+  status: string;
+  items: NoticeChangeItem[];
+  created_at: string;
+}
+
+export interface ImpactCase {
+  id: string;
+  change_item_id: string;
+  entity_type: "task" | "event";
+  entity_id: string;
+  entity_version: number;
+  reason: string;
+  severity: string;
+  current_snapshot: Record<string, unknown>;
+  proposed_patch: Record<string, unknown>;
+  recommended_action: "apply" | "keep" | "cancel" | "manual_review";
+  requires_manual_review: boolean;
+  status: string;
+  migration_plan_id: string | null;
+}
+
+export interface MigrationItem {
+  id: string;
+  entity_type: "task" | "event";
+  entity_id: string;
+  expected_version: number;
+  before: Record<string, unknown>;
+  after: Record<string, unknown>;
+  source_claim_ids: string[];
+  verification: Record<string, unknown>;
+  execute_verification: Record<string, unknown>;
+  undo_verification: Record<string, unknown>;
+}
+
+export interface MigrationPlan {
+  id: string;
+  change_set_id: string;
+  status: string;
+  risk_level: "low" | "medium" | "high";
+  required_confirmations: 1 | 2;
+  conflicts: Array<Record<string, unknown>>;
+  items: MigrationItem[];
+  verification: Record<string, unknown>;
+  execute_receipt: Record<string, unknown>;
+  undo_receipt: Record<string, unknown>;
+  generation: number;
+  version: number;
+  executed_at: string | null;
+  undone_at: string | null;
+}
+
+export interface MigrationReceipt {
+  plan_id: string;
+  status: string;
+  operation: "execute" | "undo";
+  verified_count: number;
+  total_count: number;
+  all_verified: boolean;
+  items: MigrationItem[];
+  verified_at: string;
+}
+
 const configuredBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "");
 export const API_BASE_URL = configuredBaseUrl || "http://localhost:8000";
 
@@ -197,6 +376,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   try {
     const response = await fetch(`${API_BASE_URL}${path}`, {
       ...options,
+      credentials: options.credentials ?? "include",
       headers,
       signal: options.signal ?? controller.signal,
     });
@@ -209,6 +389,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
           : await response.text();
 
     if (!response.ok) {
+      if (response.status === 401) handleUnauthorized(API_BASE_URL);
       const errorBody =
         payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
       const nested = nestedErrorDetail(errorBody);
@@ -269,6 +450,38 @@ function idempotencyHeaders(): HeadersInit {
   return { "Idempotency-Key": crypto.randomUUID() };
 }
 
+const migrationIdempotencyFallback = new Map<string, string>();
+
+function migrationIdempotencyKey(operation: "execute" | "undo", planId: string): string {
+  const storageKey = `campusvoice:migration:${operation}:${planId}`;
+  try {
+    if (typeof window !== "undefined") {
+      const existing = window.sessionStorage.getItem(storageKey);
+      if (existing) {
+        migrationIdempotencyFallback.set(storageKey, existing);
+        return existing;
+      }
+      const fallback = migrationIdempotencyFallback.get(storageKey);
+      if (fallback) {
+        window.sessionStorage.setItem(storageKey, fallback);
+        return fallback;
+      }
+      const generated = crypto.randomUUID();
+      migrationIdempotencyFallback.set(storageKey, generated);
+      window.sessionStorage.setItem(storageKey, generated);
+      return generated;
+    }
+  } catch {
+    // Some privacy modes expose sessionStorage but reject access. Keep the key
+    // stable in this module so separated confirmation clicks bind one payload.
+  }
+  const existing = migrationIdempotencyFallback.get(storageKey);
+  if (existing) return existing;
+  const generated = crypto.randomUUID();
+  migrationIdempotencyFallback.set(storageKey, generated);
+  return generated;
+}
+
 async function issueWriteChallenge(
   method: "POST" | "PATCH" | "DELETE",
   path: string,
@@ -300,6 +513,108 @@ async function confirmedJsonRequest<T>(
     headers: confirmedHeaders,
     ...jsonBody(body),
   });
+}
+
+async function challengedJsonRequest<T>(
+  method: "POST" | "PATCH",
+  path: string,
+  body: unknown,
+): Promise<T> {
+  const issued = await issueWriteChallenge(method, path, body);
+  if (issued.stage !== 1 || issued.required_stages !== 1) {
+    throw new ApiError("写入确认阶段不完整，操作未执行。", { status: 409, details: issued });
+  }
+  return request<T>(path, {
+    method,
+    headers: { "X-Write-Challenge": issued.challenge },
+    ...jsonBody(body),
+  });
+}
+
+/**
+ * Resume database verification after the business transaction was already
+ * committed. This may rebuild a two-stage challenge automatically because the
+ * idempotency key can only return/repair the existing receipt; it cannot apply
+ * the migration a second time. Initial high-risk writes must use begin/finish.
+ */
+async function recoveryJsonRequest<T>(
+  method: "POST" | "PATCH",
+  path: string,
+  body: unknown,
+): Promise<T> {
+  let issued = await issueWriteChallenge(method, path, body);
+  if (issued.required_stages === 2) {
+    issued = await request<WriteChallenge>("/api/auth/write-challenges/advance", {
+      method: "POST",
+      ...jsonBody({ challenge: issued.challenge }),
+    });
+  }
+  if (issued.stage !== issued.required_stages) {
+    throw new ApiError("恢复验证的写入确认阶段不完整，操作未执行。", {
+      status: 409,
+      details: issued,
+    });
+  }
+  return request<T>(path, {
+    method,
+    headers: { "X-Write-Challenge": issued.challenge },
+    ...jsonBody(body),
+  });
+}
+
+async function beginTwoStageWrite(
+  method: "POST" | "PATCH" | "DELETE",
+  path: string,
+  body: unknown,
+): Promise<WriteChallenge> {
+  const first = await issueWriteChallenge(method, path, body);
+  if (first.stage !== 1 || first.required_stages !== 2) {
+    throw new ApiError("高风险操作未获得两阶段确认，操作未执行。", {
+      status: 409,
+      details: first,
+    });
+  }
+  const second = await request<WriteChallenge>("/api/auth/write-challenges/advance", {
+    method: "POST",
+    ...jsonBody({ challenge: first.challenge }),
+  });
+  if (second.stage !== 2 || second.required_stages !== 2) {
+    throw new ApiError("高风险操作的第二阶段确认无效，操作未执行。", {
+      status: 409,
+      details: second,
+    });
+  }
+  return second;
+}
+
+function finishTwoStageWrite<T>(
+  method: "POST" | "PATCH" | "DELETE",
+  path: string,
+  body: unknown,
+  challenge: string,
+): Promise<T> {
+  return request<T>(path, {
+    method,
+    headers: { "X-Write-Challenge": challenge },
+    ...jsonBody(body),
+  });
+}
+
+function migrationExecuteBody(plan: MigrationPlan, allowConflicts: boolean) {
+  return {
+    plan_version: plan.version,
+    idempotency_key: migrationIdempotencyKey("execute", plan.id),
+    allow_conflicts: allowConflicts,
+    confirmation_stages: plan.required_confirmations,
+  };
+}
+
+function migrationUndoBody(plan: MigrationPlan) {
+  return {
+    plan_version: plan.version,
+    idempotency_key: migrationIdempotencyKey("undo", plan.id),
+    confirmation_stages: 2 as const,
+  };
 }
 
 function normalizePendingAction(action: WirePendingAction): PendingAction {
@@ -404,11 +719,119 @@ async function prepareDestructive(
 
 export const api = {
   auth: {
+    session: () =>
+      request<{
+        authenticated: boolean;
+        user_id: string;
+        display_name: string;
+        roles: string[];
+        expires_at: string | null;
+      }>("/api/auth/session"),
+    logout: () => request<{ logout_url: string }>("/api/auth/logout", { method: "POST" }),
     websocketTicket: () =>
       request<{ ticket: string; expires_at: string }>("/api/auth/ws-ticket", { method: "POST" }),
   },
 
   health: () => request<HealthResponse>("/api/health", { timeoutMs: 5_000 }),
+
+  radar: {
+    list: (limit = 20) =>
+      request<{ items: RadarCard[]; total: number }>(`/api/notice-radar${asQuery({ limit })}`),
+    series: (limit = 100, offset = 0) =>
+      request<NoticeSeries[]>(`/api/notice-radar/series${asQuery({ limit, offset })}`),
+    createSeries: (body: NoticeSeriesCreate) =>
+      challengedJsonRequest<NoticeSeries>("POST", "/api/notice-radar/series", body),
+    timeline: (seriesId: string) =>
+      request<NoticeTimeline>(`/api/notice-radar/series/${encodeURIComponent(seriesId)}/timeline`),
+    addVersion: (seriesId: string, body: NoticeVersionCreate) =>
+      challengedJsonRequest<NoticeVersion>(
+        "POST",
+        `/api/notice-radar/series/${encodeURIComponent(seriesId)}/versions`,
+        body,
+      ),
+    changeSet: (id: string) =>
+      request<NoticeChangeSet>(`/api/notice-radar/changes/${encodeURIComponent(id)}`),
+    reviewChange: (itemId: string, decision: "approved" | "rejected") => {
+      const path = `/api/notice-radar/changes/items/${encodeURIComponent(itemId)}/review`;
+      return challengedJsonRequest<NoticeChangeItem>("PATCH", path, { decision });
+    },
+    impacts: (changeSetId: string, status?: "open" | "resolved" | "dismissed") =>
+      request<{ items: ImpactCase[]; total: number }>(
+        `/api/notice-radar/impacts${asQuery({ change_set_id: changeSetId, status })}`,
+      ),
+    detectImpacts: (changeSetId: string) => {
+      const path = `/api/notice-radar/changes/${encodeURIComponent(changeSetId)}/impacts/detect`;
+      return challengedJsonRequest<{ items: ImpactCase[]; total: number }>("POST", path, null);
+    },
+    preview: (changeSetId: string) => {
+      const path = `/api/notice-radar/changes/${encodeURIComponent(changeSetId)}/migration-preview`;
+      return challengedJsonRequest<MigrationPlan>("POST", path, null);
+    },
+    plan: (planId: string) =>
+      request<MigrationPlan>(`/api/notice-radar/migrations/${encodeURIComponent(planId)}`),
+    execute: (plan: MigrationPlan, allowConflicts: boolean) => {
+      const path = `/api/notice-radar/migrations/${encodeURIComponent(plan.id)}/execute`;
+      return challengedJsonRequest<MigrationReceipt>(
+        "POST",
+        path,
+        migrationExecuteBody(plan, allowConflicts),
+      );
+    },
+    beginExecute: (plan: MigrationPlan, allowConflicts: boolean) => {
+      const path = `/api/notice-radar/migrations/${encodeURIComponent(plan.id)}/execute`;
+      return beginTwoStageWrite("POST", path, migrationExecuteBody(plan, allowConflicts));
+    },
+    finishExecute: (plan: MigrationPlan, allowConflicts: boolean, challenge: string) => {
+      const path = `/api/notice-radar/migrations/${encodeURIComponent(plan.id)}/execute`;
+      return finishTwoStageWrite<MigrationReceipt>(
+        "POST",
+        path,
+        migrationExecuteBody(plan, allowConflicts),
+        challenge,
+      );
+    },
+    resumeExecute: async (plan: MigrationPlan, allowConflicts: boolean) => {
+      if (!["applied", "verification_failed"].includes(plan.status)) {
+        throw new ApiError("迁移尚未进入可恢复的执行后验证状态。", {
+          status: 409,
+          details: { plan_id: plan.id, status: plan.status },
+        });
+      }
+      const path = `/api/notice-radar/migrations/${encodeURIComponent(plan.id)}/execute`;
+      return recoveryJsonRequest<MigrationReceipt>(
+        "POST",
+        path,
+        migrationExecuteBody(plan, allowConflicts),
+      );
+    },
+    receipt: (planId: string, operation: "execute" | "undo") =>
+      request<MigrationReceipt>(
+        `/api/notice-radar/migrations/${encodeURIComponent(planId)}/receipt${asQuery({ operation })}`,
+      ),
+    resumeUndo: async (plan: MigrationPlan) => {
+      if (!["undo_applied", "undo_verification_failed"].includes(plan.status)) {
+        throw new ApiError("迁移尚未进入可恢复的撤销后验证状态。", {
+          status: 409,
+          details: { plan_id: plan.id, status: plan.status },
+        });
+      }
+      const path = `/api/notice-radar/migrations/${encodeURIComponent(plan.id)}/undo`;
+      return recoveryJsonRequest<MigrationReceipt>("POST", path, migrationUndoBody(plan));
+    },
+    beginUndo: (plan: MigrationPlan) => {
+      const path = `/api/notice-radar/migrations/${encodeURIComponent(plan.id)}/undo`;
+      return beginTwoStageWrite("POST", path, migrationUndoBody(plan));
+    },
+    finishUndo: (plan: MigrationPlan, challenge: string) => {
+      const path = `/api/notice-radar/migrations/${encodeURIComponent(plan.id)}/undo`;
+      return finishTwoStageWrite<MigrationReceipt>(
+        "POST",
+        path,
+        migrationUndoBody(plan),
+        challenge,
+      );
+    },
+  },
 
   tasks: {
     list: (

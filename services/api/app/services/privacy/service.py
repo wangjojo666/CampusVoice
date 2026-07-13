@@ -21,6 +21,14 @@ from app.models.entities import (
     Document,
     DocumentChunk,
     Hotword,
+    ImpactCase,
+    ImpactMigrationItem,
+    ImpactMigrationPlan,
+    NoticeChangeItem,
+    NoticeChangeSet,
+    NoticeClaim,
+    NoticeSeries,
+    OidcSession,
     PendingAction,
     PrivacyDeletionChallenge,
     Task,
@@ -140,6 +148,35 @@ class PrivacyService:
                     .where(Document.user_id == user_id)
                 )
             )
+            notice_series = list(
+                await session.scalars(select(NoticeSeries).where(NoticeSeries.user_id == user_id))
+            )
+            notice_claims = list(
+                await session.scalars(select(NoticeClaim).where(NoticeClaim.user_id == user_id))
+            )
+            notice_change_sets = list(
+                await session.scalars(
+                    select(NoticeChangeSet).where(NoticeChangeSet.user_id == user_id)
+                )
+            )
+            notice_change_items = list(
+                await session.scalars(
+                    select(NoticeChangeItem).where(NoticeChangeItem.user_id == user_id)
+                )
+            )
+            impact_cases = list(
+                await session.scalars(select(ImpactCase).where(ImpactCase.user_id == user_id))
+            )
+            impact_migration_plans = list(
+                await session.scalars(
+                    select(ImpactMigrationPlan).where(ImpactMigrationPlan.user_id == user_id)
+                )
+            )
+            impact_migration_items = list(
+                await session.scalars(
+                    select(ImpactMigrationItem).where(ImpactMigrationItem.user_id == user_id)
+                )
+            )
             tasks = list(await session.scalars(select(Task).where(Task.user_id == user_id)))
             events = list(
                 await session.scalars(select(CalendarEvent).where(CalendarEvent.user_id == user_id))
@@ -225,6 +262,12 @@ class PrivacyService:
                         "file_type",
                         "content_sha256",
                         "status",
+                        "series_id",
+                        "supersedes_document_id",
+                        "revision_number",
+                        "effective_at",
+                        "is_current",
+                        "ingest_source",
                         "created_at",
                         "updated_at",
                     ),
@@ -247,6 +290,142 @@ class PrivacyService:
                 )
                 for item in document_chunks
             ],
+            "notice_series": [
+                _record(
+                    item,
+                    (
+                        "id",
+                        "canonical_key",
+                        "normalized_title",
+                        "department",
+                        "source_key",
+                        "created_at",
+                        "updated_at",
+                    ),
+                )
+                for item in notice_series
+            ],
+            "notice_claims": [
+                _record(
+                    item,
+                    (
+                        "id",
+                        "document_id",
+                        "chunk_id",
+                        "claim_key",
+                        "claim_type",
+                        "value_json",
+                        "normalized_value_json",
+                        "audience_rule_json",
+                        "confidence",
+                        "evidence_start",
+                        "evidence_end",
+                        "extractor_version",
+                        "review_state",
+                        "created_at",
+                    ),
+                )
+                for item in notice_claims
+            ],
+            "notice_change_sets": [
+                _record(
+                    item,
+                    (
+                        "id",
+                        "series_id",
+                        "from_document_id",
+                        "to_document_id",
+                        "algorithm_version",
+                        "status",
+                        "created_at",
+                    ),
+                )
+                for item in notice_change_sets
+            ],
+            "notice_change_items": [
+                _record(
+                    item,
+                    (
+                        "id",
+                        "change_set_id",
+                        "claim_key",
+                        "change_type",
+                        "before_claim_id",
+                        "after_claim_id",
+                        "severity",
+                        "confidence",
+                        "review_state",
+                        "created_at",
+                    ),
+                )
+                for item in notice_change_items
+            ],
+            "impact_cases": [
+                _record(
+                    item,
+                    (
+                        "id",
+                        "change_item_id",
+                        "entity_type",
+                        "entity_id",
+                        "entity_version",
+                        "reason",
+                        "severity",
+                        "current_snapshot",
+                        "proposed_patch",
+                        "recommended_action",
+                        "requires_manual_review",
+                        "status",
+                        "migration_plan_id",
+                        "detected_at",
+                        "resolved_at",
+                    ),
+                )
+                for item in impact_cases
+            ],
+            "impact_migration_plans": [
+                _record(
+                    item,
+                    (
+                        "id",
+                        "change_set_id",
+                        "generation",
+                        "status",
+                        "risk_level",
+                        "conflicts_json",
+                        "verification_json",
+                        "execute_receipt_json",
+                        "undo_receipt_json",
+                        "version",
+                        "executed_at",
+                        "undone_at",
+                        "created_at",
+                        "updated_at",
+                    ),
+                )
+                for item in impact_migration_plans
+            ],
+            "impact_migration_items": [
+                _record(
+                    item,
+                    (
+                        "id",
+                        "plan_id",
+                        "entity_type",
+                        "entity_id",
+                        "expected_version",
+                        "before_snapshot",
+                        "proposed_patch",
+                        "after_snapshot",
+                        "source_claim_ids",
+                        "verification_json",
+                        "execute_verification_json",
+                        "undo_verification_json",
+                        "created_at",
+                    ),
+                )
+                for item in impact_migration_items
+            ],
             "tasks": [
                 _record(
                     item,
@@ -262,6 +441,9 @@ class PrivacyService:
                         "status",
                         "source_type",
                         "source_document_id",
+                        "source_chunk_id",
+                        "source_claim_id",
+                        "source_history",
                         "version",
                         "created_at",
                         "updated_at",
@@ -284,6 +466,9 @@ class PrivacyService:
                         "reminder_minutes",
                         "source_type",
                         "source_document_id",
+                        "source_chunk_id",
+                        "source_claim_id",
+                        "source_history",
                         "version",
                         "created_at",
                         "updated_at",
@@ -503,6 +688,13 @@ class PrivacyService:
                         WriteChallenge.expires_at <= now,
                     ),
                 ),
+                "expired_oidc_sessions": await _delete_count(
+                    session,
+                    delete(OidcSession).where(
+                        OidcSession.user_id == user_id,
+                        OidcSession.expires_at <= now,
+                    ),
+                ),
             }
         return RetentionRunResponse(ran_at=now, deleted_counts=deleted_counts)
 
@@ -644,6 +836,38 @@ class PrivacyService:
                     DocumentChunk.document_id.in_(document_ids)
                 ),
             ),
+            "notice_series": await _count(
+                session,
+                select(func.count(NoticeSeries.id)).where(NoticeSeries.user_id == user_id),
+            ),
+            "notice_claims": await _count(
+                session,
+                select(func.count(NoticeClaim.id)).where(NoticeClaim.user_id == user_id),
+            ),
+            "notice_change_sets": await _count(
+                session,
+                select(func.count(NoticeChangeSet.id)).where(NoticeChangeSet.user_id == user_id),
+            ),
+            "notice_change_items": await _count(
+                session,
+                select(func.count(NoticeChangeItem.id)).where(NoticeChangeItem.user_id == user_id),
+            ),
+            "impact_cases": await _count(
+                session,
+                select(func.count(ImpactCase.id)).where(ImpactCase.user_id == user_id),
+            ),
+            "impact_migration_plans": await _count(
+                session,
+                select(func.count(ImpactMigrationPlan.id)).where(
+                    ImpactMigrationPlan.user_id == user_id
+                ),
+            ),
+            "impact_migration_items": await _count(
+                session,
+                select(func.count(ImpactMigrationItem.id)).where(
+                    ImpactMigrationItem.user_id == user_id
+                ),
+            ),
             "tasks": await _count(
                 session, select(func.count(Task.id)).where(Task.user_id == user_id)
             ),
@@ -691,6 +915,10 @@ class PrivacyService:
                     WriteChallenge.user_id == user_id
                 ),
             ),
+            "oidc_sessions": await _count(
+                session,
+                select(func.count(OidcSession.session_hash)).where(OidcSession.user_id == user_id),
+            ),
             "action_logs": await _count(
                 session,
                 select(func.count(ActionLog.id)).where(ActionLog.user_id == user_id),
@@ -711,6 +939,9 @@ class PrivacyService:
         document_ids = select(Document.id).where(Document.user_id == user_id)
         voice_session_ids = select(VoiceSession.id).where(VoiceSession.user_id == user_id)
         statements = (
+            # Delete leaf rows before their parents even when a database also enforces
+            # ON DELETE actions. This keeps the privacy boundary portable and makes the
+            # rows covered by the fresh-session verification explicit.
             delete(UndoRecord).where(UndoRecord.user_id == user_id),
             delete(ActionLog).where(ActionLog.user_id == user_id),
             delete(ConfirmationNonce).where(ConfirmationNonce.user_id == user_id),
@@ -718,15 +949,23 @@ class PrivacyService:
             delete(CorrectionRecord).where(CorrectionRecord.user_id == user_id),
             delete(Transcription).where(Transcription.voice_session_id.in_(voice_session_ids)),
             delete(VoiceSession).where(VoiceSession.user_id == user_id),
+            delete(ImpactMigrationItem).where(ImpactMigrationItem.user_id == user_id),
+            delete(ImpactCase).where(ImpactCase.user_id == user_id),
+            delete(ImpactMigrationPlan).where(ImpactMigrationPlan.user_id == user_id),
+            delete(NoticeChangeItem).where(NoticeChangeItem.user_id == user_id),
+            delete(NoticeChangeSet).where(NoticeChangeSet.user_id == user_id),
             delete(CalendarEvent).where(CalendarEvent.user_id == user_id),
             delete(Task).where(Task.user_id == user_id),
+            delete(NoticeClaim).where(NoticeClaim.user_id == user_id),
             delete(DocumentChunk).where(DocumentChunk.document_id.in_(document_ids)),
             delete(Document).where(Document.user_id == user_id),
+            delete(NoticeSeries).where(NoticeSeries.user_id == user_id),
             delete(Course).where(Course.user_id == user_id),
             delete(Hotword).where(Hotword.user_id == user_id),
             delete(Conversation).where(Conversation.user_id == user_id),
             delete(WebSocketTicket).where(WebSocketTicket.user_id == user_id),
             delete(WriteChallenge).where(WriteChallenge.user_id == user_id),
+            delete(OidcSession).where(OidcSession.user_id == user_id),
             delete(UserSettings).where(UserSettings.user_id == user_id),
             delete(PrivacyDeletionChallenge).where(
                 PrivacyDeletionChallenge.user_id == user_id,

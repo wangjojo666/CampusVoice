@@ -2,7 +2,9 @@
 param(
     [string]$ProjectName = $(if ($env:CAMPUSVOICE_SMOKE_PROJECT) { $env:CAMPUSVOICE_SMOKE_PROJECT } else { "campusvoice-smoke" }),
     [string]$ComposeFile = $(if ($env:CAMPUSVOICE_COMPOSE_FILE) { $env:CAMPUSVOICE_COMPOSE_FILE } else { "docker-compose.yml" }),
-    [string]$SmokeFile = $(if ($env:CAMPUSVOICE_SMOKE_COMPOSE_FILE) { $env:CAMPUSVOICE_SMOKE_COMPOSE_FILE } else { "docker-compose.smoke.yml" })
+    [string]$SmokeFile = $(if ($env:CAMPUSVOICE_SMOKE_COMPOSE_FILE) { $env:CAMPUSVOICE_SMOKE_COMPOSE_FILE } else { "docker-compose.smoke.yml" }),
+    [string]$ExtraComposeFile = $(if ($env:CAMPUSVOICE_EXTRA_COMPOSE_FILE) { $env:CAMPUSVOICE_EXTRA_COMPOSE_FILE } else { "docker-compose.multi-worker.yml" }),
+    [string]$ComposeProfile = $(if ($env:CAMPUSVOICE_SMOKE_PROFILE) { $env:CAMPUSVOICE_SMOKE_PROFILE } else { "multi-worker" })
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,6 +14,12 @@ $composeArgs = @(
     "--file", $ComposeFile,
     "--file", $SmokeFile
 )
+if ($ExtraComposeFile) {
+    $composeArgs += @("--file", $ExtraComposeFile)
+}
+if ($ComposeProfile) {
+    $composeArgs += @("--profile", $ComposeProfile)
+}
 $completed = $false
 
 function Invoke-SmokeCompose {

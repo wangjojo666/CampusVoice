@@ -1,5 +1,15 @@
 # CampusVoice 声程
 
+## v0.3 校园通知变化雷达
+
+声程现在可以把同一 `NoticeSeries` 中显式确认的 v1/v2 版本编译为带原文证据的结构化变化，按确定性规范化比较 claim，判断专业/年级/课程适用性，并只找出仍精确依赖旧 claim（或业务字段仍等于旧 claim 值）的待办和日程。用户手工改过的值不会因为仍指向旧文档而被覆盖；supporting claims 进入来源历史但不会替换 primary source claim。v1 适用而 v2 不再适用时会产生 `keep`、`cancel` 或 `manual_review` 建议，不会静默显示零影响。
+
+迁移预览按 change set 生成递增 generation，冻结整组 before/after、实体版本、来源与稳定排序的日历冲突。审核被拒绝会使 ready plan 失效并 dismiss 影响；重新通过审核后只能创建新 generation。普通更新一次确认；冲突覆盖和整组撤销使用两次分离交互、请求体绑定、一次性 write challenge，第一次只准备最终 challenge，第二次才写入。执行在数据库事务和状态锁内重新校验审核、适用性、实体版本、旧 claim 依赖与当前冲突；任一变化都使整组零写入。执行与撤销分别保存不可互相覆盖的回执，提交后使用全新数据库会话逐项复查；断线恢复先读取最新 plan，只有 `applied`/`undo_applied` 等已提交状态才用相同幂等键补做核验，`verified`/`undone` 只读回执，`ready` 必须重新确认。
+
+首页 `Campus Radar` 展示 new notice、version change、upcoming deadline 和 needs review 四类卡片；详情页依次展示 v1/v2 diff 与证据、Impact Canvas、真实日历时间线、确认面板、数据库核验详情和整组撤销。验证失败会显示实际数据库快照并允许继续核验，瞬时失败使用同一 plan 和 sessionStorage 中的稳定幂等键重试。通知页还可创建或选择 series、查看时间线、显式导入 v1/v2、选择 predecessor，并在后继关系有歧义时要求确认。合成演示运行 `python scripts/seed_demo.py`，会建立“2026 人工智能专业考试安排”v1（09:00–11:00 / A302）和 v2（14:00–16:00 / B205）、一个考试日程、两个复习待办、一条“携带校园卡”任务提醒及来源链。任务提醒绑定 v1 的材料证据，截止与提醒时间会随考试时间迁移；重复运行不会创建重复版本或安排。
+
+设计与安全语义见 [`ADR 0007`](docs/decisions/0007-notice-evidence-impact-migrations.md)，API 与表结构见 [`services/api/docs/api-contract.md`](services/api/docs/api-contract.md) 和 [`services/api/docs/data-model.md`](services/api/docs/data-model.md)。
+
 面向大学生的可验证校园语音学习助手。CampusVoice 把浏览器语音转写、校园术语纠错、结构化意图、风险确认、数据库事务和执行后验证连接成一条可审计链路；模型输出本身永远不被当作写入成功的证据。
 
 ## 已实现能力
@@ -8,7 +18,7 @@
 - FunASR 流式中文识别、FSMN-VAD、CT-Punc、热词和 Whisper 离线基线。
 - 创建/修改/删除任务与日历、冲突与重复检测、乐观版本检查和撤销。
 - 严格 Pydantic 意图 Schema、一次结构化修复、缺失字段追问和低置信度保护。
-- development/test 显式 demo 身份，以及 production 强制 OIDC/JWT（issuer、audience、JWKS、非对称签名）身份边界。
+- development/test 显式 demo 身份、Bearer JWT 适配器，以及服务端校园 OIDC Authorization Code + PKCE 会话边界。
 - 确定性风险分级：服务端签发并绑定用户、操作、请求内容、阶段和过期时间的一次性挑战；高风险删除需要两次分离交互。
 - ASR 使用短时、一次性 WebSocket ticket，不在 URL、日志或数据库中保存长期访问令牌，并限制帧、空闲、会话、音频与并发配额。
 - PDF、DOCX、TXT、Markdown 通知库、中文向量检索、证据约束 LLM 问答、真实页码和证据不足拒答。
@@ -60,7 +70,7 @@ pnpm install --frozen-lockfile
 Copy-Item .env.example .env
 ```
 
-本地默认仅在 `development` 下显式启用 demo auth。生产环境必须设置 `CAMPUSVOICE_ENV=production`、`CAMPUSVOICE_AUTH_MODE=jwt`、JWT issuer/audience/JWKS、允许的非对称算法，以及至少 32 字符的 `CAMPUSVOICE_CONFIRMATION_SECRET`；缺少任何一项都会在启动时失败，不会回退到 `user_demo`。Web 客户端只在内存中持有 Bearer token；不要把 token 放入 URL、浏览器持久存储或日志。
+本地默认仅在 `development` 下显式启用 demo auth。校园试点使用 `CAMPUSVOICE_ENV=production` 与 `CAMPUSVOICE_AUTH_MODE=oidc`，并配置 HTTPS issuer、client ID、API 回调地址、登录/登出跳转地址、`openid` scope、非对称 ID-token 算法，以及至少 32 字符的 `CAMPUSVOICE_CONFIRMATION_SECRET`；缺项会启动失败且绝不回退到 `user_demo`。PKCE verifier、state、nonce、可选 client secret 和 code exchange 全在 API 端；浏览器只持有 `HttpOnly` 随机会话 cookie，不接收或持久化 access token。非浏览器客户端仍可使用 `jwt` 模式。详见 [`docs/decisions/0004-oidc-authorization-code-pkce.md`](docs/decisions/0004-oidc-authorization-code-pkce.md)。
 
 生产 ASR 不使用浏览器 `SpeechRecognition`。在 `.env` 中启用真实 FunASR：
 
@@ -115,7 +125,7 @@ API 启动后运行：
 python scripts/seed_demo.py
 ```
 
-在 `development + demo auth` 下，应用会创建固定演示身份 `user_demo`；它只用于本地合成数据，不是生产账户。JWT 模式下用户 ID 由服务端根据受验证的 issuer 与 subject 稳定映射，客户端不能通过请求头、路径或正文选择用户。种子脚本通过 REST 接口写入合成课程、热词、待办、考试日程和两份校园通知，可安全重复运行。
+在 `development/test + demo auth` 下，应用会创建固定演示身份 `user_demo`；它只用于本地合成数据，不是生产账户。JWT/OIDC 模式下用户 ID 由服务端根据受验证的 issuer 与 subject 稳定映射，客户端不能通过请求头、路径或正文选择用户。种子脚本通过 REST 接口写入合成课程、热词、待办、考试日程和两份校园通知，可安全重复运行。
 
 ## Docker Compose
 
@@ -126,6 +136,17 @@ docker compose up --build
 ```
 
 默认 Compose 镜像不安装 AI 额外依赖，并明确使用 `ASR=disabled` 与 `knowledge=lexical`；它适合先验证任务、日历、确认、事务和引用链路，不会伪造语音转写结果。若手动把检索器切到 `embedding`，必须同时构建 AI 镜像。
+
+多 worker ASR 必须启用 Redis 共享租约，不能让每个 worker 各自计算配额：
+
+```powershell
+$env:CAMPUSVOICE_ASR_WORKER_COUNT="2"
+$env:CAMPUSVOICE_CONFIRMATION_SECRET="replace-with-one-shared-random-secret-at-least-32-characters"
+docker compose -f docker-compose.yml -f docker-compose.multi-worker.yml `
+  --profile multi-worker up --build
+```
+
+覆盖文件会让 API 等待 Redis 健康后再启动，并把 worker count 传给 Uvicorn。所有 worker 还必须显式共享同一个 confirmation secret；缺失或短于 32 字符时配置会 fail closed，绝不能依赖各进程随机生成的开发密钥。Redis 不可用时多 worker 配置与 readiness 同样会 fail closed；`local` 后端只适用于明确的单 worker 降级模式。租约在同一个 Lua 脚本中读取 Redis 时间并原子计数，worker 崩溃后按最大会话时长加宽限期自动释放。GPU ASR 每个 worker 都会加载模型，部署前必须核算显存；不足时应拆分推理服务而不是盲目增加 worker。详见 [`docs/decisions/0005-shared-asr-quota.md`](docs/decisions/0005-shared-asr-quota.md)。
 
 包含 CUDA AI 依赖的镜像体积较大，可显式启用，并通过 GPU 覆盖文件向 Docker 申请 NVIDIA GPU：
 
@@ -145,11 +166,13 @@ GPU 容器还需要主机正确配置 WSL 2、Docker GPU 支持和 NVIDIA 驱动
 ```powershell
 # 后端
 Set-Location services/api
-python -m pytest --cov=app
+python -m pytest --cov=app --cov-fail-under=80 --cov-report=json:coverage.json
+python scripts/check_critical_coverage.py coverage.json
 python -m ruff check app tests
 python -m ruff format --check app tests
 python -m mypy app
 python -m pip_audit --require-hashes --disable-pip -r requirements/runtime.lock
+python -m pip_audit --require-hashes --disable-pip -r requirements/dev.lock
 
 # 回到仓库根目录后运行前端
 pnpm test
@@ -158,6 +181,7 @@ pnpm typecheck
 pnpm lint
 pnpm build
 pnpm format:check
+pnpm audit --audit-level=high
 
 # 首次安装 Playwright Chromium，随后运行浏览器合约场景
 pnpm --filter @campusvoice/web exec playwright install chromium
@@ -166,6 +190,8 @@ pnpm test:e2e
 # Windows 已安装 Microsoft Edge 时也可直接验证 Edge 通道
 pnpm --filter @campusvoice/web test:e2e:edge
 ```
+
+后端 coverage 总门槛为 80%；关键 `actions/service.py` 门槛为 75%，`verification/service.py` 门槛为 90%。前端 coverage 门槛由 `apps/web/vitest.config.ts` 强制执行。所有阈值都基于本次生成的报告，不能沿用旧报告。
 
 默认 `pnpm test:e2e` 是前端浏览器合约测试：它使用真实 Next 页面，但会拦截 REST，并在页面上下文中模拟 AudioWorklet、WebSocket 和合成 PCM `ArrayBuffer`，因此不等同于完整系统 E2E。Compose smoke 另行启动真实 Web、API 与 SQLite，且不拦截 `/api/**`；两套测试都只用合成数据，不请求或录制真实麦克风。
 
@@ -180,6 +206,20 @@ Windows PowerShell 可直接运行等价脚本：
 ```powershell
 pnpm test:e2e:smoke:windows
 ```
+
+两个 smoke 脚本默认叠加 `docker-compose.multi-worker.yml` 并启用 `multi-worker` profile，
+因此本地和 CI 都使用 Redis、两个真实 Uvicorn worker、真实 API、SQLite 和页面，而不只
+验证两个内存对象。可用 `CAMPUSVOICE_EXTRA_COMPOSE_FILE` 和
+`CAMPUSVOICE_SMOKE_PROFILE` 显式覆盖这两个默认值。
+
+隐私保留可由 cron、Task Scheduler 或 Kubernetes CronJob 调用一次性执行器：
+
+```powershell
+Set-Location services/api
+python -m app.jobs.retention
+```
+
+执行器按配置进行有界指数退避；生产建议只运行一个外部调度实例。SQLite WAL checkpoint、备份一致性、恢复演练、失败升级和物理清理步骤见 [`docs/runbooks/privacy-retention.md`](docs/runbooks/privacy-retention.md)。
 
 迁移验证：
 
@@ -220,7 +260,7 @@ python scripts/generate_synthetic_evaluation.py
 ## 安全与范围
 
 - API 密钥只从环境变量读取；`.env` 已被 Git 忽略。
-- production 只接受经 issuer、audience、签名和必需 claims 验证的 JWT；所有 REST 查询与写入都使用服务端派生的当前用户。
+- production 禁止 demo。OIDC 会校验 state、PKCE、nonce、issuer、audience、JWKS 签名、到期和必需 claims；JWT 模式执行同等 JWT 边界。所有 REST 查询与写入只使用服务端派生的当前用户。
 - 日志不记录完整认证令牌、密钥、请求正文、原始音频或不必要的学生文本；`user_id` 只记录进程盐化摘要。
 - 数据库存储 UTC，前端默认按 `Asia/Shanghai` 展示。
 - 所有关键写入使用事务并在提交后重新查询验证。
@@ -228,4 +268,4 @@ python scripts/generate_synthetic_evaluation.py
 - 原始音频持久化未实现且不能开启。转写、纠错、对话和审计记录按配置保留；用户可导出或清除自己的业务数据。发送到外部 LLM 的边界仅为意图输入/上下文或通知问答所需的编号证据，启用外部服务前应完成校方数据处理评审。
 - 测试适配器仅存在于测试目录，生产演示不会用固定文本冒充 AI 输出。
 
-SQLite 删除后的空闲页、WAL 与备份不等同于物理擦除；内测部署仍需独立制定备份保留、访问控制与安全擦除策略。项目当前不自动选择开源许可证，MIT 与 Apache-2.0 的取舍需由项目所有者决定。
+SQLite 删除后的空闲页、WAL 与备份不等同于物理擦除；校园试点必须执行隐私保留运维手册中的 checkpoint、备份保留、恢复演练与安全擦除流程。本项目采用 [Apache License 2.0](LICENSE)。

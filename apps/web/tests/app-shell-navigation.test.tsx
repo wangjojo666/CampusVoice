@@ -1,17 +1,24 @@
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AppShell } from "@/components/layout/app-shell";
 
-const mocks = vi.hoisted(() => ({ pathname: vi.fn() }));
+const mocks = vi.hoisted(() => ({ pathname: vi.fn(), logout: vi.fn() }));
 
 vi.mock("next/navigation", () => ({ usePathname: () => mocks.pathname() }));
 vi.mock("@/components/system/health-status", () => ({
   HealthStatus: () => <span>API 状态正常</span>,
 }));
+vi.mock("@/lib/api-client", () => ({
+  API_BASE_URL: "https://api.campus.test",
+  api: { auth: { logout: mocks.logout } },
+}));
 
 describe("application shell navigation", () => {
-  beforeEach(() => mocks.pathname.mockReturnValue("/tasks"));
+  beforeEach(() => {
+    mocks.pathname.mockReturnValue("/tasks");
+    mocks.logout.mockReset();
+  });
 
   it("marks the current section in desktop and mobile navigation", () => {
     const { unmount } = render(
@@ -50,5 +57,20 @@ describe("application shell navigation", () => {
       "aria-current",
     );
     unmount();
+  });
+
+  it("offers desktop and mobile OIDC logout and preserves the session on failure", async () => {
+    mocks.logout.mockRejectedValue(new Error("network unavailable"));
+    render(<AppShell oidcEnabled>校园首页</AppShell>);
+
+    const logoutButtons = screen.getAllByRole("button", { name: "退出登录" });
+    expect(logoutButtons).toHaveLength(2);
+    fireEvent.click(logoutButtons[1]!);
+
+    expect(
+      await screen.findByText("退出登录未完成，当前会话仍然有效。请检查网络后重试。"),
+    ).toBeInTheDocument();
+    expect(mocks.logout).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "重试退出" })).toBeInTheDocument();
   });
 });

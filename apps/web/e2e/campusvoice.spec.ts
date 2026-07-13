@@ -168,7 +168,7 @@ async function installApiMocks(page: Page, options: MockOptions = {}) {
     state.calls.push({ method, path, headers: await request.allHeaders(), body });
 
     if (path === "/api/health")
-      return fulfill(route, { status: "ok", service: "CampusVoice API", version: "0.1.0" });
+      return fulfill(route, { status: "ok", service: "CampusVoice API", version: "0.3.0" });
 
     if (path === "/api/auth/ws-ticket" && method === "POST")
       return fulfill(route, {

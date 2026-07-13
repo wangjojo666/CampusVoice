@@ -18,7 +18,8 @@ from app.db.base import Base
 from app.db.session import create_database_engine, create_session_factory
 from app.models.entities import User, UserSettings
 from app.security.authentication import build_authenticator
-from app.services.asr.connections import AsrConnectionRegistry
+from app.security.oidc import OidcClient
+from app.services.asr.connections import build_asr_quota_registry
 from app.services.errors import DomainError
 
 
@@ -41,6 +42,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        await application.state.asr_connections.start()
         if should_initialize:
             async with database_engine.begin() as connection:
                 await connection.run_sync(Base.metadata.create_all)
@@ -65,9 +67,12 @@ def create_app(
                             },
                         )
                     )
-        yield
-        if owns_engine:
-            await database_engine.dispose()
+        try:
+            yield
+        finally:
+            await application.state.asr_connections.close()
+            if owns_engine:
+                await database_engine.dispose()
 
     app = FastAPI(
         title=settings.app_name,
@@ -80,13 +85,16 @@ def create_app(
     app.state.database_engine = database_engine
     app.state.settings = settings
     app.state.authenticator = build_authenticator(settings)
-    app.state.asr_connections = AsrConnectionRegistry()
+    app.state.oidc_client = OidcClient(settings) if settings.auth_mode == "oidc" else None
+    app.state.asr_connections = build_asr_quota_registry(settings)
     metrics = InMemoryMetrics()
     app.state.metrics = metrics
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
-        allow_credentials=False,
+        # The web client intentionally sends credentials in every auth mode.
+        # Exact configured origins above keep this safe for local JWT/demo and OIDC alike.
+        allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -105,7 +113,7 @@ def create_app(
         request_id = request_id_from(request)
         headers = {"X-Request-ID": request_id}
         if exc.status_code == 401:
-            headers["WWW-Authenticate"] = "Bearer"
+            headers["WWW-Authenticate"] = "Bearer" if settings.auth_mode == "jwt" else "Session"
         return JSONResponse(
             status_code=exc.status_code,
             headers=headers,

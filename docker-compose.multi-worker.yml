@@ -1,0 +1,12 @@
+services:
+  api:
+    environment:
+      CAMPUSVOICE_ASR_WORKER_COUNT: ${CAMPUSVOICE_ASR_WORKER_COUNT:-2}
+      CAMPUSVOICE_ASR_QUOTA_BACKEND: redis
+      CAMPUSVOICE_ASR_REDIS_URL: ${CAMPUSVOICE_ASR_REDIS_URL:-redis://redis:6379/0}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  redis:
+    profiles: ["multi-worker"]

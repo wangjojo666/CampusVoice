@@ -5,8 +5,12 @@ from typing import Any, Protocol
 
 import jwt
 from jwt import PyJWKClient
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
+from app.db.types import utc_now
+from app.models.entities import OidcSession
 from app.services.errors import DomainError
 
 
@@ -29,7 +33,7 @@ class Authenticator(Protocol):
     async def authenticate(self, token: str | None) -> AuthPrincipal: ...
 
 
-def _internal_user_id(issuer: str, subject: str) -> str:
+def internal_user_id(issuer: str, subject: str) -> str:
     digest = hashlib.sha256(f"{issuer}\0{subject}".encode()).hexdigest()[:48]
     return f"usr_{digest}"
 
@@ -47,6 +51,12 @@ class DemoAuthenticator:
             display_name="CampusVoice Demo User",
             authentication_method="demo",
         )
+
+
+class OidcCookieAuthenticator:
+    async def authenticate(self, token: str | None) -> AuthPrincipal:
+        del token
+        raise AuthenticationError("authentication_required", "An OIDC session is required")
 
 
 class JwtAuthenticator:
@@ -101,7 +111,7 @@ class JwtAuthenticator:
             "CampusVoice User",
         )
         return AuthPrincipal(
-            user_id=_internal_user_id(self._issuer, subject),
+            user_id=internal_user_id(self._issuer, subject),
             subject=subject,
             issuer=self._issuer,
             display_name=display_name[:120],
@@ -112,6 +122,8 @@ class JwtAuthenticator:
 def build_authenticator(settings: Settings) -> Authenticator:
     if settings.auth_mode == "demo":
         return DemoAuthenticator(settings.demo_user_id)
+    if settings.auth_mode == "oidc":
+        return OidcCookieAuthenticator()
     assert settings.jwt_issuer and settings.jwt_audience and settings.jwt_jwks_url
     return JwtAuthenticator(
         issuer=settings.jwt_issuer,
@@ -119,6 +131,28 @@ def build_authenticator(settings: Settings) -> Authenticator:
         jwks_url=settings.jwt_jwks_url,
         algorithms=settings.jwt_algorithms,
         leeway_seconds=settings.jwt_leeway_seconds,
+    )
+
+
+async def authenticate_oidc_session(
+    session: AsyncSession,
+    token: str | None,
+) -> AuthPrincipal:
+    if not token:
+        raise AuthenticationError("authentication_required", "An OIDC session is required")
+    session_hash = hashlib.sha256(token.encode()).hexdigest()
+    record = await session.scalar(
+        select(OidcSession).where(OidcSession.session_hash == session_hash)
+    )
+    if record is None or record.revoked_at is not None or record.expires_at <= utc_now():
+        raise AuthenticationError("invalid_session", "The OIDC session is invalid or expired")
+    return AuthPrincipal(
+        user_id=record.user_id,
+        subject=record.subject,
+        issuer=record.issuer,
+        display_name=record.display_name,
+        roles=tuple(record.roles),
+        authentication_method="oidc_session",
     )
 
 

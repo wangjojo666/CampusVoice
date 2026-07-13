@@ -26,3 +26,15 @@ class WriteChallengeResponse(StrictModel):
     stage: int = Field(ge=1, le=2)
     required_stages: int = Field(ge=1, le=2)
     expires_at: datetime
+
+
+class OidcSessionResponse(StrictModel):
+    authenticated: bool
+    user_id: str
+    display_name: str
+    roles: list[str]
+    expires_at: datetime | None = None
+
+
+class OidcLogoutResponse(StrictModel):
+    logout_url: str

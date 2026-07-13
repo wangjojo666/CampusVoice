@@ -28,6 +28,8 @@ class TaskCreate(StrictModel):
     status: TaskStatus = TaskStatus.PENDING
     source_type: SourceType = SourceType.MANUAL
     source_document_id: str | None = None
+    source_chunk_id: str | None = None
+    source_claim_id: str | None = None
 
     @model_validator(mode="after")
     def reminder_precedes_due(self) -> "TaskCreate":
@@ -47,6 +49,8 @@ class TaskUpdate(StrictModel):
     status: TaskStatus | None = None
     source_type: SourceType | None = None
     source_document_id: str | None = None
+    source_chunk_id: str | None = None
+    source_claim_id: str | None = None
     expected_version: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
@@ -70,6 +74,8 @@ class TaskDraft(StrictModel):
     status: TaskStatus | None = None
     source_type: SourceType | None = None
     source_document_id: str | None = None
+    source_chunk_id: str | None = None
+    source_claim_id: str | None = None
     expected_version: int | None = Field(default=None, ge=1)
 
 
@@ -85,6 +91,9 @@ class TaskView(StrictModel):
     status: TaskStatus
     source_type: SourceType
     source_document_id: str | None
+    source_chunk_id: str | None
+    source_claim_id: str | None
+    source_history: list[dict[str, Any]]
     version: int
     created_at: datetime
     updated_at: datetime
@@ -106,6 +115,8 @@ class EventCreate(StrictModel):
     reminder_minutes: int = Field(default=30, ge=0, le=525_600)
     source_type: SourceType = SourceType.MANUAL
     source_document_id: str | None = None
+    source_chunk_id: str | None = None
+    source_claim_id: str | None = None
     allow_conflict: bool = False
 
     @model_validator(mode="after")
@@ -126,6 +137,8 @@ class EventUpdate(StrictModel):
     reminder_minutes: int | None = Field(default=None, ge=0, le=525_600)
     source_type: SourceType | None = None
     source_document_id: str | None = None
+    source_chunk_id: str | None = None
+    source_claim_id: str | None = None
     allow_conflict: bool = False
     expected_version: int | None = Field(default=None, ge=1)
 
@@ -150,6 +163,8 @@ class EventDraft(StrictModel):
     reminder_minutes: int | None = Field(default=None, ge=0, le=525_600)
     source_type: SourceType | None = None
     source_document_id: str | None = None
+    source_chunk_id: str | None = None
+    source_claim_id: str | None = None
     expected_version: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
@@ -171,6 +186,9 @@ class EventView(StrictModel):
     reminder_minutes: int
     source_type: SourceType
     source_document_id: str | None
+    source_chunk_id: str | None
+    source_claim_id: str | None
+    source_history: list[dict[str, Any]]
     version: int
     created_at: datetime
     updated_at: datetime

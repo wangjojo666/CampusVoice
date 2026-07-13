@@ -12,6 +12,7 @@ from app.api.routes import (
     intent,
     knowledge,
     metrics,
+    notice_radar,
     privacy,
     settings,
     tasks,
@@ -32,3 +33,4 @@ api_router.include_router(intent.router)
 api_router.include_router(correction.router)
 api_router.include_router(documents.router)
 api_router.include_router(knowledge.router)
+api_router.include_router(notice_radar.router)
