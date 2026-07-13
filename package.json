@@ -1,6 +1,6 @@
 {
   "name": "campusvoice",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "packageManager": "pnpm@11.7.0",
   "engines": {
@@ -13,6 +13,8 @@
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
     "test:e2e": "pnpm --filter @campusvoice/web test:e2e",
+    "test:e2e:smoke": "pnpm --filter @campusvoice/web test:e2e:smoke",
+    "test:e2e:smoke:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-compose-smoke.ps1",
     "test:coverage": "pnpm -r test:coverage",
     "format": "prettier --write .",
     "format:check": "prettier --check ."

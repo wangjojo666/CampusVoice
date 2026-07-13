@@ -1,5 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.metrics import InMemoryMetrics, observe_component
 from app.repositories.hotwords import HotwordRepository
 from app.schemas.domain import HotwordCreate, HotwordMutationResponse, HotwordView
 from app.services.errors import (
@@ -12,9 +13,10 @@ from app.services.verification.service import VerificationService
 
 
 class HotwordService:
-    def __init__(self) -> None:
+    def __init__(self, metrics: InMemoryMetrics | None = None) -> None:
         self.repository = HotwordRepository()
         self.verifier = VerificationService()
+        self.metrics = metrics
 
     async def create(
         self,
@@ -39,9 +41,11 @@ class HotwordService:
         async with session.begin():
             hotword = await self.repository.create(session, user_id, data)
             hotword_id = hotword.id
-        report = await self.verifier.verify_hotword(
-            session, user_id, hotword_id, data.model_dump(mode="json")
-        )
+        with observe_component(self.metrics, "verification", "verify") as observation:
+            report = await self.verifier.verify_hotword(
+                session, user_id, hotword_id, data.model_dump(mode="json")
+            )
+            observation.error = not report.success
         record = HotwordView.model_validate(report.record) if report.record is not None else None
         await session.rollback()
         if not report.success:
@@ -74,9 +78,11 @@ class HotwordService:
             if hotword is None:
                 raise NotFoundError("hotword", hotword_id)
             await self.repository.delete(session, hotword)
-        report = await self.verifier.verify_hotword(
-            session, user_id, hotword_id, {}, should_exist=False
-        )
+        with observe_component(self.metrics, "verification", "verify") as observation:
+            report = await self.verifier.verify_hotword(
+                session, user_id, hotword_id, {}, should_exist=False
+            )
+            observation.error = not report.success
         await session.rollback()
         if not report.success:
             raise VerificationFailedError(report.as_dict())

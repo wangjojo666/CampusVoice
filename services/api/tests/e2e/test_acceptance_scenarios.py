@@ -25,9 +25,12 @@ def _prepare(
 
 
 def _confirm(client: TestClient, action_id: str, token: str) -> dict[str, Any]:
+    del token
+    issued = client.post(f"/api/actions/{action_id}/challenge")
+    assert issued.status_code == 200, issued.text
     response = client.post(
         f"/api/actions/{action_id}/confirm",
-        json={"confirmed": True, "confirmation_token": token},
+        json={"confirmed": True, "challenge": issued.json()["challenge"]},
     )
     assert response.status_code == 200, response.text
     return cast(dict[str, Any], response.json())
@@ -182,10 +185,7 @@ def test_scenario_02_missing_information_needs_input_then_completed_retry_execut
     )
     assert blocked["state"] == "needs_input"
     assert "missing_required_fields" in blocked["blocking_reasons"]
-    cannot_confirm = client.post(
-        f"/api/actions/{blocked['id']}/confirm",
-        json={"confirmed": True, "confirmation_token": "blocked-confirmation"},
-    )
+    cannot_confirm = client.post(f"/api/actions/{blocked['id']}/challenge")
     assert cannot_confirm.status_code == 409
 
     completed_response = client.post(
@@ -268,10 +268,7 @@ def test_scenario_04_duplicate_event_is_blocked_without_creating_second_record(
     assert "duplicate_record" in duplicate["blocking_reasons"]
     assert existing_id in duplicate["diagnostics"]["duplicate_ids"]
 
-    confirmation = client.post(
-        f"/api/actions/{duplicate['id']}/confirm",
-        json={"confirmed": True, "confirmation_token": "duplicate-confirm"},
-    )
+    confirmation = client.post(f"/api/actions/{duplicate['id']}/challenge")
     assert confirmation.status_code == 409
     assert client.get("/api/events").json()["total"] == 1
 
@@ -283,13 +280,25 @@ def test_scenario_05_delete_requires_two_distinct_confirmations(client: TestClie
     assert deletion["risk_level"] == "high"
     assert deletion["required_confirmations"] == 2
 
-    first = _confirm(client, deletion_id, "scenario-05-first")
+    issued = client.post(f"/api/actions/{deletion_id}/challenge").json()["challenge"]
+    first_response = client.post(
+        f"/api/actions/{deletion_id}/confirm",
+        json={"confirmed": True, "challenge": issued},
+    )
+    assert first_response.status_code == 200, first_response.text
+    first = first_response.json()
     assert first["state"] == "awaiting_second_confirmation"
     assert first["confirmations_received"] == 1
 
-    replayed = _confirm(client, deletion_id, "scenario-05-first")
-    assert replayed["state"] == "awaiting_second_confirmation"
-    assert replayed["confirmations_received"] == 1
+    replayed = client.post(
+        f"/api/actions/{deletion_id}/confirm",
+        json={"confirmed": True, "challenge": issued},
+    )
+    assert replayed.status_code == 409
+    assert replayed.json()["error"]["code"] in {
+        "confirmation_challenge_mismatch",
+        "confirmation_replayed",
+    }
     assert client.post(f"/api/actions/{deletion_id}/execute").status_code == 409
 
     second = _confirm(client, deletion_id, "scenario-05-second")

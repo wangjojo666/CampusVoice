@@ -2,26 +2,29 @@
 
 ## 权限边界
 
-MVP 是单用户本地应用。服务端只使用种子用户 `user_demo`，不接受调用方任意指定用户 ID，也不接入真实教务系统。读取为低风险；任何写入均须通过同一完整性、风险、事务和执行后验证服务。删除、覆盖和批量写入必须经过两次确认。
+development/test 可显式启用种子身份 `user_demo`；production 必须使用 Bearer JWT。服务端验证 issuer、audience、JWKS 非对称签名、有效期与必需 claims，再从受验证的 issuer/subject 派生内部用户 ID。任何路径、正文或临时请求头都不能选择用户，跨用户对象统一返回 `404`。项目不接入真实教务系统。
+
+普通任务、日历、设置和热词写入先申请绑定用户、方法、路径、规范化正文哈希、阶段与有效期的一次性 write challenge。可靠 Action 另使用绑定用户、action、payload 指纹、阶段与有效期的签名 challenge。高风险删除、覆盖和批量写入需要两次分离用户交互；前端 API helper 不得自动循环完成两阶段。
 
 ## 统一错误
 
 ```json
 {
-  "detail": {
-    "code": "ACTION_NOT_READY",
-    "message": "操作尚未完成所需确认",
-    "retryable": false,
-    "context": {}
-  }
+  "error": {
+    "code": "invalid_action_state",
+    "message": "Action must receive all required confirmations before execution",
+    "details": { "state": "awaiting_confirmation" }
+  },
+  "request_id": "c7b12a..."
 }
 ```
 
 常用状态码：
 
-- `400`：请求语义无效或结构化模型修复失败。
-- `404`：记录或文档不存在。
-- `409`：重复、时间冲突、状态转换冲突或幂等键冲突。
+- `401`：Bearer 凭据缺失或无效，响应包含 `WWW-Authenticate: Bearer`。
+- `403`：账户停用或 Origin 不允许。
+- `404`：当前用户范围内记录或文档不存在。
+- `409`：重复、时间冲突、状态转换、挑战消费或幂等键冲突。
 - `422`：请求不符合 Pydantic Schema。
 - `428`：操作需要确认或补充信息。
 - `500`：事务或执行后验证失败；响应不得声称成功。
@@ -68,11 +71,13 @@ undone
 expired
 ```
 
-确认请求包含唯一 `confirmation_token`，重复令牌不能算作第二次确认。执行接口具备幂等性；已执行操作再次执行返回同一验证结果，不重复写数据库。
+客户端先调用 `POST /api/actions/{id}/challenge` 取得服务端签发的短时 challenge，再向 `POST /api/actions/{id}/confirm` 发送 `{"confirmed": true, "challenge": "..."}`。数据库只保存 nonce 哈希并原子限制每个 action/stage 一次消费；重放、并发重复、过期、跨用户或 payload 改变均失败。执行接口具备幂等性；已执行操作再次执行返回同一验证结果，不重复写数据库。
 
 ## `/ws/asr`
 
-客户端先发送 JSON 控制消息，再发送二进制 PCM 帧：
+客户端先通过认证 REST 调用 `POST /api/auth/ws-ticket`，并携带允许的 `Origin`。原始 ticket 只返回一次，数据库仅保存哈希；连接时以 `campusvoice.ticket.<ticket>` WebSocket 子协议提交，不放入 URL。服务端在接受连接前原子消费并再次校验 Origin。
+
+认证完成后客户端先发送 JSON 控制消息，再发送二进制 PCM 帧：
 
 ```json
 {
@@ -94,3 +99,5 @@ expired
 - `error`：包含稳定错误码、用户可读消息和 `recoverable`。
 
 浏览器 `SpeechRecognition` 不属于此协议，也不能作为生产识别引擎。
+
+服务端还强制限制单帧/控制消息字节数、空闲超时、最大会话时长、累计音频时长和单用户并发连接数。超限返回稳定协议错误并关闭连接；最外层清理负责释放 ASR adapter、持久化会话和并发配额。

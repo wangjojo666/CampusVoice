@@ -1,5 +1,7 @@
 from fastapi.testclient import TestClient
 
+from tests.helpers import confirmed_write
+
 
 def test_settings_get_and_verified_patch(client: TestClient) -> None:
     initial = client.get("/api/settings")
@@ -28,11 +30,7 @@ def test_settings_get_and_verified_patch(client: TestClient) -> None:
     assert unconfirmed.status_code == 428
     assert client.get("/api/settings").json()["major"] is None
 
-    updated = client.patch(
-        "/api/settings",
-        json=payload,
-        headers={"X-User-Confirmed": "true"},
-    )
+    updated = confirmed_write(client, "PATCH", "/api/settings", payload)
     assert updated.status_code == 200, updated.text
     body = updated.json()
     assert body["success"] is True
@@ -46,25 +44,20 @@ def test_settings_get_and_verified_patch(client: TestClient) -> None:
 
 
 def test_settings_schema_rejects_unknown_invalid_and_empty_updates(client: TestClient) -> None:
+    assert confirmed_write(client, "PATCH", "/api/settings", {}).status_code == 422
     assert (
-        client.patch(
+        confirmed_write(
+            client,
+            "PATCH",
             "/api/settings",
-            json={},
-            headers={"X-User-Confirmed": "true"},
+            {"timezone": "Mars/Olympus"},
         ).status_code
         == 422
     )
-    assert (
-        client.patch(
-            "/api/settings",
-            json={"timezone": "Mars/Olympus"},
-            headers={"X-User-Confirmed": "true"},
-        ).status_code
-        == 422
-    )
-    unknown = client.patch(
+    unknown = confirmed_write(
+        client,
+        "PATCH",
         "/api/settings",
-        json={"api_key": "must-not-be-accepted"},
-        headers={"X-User-Confirmed": "true"},
+        {"api_key": "must-not-be-accepted"},
     )
     assert unknown.status_code == 422

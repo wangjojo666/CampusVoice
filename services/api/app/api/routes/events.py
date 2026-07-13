@@ -3,7 +3,12 @@ from typing import Annotated
 from fastapi import APIRouter, Header, Query, Response, status
 from pydantic import AwareDatetime
 
-from app.api.dependencies import SessionDependency, UserIdDependency
+from app.api.dependencies import (
+    MetricsDependency,
+    SessionDependency,
+    UserIdDependency,
+    WriteChallengeDependency,
+)
 from app.repositories.events import EventRepository
 from app.schemas.domain import (
     ConflictCheckRequest,
@@ -14,9 +19,14 @@ from app.schemas.domain import (
     EventUpdate,
     EventView,
 )
+from app.services.actions.service import ActionService
 from app.services.event_service import EventService
 
 router = APIRouter(prefix="/events", tags=["events"])
+
+
+def _mutation_service(metrics: MetricsDependency) -> EventService:
+    return EventService(ActionService(metrics=metrics))
 
 
 @router.get("", response_model=EventList)
@@ -46,14 +56,15 @@ async def create_event(
     body: EventCreate,
     session: SessionDependency,
     user_id: UserIdDependency,
-    confirmed: Annotated[bool, Header(alias="X-User-Confirmed")] = False,
+    _write_challenge: WriteChallengeDependency,
+    metrics: MetricsDependency,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> EventMutationResponse:
-    return await EventService().create(
+    return await _mutation_service(metrics).create(
         session,
         user_id,
         body,
-        confirmed=confirmed,
+        confirmed=True,
         idempotency_key=idempotency_key,
     )
 
@@ -64,15 +75,16 @@ async def update_event(
     body: EventUpdate,
     session: SessionDependency,
     user_id: UserIdDependency,
-    confirmed: Annotated[bool, Header(alias="X-User-Confirmed")] = False,
+    _write_challenge: WriteChallengeDependency,
+    metrics: MetricsDependency,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> EventMutationResponse:
-    return await EventService().update(
+    return await _mutation_service(metrics).update(
         session,
         user_id,
         event_id,
         body,
-        confirmed=confirmed,
+        confirmed=True,
         idempotency_key=idempotency_key,
     )
 
@@ -86,9 +98,12 @@ async def delete_event(
     event_id: str,
     session: SessionDependency,
     user_id: UserIdDependency,
+    metrics: MetricsDependency,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> Response:
-    await EventService().prepare_delete(session, user_id, event_id, idempotency_key=idempotency_key)
+    await _mutation_service(metrics).prepare_delete(
+        session, user_id, event_id, idempotency_key=idempotency_key
+    )
     raise AssertionError("prepare_delete always raises a confirmation requirement")
 
 

@@ -39,7 +39,11 @@ def get_knowledge_service(request: Request, user_id: UserIdDependency) -> Knowle
     answerer = (
         OpenAICompatibleKnowledgeAnswerer(
             base_url=settings.llm_base_url,
-            api_key=settings.llm_api_key,
+            api_key=(
+                settings.llm_api_key.get_secret_value()
+                if settings.llm_api_key is not None
+                else None
+            ),
             model=settings.llm_model,
         )
         if settings.llm_base_url and settings.llm_model
@@ -49,6 +53,7 @@ def get_knowledge_service(request: Request, user_id: UserIdDependency) -> Knowle
         SqlAlchemyKnowledgeRepository(factory, user_id),
         retriever=retriever,
         answerer=answerer,
+        metrics=request.app.state.metrics,
     )
 
 

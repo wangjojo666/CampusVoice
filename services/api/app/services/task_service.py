@@ -1,11 +1,9 @@
-from uuid import uuid4
-
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.entities import PendingAction, Task
 from app.models.enums import ActionType, TaskStatus
 from app.repositories.tasks import TaskRepository
-from app.schemas.actions import ActionPrepareRequest, ConfirmActionRequest, PendingActionView
+from app.schemas.actions import ActionPrepareRequest, PendingActionView
 from app.schemas.domain import TaskCreate, TaskMutationResponse, TaskUpdate, TaskView
 from app.services.actions.service import ActionService
 from app.services.errors import ConfirmationRequiredError, VerificationFailedError
@@ -105,12 +103,7 @@ class TaskService:
     ) -> TaskMutationResponse:
         if not confirmed or action.state.value == "needs_input":
             raise ConfirmationRequiredError(_action_dict(action))
-        action = await self.actions.confirm(
-            session,
-            user_id,
-            action.id,
-            ConfirmActionRequest(confirmed=True, confirmation_token=f"direct-{uuid4().hex}"),
-        )
+        action = await self.actions.confirm_direct(session, user_id, action.id)
         if action.state.value != "ready":
             raise ConfirmationRequiredError(_action_dict(action))
         result = await self.actions.execute(session, user_id, action.id)

@@ -24,6 +24,7 @@ import type {
 } from "@campusvoice/shared-types";
 
 import { mergeContextHotwords } from "@/lib/asr/context-hotwords";
+import { getAccessToken } from "@/lib/auth";
 
 interface WirePendingAction {
   id: string;
@@ -111,6 +112,13 @@ interface WireActionLog {
   created_at: string;
 }
 
+interface WriteChallenge {
+  challenge: string;
+  stage: number;
+  required_stages: number;
+  expires_at: string;
+}
+
 const configuredBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "");
 export const API_BASE_URL = configuredBaseUrl || "http://localhost:8000";
 
@@ -134,11 +142,14 @@ export class ApiError extends Error {
 
   get userMessage() {
     if (this.status === 0) return "无法连接服务，请确认后端已启动并检查网络。";
+    if (this.status === 401) return "登录状态已失效，请重新登录。";
+    if (this.status === 403) return this.message || "当前账户无权执行该操作。";
     if (this.status === 400 || this.status === 422)
       return this.message || "提交的信息不完整，请检查后重试。";
     if (this.status === 404) return this.message || "没有找到对应的数据。";
     if (this.status === 409) return this.message || "操作与现有数据冲突，请检查后再试。";
     if (this.status === 410) return "该操作已过期，请重新发起。";
+    if (this.status === 428) return this.message || "该操作还需要用户确认。";
     if (this.status >= 500) return "服务暂时不可用，请稍后重试。";
     return this.message || "请求失败，请重试。";
   }
@@ -178,6 +189,10 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   if (options.body && !bodyIsForm && !headers.has("Content-Type"))
     headers.set("Content-Type", "application/json");
   headers.set("Accept", "application/json");
+  const accessToken = getAccessToken();
+  if (accessToken && !headers.has("Authorization")) {
+    headers.set("Authorization", `Bearer ${accessToken}`);
+  }
 
   try {
     const response = await fetch(`${API_BASE_URL}${path}`, {
@@ -216,7 +231,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
             typeof errorBody.request_id === "string"
               ? errorBody.request_id
               : (response.headers.get("x-request-id") ?? undefined),
-          details: errorBody.detail,
+          details: errorBody.detail ?? nested.details,
         },
       );
     }
@@ -250,12 +265,41 @@ function jsonBody(value: unknown): Pick<RequestInit, "body"> {
   return { body: JSON.stringify(value) };
 }
 
-function confirmationHeaders(second = false): HeadersInit {
-  return {
-    "X-User-Confirmed": "true",
-    ...(second ? { "X-Second-Confirmation": "true" } : {}),
-    "Idempotency-Key": crypto.randomUUID(),
-  };
+function idempotencyHeaders(): HeadersInit {
+  return { "Idempotency-Key": crypto.randomUUID() };
+}
+
+async function issueWriteChallenge(
+  method: "POST" | "PATCH" | "DELETE",
+  path: string,
+  body: unknown,
+): Promise<WriteChallenge> {
+  return request<WriteChallenge>("/api/auth/write-challenges", {
+    method: "POST",
+    ...jsonBody({ method, path, body }),
+  });
+}
+
+async function confirmedJsonRequest<T>(
+  method: "POST" | "PATCH",
+  path: string,
+  body: unknown,
+  headers?: HeadersInit,
+): Promise<T> {
+  const issued = await issueWriteChallenge(method, path, body);
+  if (issued.stage !== 1 || issued.required_stages !== 1) {
+    throw new ApiError("写入确认策略与请求不匹配，操作未执行。", {
+      status: 409,
+      details: issued,
+    });
+  }
+  const confirmedHeaders = new Headers(headers);
+  confirmedHeaders.set("X-Write-Challenge", issued.challenge);
+  return request<T>(path, {
+    method,
+    headers: confirmedHeaders,
+    ...jsonBody(body),
+  });
 }
 
 function normalizePendingAction(action: WirePendingAction): PendingAction {
@@ -340,11 +384,11 @@ function normalizeCitation(citation: WireCitation): KnowledgeEvidence {
   };
 }
 
-async function executeDestructive<T>(
+async function prepareDestructive(
   action: "delete_task" | "delete_event",
   targetId: string,
-): Promise<MutationResult<T>> {
-  let pending = normalizePendingAction(
+): Promise<PendingAction> {
+  return normalizePendingAction(
     await request<WirePendingAction>("/api/actions/prepare", {
       method: "POST",
       ...jsonBody({
@@ -356,31 +400,14 @@ async function executeDestructive<T>(
       }),
     }),
   );
-  for (
-    let step = 0;
-    step < 2 && ["awaiting_confirmation", "awaiting_second_confirmation"].includes(pending.status);
-    step += 1
-  ) {
-    pending = normalizePendingAction(
-      await request<WirePendingAction>(`/api/actions/${encodeURIComponent(pending.id)}/confirm`, {
-        method: "POST",
-        ...jsonBody({ confirmed: true, confirmation_token: crypto.randomUUID() }),
-      }),
-    );
-  }
-  if (pending.status !== "ready") {
-    throw new ApiError("删除操作未获得全部确认，未执行。", { status: 409, details: pending });
-  }
-  const result = normalizeVerification(
-    await request<VerificationResult & { error?: string | null }>(
-      `/api/actions/${encodeURIComponent(pending.id)}/execute`,
-      { method: "POST" },
-    ),
-  );
-  return result as MutationResult<T>;
 }
 
 export const api = {
+  auth: {
+    websocketTicket: () =>
+      request<{ ticket: string; expires_at: string }>("/api/auth/ws-ticket", { method: "POST" }),
+  },
+
   health: () => request<HealthResponse>("/api/health", { timeoutMs: 5_000 }),
 
   tasks: {
@@ -388,18 +415,15 @@ export const api = {
       filters: { status?: string; course?: string; due_from?: string; due_to?: string } = {},
     ) => listRequest<Task>(`/api/tasks${asQuery(filters)}`),
     create: (data: TaskCreate) =>
-      request<MutationResult<Task>>("/api/tasks", {
-        method: "POST",
-        headers: confirmationHeaders(),
-        ...jsonBody(data),
-      }),
+      confirmedJsonRequest<MutationResult<Task>>("POST", "/api/tasks", data, idempotencyHeaders()),
     update: (id: string, data: TaskUpdate) =>
-      request<MutationResult<Task>>(`/api/tasks/${encodeURIComponent(id)}`, {
-        method: "PATCH",
-        headers: confirmationHeaders(),
-        ...jsonBody(data),
-      }),
-    remove: (id: string) => executeDestructive<Task>("delete_task", id),
+      confirmedJsonRequest<MutationResult<Task>>(
+        "PATCH",
+        `/api/tasks/${encodeURIComponent(id)}`,
+        data,
+        idempotencyHeaders(),
+      ),
+    remove: (id: string) => prepareDestructive("delete_task", id),
   },
 
   events: {
@@ -408,18 +432,20 @@ export const api = {
         `/api/events${asQuery({ starts_after: filters.start, starts_before: filters.end, course: filters.course })}`,
       ),
     create: (data: CalendarEventCreate) =>
-      request<MutationResult<CalendarEvent>>("/api/events", {
-        method: "POST",
-        headers: confirmationHeaders(),
-        ...jsonBody(data),
-      }),
+      confirmedJsonRequest<MutationResult<CalendarEvent>>(
+        "POST",
+        "/api/events",
+        data,
+        idempotencyHeaders(),
+      ),
     update: (id: string, data: CalendarEventUpdate) =>
-      request<MutationResult<CalendarEvent>>(`/api/events/${encodeURIComponent(id)}`, {
-        method: "PATCH",
-        headers: confirmationHeaders(),
-        ...jsonBody(data),
-      }),
-    remove: (id: string) => executeDestructive<CalendarEvent>("delete_event", id),
+      confirmedJsonRequest<MutationResult<CalendarEvent>>(
+        "PATCH",
+        `/api/events/${encodeURIComponent(id)}`,
+        data,
+        idempotencyHeaders(),
+      ),
+    remove: (id: string) => prepareDestructive("delete_event", id),
     checkConflict: (data: { start_at: string; end_at: string; exclude_event_id?: string }) =>
       request<{ conflicts: CalendarEvent[]; has_conflict: boolean }>("/api/events/check-conflict", {
         method: "POST",
@@ -512,31 +538,56 @@ export const api = {
         items: payload.items.map(normalizeHotword),
         total: payload.total,
       })),
-    create: (data: Pick<Hotword, "value" | "category">) =>
-      request<MutationResult<WireHotword>>("/api/hotwords", {
-        method: "POST",
-        headers: confirmationHeaders(),
-        ...jsonBody({ term: data.value, category: data.category, source: "user", weight: 1 }),
-      }).then((payload) => {
+    create: (data: Pick<Hotword, "value" | "category">) => {
+      const body = { term: data.value, category: data.category, source: "user", weight: 1 };
+      return confirmedJsonRequest<MutationResult<WireHotword>>(
+        "POST",
+        "/api/hotwords",
+        body,
+        idempotencyHeaders(),
+      ).then((payload) => {
         if (!payload.record)
           throw new ApiError("热词写入后未能查询到记录。", { status: 409, details: payload });
         return normalizeHotword(payload.record);
-      }),
-    remove: (id: string) =>
+      });
+    },
+    beginRemove: async (id: string) => {
+      const path = `/api/hotwords/${encodeURIComponent(id)}`;
+      const first = await issueWriteChallenge("DELETE", path, null);
+      if (first.stage !== 1 || first.required_stages !== 2) {
+        throw new ApiError("热词删除未获得两阶段确认，操作未执行。", {
+          status: 409,
+          details: first,
+        });
+      }
+      const second = await request<WriteChallenge>("/api/auth/write-challenges/advance", {
+        method: "POST",
+        ...jsonBody({ challenge: first.challenge }),
+      });
+      if (second.stage !== 2 || second.required_stages !== 2) {
+        throw new ApiError("热词删除的第二阶段确认无效，操作未执行。", {
+          status: 409,
+          details: second,
+        });
+      }
+      return second;
+    },
+    finishRemove: (id: string, challenge: string) =>
       request<MutationResult<WireHotword>>(`/api/hotwords/${encodeURIComponent(id)}`, {
         method: "DELETE",
-        headers: confirmationHeaders(true),
+        headers: { "X-Write-Challenge": challenge },
       }),
   },
 
   settings: {
     get: () => request<UserSettings>("/api/settings"),
     update: (data: Partial<UserSettings>) =>
-      request<{ settings: UserSettings }>("/api/settings", {
-        method: "PATCH",
-        headers: confirmationHeaders(),
-        ...jsonBody(data),
-      }).then((response) => response.settings),
+      confirmedJsonRequest<{ settings: UserSettings }>(
+        "PATCH",
+        "/api/settings",
+        data,
+        idempotencyHeaders(),
+      ).then((response) => response.settings),
   },
 
   intent: {
@@ -657,11 +708,16 @@ export const api = {
         method: "POST",
         ...jsonBody(data),
       }).then(normalizePendingAction),
-    confirm: (id: string, confirmed: boolean, confirmationToken: string) =>
-      request<WirePendingAction>(`/api/actions/${encodeURIComponent(id)}/confirm`, {
+    confirm: async (id: string, confirmed: boolean) => {
+      const issued = await request<{ challenge: string; stage: number; expires_at: string }>(
+        `/api/actions/${encodeURIComponent(id)}/challenge`,
+        { method: "POST" },
+      );
+      return request<WirePendingAction>(`/api/actions/${encodeURIComponent(id)}/confirm`, {
         method: "POST",
-        ...jsonBody({ confirmed, confirmation_token: confirmationToken }),
-      }).then(normalizePendingAction),
+        ...jsonBody({ confirmed, challenge: issued.challenge }),
+      }).then(normalizePendingAction);
+    },
     execute: (id: string) =>
       request<VerificationResult & { error?: string | null }>(
         `/api/actions/${encodeURIComponent(id)}/execute`,

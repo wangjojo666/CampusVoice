@@ -170,6 +170,35 @@ async function installApiMocks(page: Page, options: MockOptions = {}) {
     if (path === "/api/health")
       return fulfill(route, { status: "ok", service: "CampusVoice API", version: "0.1.0" });
 
+    if (path === "/api/auth/ws-ticket" && method === "POST")
+      return fulfill(route, {
+        ticket: "e2e-websocket-ticket",
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+      });
+
+    if (path === "/api/auth/write-challenges" && method === "POST") {
+      const descriptor = body as { method?: unknown; path?: unknown };
+      const requiredStages =
+        descriptor.method === "DELETE" &&
+        typeof descriptor.path === "string" &&
+        descriptor.path.startsWith("/api/hotwords/")
+          ? 2
+          : 1;
+      return fulfill(route, {
+        challenge: `write-stage-1-${state.calls.length}`,
+        stage: 1,
+        required_stages: requiredStages,
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+      });
+    }
+    if (path === "/api/auth/write-challenges/advance" && method === "POST")
+      return fulfill(route, {
+        challenge: `write-stage-2-${state.calls.length}`,
+        stage: 2,
+        required_stages: 2,
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+      });
+
     if (path === "/api/tasks" && method === "GET")
       return fulfill(route, { items: state.tasks, total: state.tasks.length });
     if (path === "/api/tasks" && method === "POST") {
@@ -293,6 +322,19 @@ async function installApiMocks(page: Page, options: MockOptions = {}) {
         record: created,
       });
     }
+    if (/^\/api\/hotwords\/[^/]+$/.test(path) && method === "DELETE") {
+      const id = decodeURIComponent(path.split("/").at(-1) ?? "");
+      state.hotwords = state.hotwords.filter((item) => item.id !== id);
+      return fulfill(route, {
+        success: true,
+        action: "delete_hotword",
+        record_id: null,
+        verified_fields: { deleted: true },
+        side_effects: [],
+        message: "热词已删除并验证",
+        record: null,
+      });
+    }
 
     if (path === "/api/correction/preview" && method === "POST") {
       const text = String((body as Record<string, unknown>).text);
@@ -333,8 +375,23 @@ async function installApiMocks(page: Page, options: MockOptions = {}) {
       };
       return fulfill(route, wireAction());
     }
+    if (/^\/api\/actions\/[^/]+\/challenge$/.test(path) && method === "POST") {
+      if (!state.pending) throw new Error("challenge called without prepare");
+      const stage = state.pending.confirmations + 1;
+      if (stage > state.pending.required)
+        throw new Error("challenge called after action was ready");
+      return fulfill(route, {
+        challenge: `action-stage-${stage}-${"x".repeat(32)}`,
+        stage,
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+      });
+    }
     if (/^\/api\/actions\/[^/]+\/confirm$/.test(path) && method === "POST") {
       if (!state.pending) throw new Error("confirm called without prepare");
+      const expectedStage = state.pending.confirmations + 1;
+      const confirmation = body as { challenge?: unknown };
+      if (confirmation.challenge !== `action-stage-${expectedStage}-${"x".repeat(32)}`)
+        throw new Error("confirm called without its server-issued action challenge");
       state.pending.confirmations += 1;
       return fulfill(route, wireAction());
     }
@@ -476,9 +533,15 @@ async function installSyntheticAudioAndWebSocket(page: Page) {
       onerror: (() => void) | null = null;
       onclose: (() => void) | null = null;
 
-      constructor(url: string) {
+      constructor(url: string, protocols?: string | string[]) {
         this.url = url;
         telemetry.events.push(`ws:construct:${url}`);
+        const offeredProtocols = Array.isArray(protocols)
+          ? protocols
+          : protocols
+            ? [protocols]
+            : [];
+        telemetry.events.push(`ws:protocols:${offeredProtocols.join(",")}`);
         window.setTimeout(() => {
           this.readyState = MockWebSocket.OPEN;
           telemetry.events.push("ws:open");
@@ -548,7 +611,8 @@ async function installSyntheticAudioAndWebSocket(page: Page) {
     const RoutedWebSocket = new Proxy(NativeWebSocket, {
       construct(target, argumentsList) {
         const url = String(argumentsList[0]);
-        if (url.endsWith("/ws/asr")) return new MockWebSocket(url);
+        if (url.endsWith("/ws/asr"))
+          return new MockWebSocket(url, argumentsList[1] as string | string[] | undefined);
         return Reflect.construct(target, argumentsList);
       },
     });
@@ -576,7 +640,7 @@ test("02 待办列表在浏览器中完成关键词和状态筛选", async ({ pa
   await expect(page.getByRole("heading", { name: "复习机器学习" })).toBeHidden();
 });
 
-test("03 新建待办经过 UI 核对并携带显式确认请求头", async ({ page }) => {
+test("03 新建待办经过 UI 核对并携带服务端写挑战", async ({ page }) => {
   const state = await installApiMocks(page, { tasks: [] });
   await page.goto("/tasks");
   await page.getByRole("button", { name: "新增待办" }).first().click();
@@ -591,7 +655,16 @@ test("03 新建待办经过 UI 核对并携带显式确认请求头", async ({ p
   const createCall = state.calls.find(
     (call) => call.method === "POST" && call.path === "/api/tasks",
   );
-  expect(createCall?.headers["x-user-confirmed"]).toBe("true");
+  expect(createCall?.headers["x-write-challenge"]).toMatch(/^write-stage-1-/);
+  expect(
+    state.calls.some(
+      (call) =>
+        call.path === "/api/auth/write-challenges" &&
+        call.body &&
+        (call.body as Record<string, unknown>).method === "POST" &&
+        (call.body as Record<string, unknown>).path === "/api/tasks",
+    ),
+  ).toBe(true);
 });
 
 test("04 删除待办要求输入标题且 REST 状态机完成两次确认", async ({ page }) => {
@@ -599,12 +672,24 @@ test("04 删除待办要求输入标题且 REST 状态机完成两次确认", as
   await page.goto("/tasks");
   await page.getByRole("button", { name: "删除删除前核对我" }).click();
   const dialog = page.getByRole("dialog", { name: "高风险：删除待办" });
-  const deleteButton = dialog.getByRole("button", { name: "再次确认删除" });
-  await expect(deleteButton).toBeDisabled();
-  await dialog.getByLabel("输入完整标题确认").fill("删除前核对我");
-  await deleteButton.click();
+  const firstButton = dialog.getByRole("button", { name: "第一次确认删除" });
+  await expect(firstButton).toBeDisabled();
+  await dialog.getByLabel("输入完整标题进行第一次确认").fill("删除前核对我");
+  await firstButton.click();
+
+  await expect(page.getByRole("status")).toContainText("第一次确认已记录");
+  await expect(dialog).toContainText("第一次确认已完成");
+  const secondButton = dialog.getByRole("button", { name: "第二次确认并删除" });
+  await expect(secondButton).toBeDisabled();
+  expect(state.calls.filter((call) => call.path.endsWith("/challenge"))).toHaveLength(1);
+  expect(state.calls.filter((call) => call.path.endsWith("/confirm"))).toHaveLength(1);
+  expect(state.calls.filter((call) => call.path.endsWith("/execute"))).toHaveLength(0);
+
+  await dialog.getByLabel("重新输入完整标题进行第二次确认").fill("删除前核对我");
+  await secondButton.click();
   await expect(page.getByRole("status")).toContainText("记录已删除并验证");
   await expect(page.getByRole("heading", { name: "删除前核对我" })).toHaveCount(0);
+  expect(state.calls.filter((call) => call.path.endsWith("/challenge"))).toHaveLength(2);
   expect(state.calls.filter((call) => call.path.endsWith("/confirm"))).toHaveLength(2);
   expect(state.calls.filter((call) => call.path.endsWith("/execute"))).toHaveLength(1);
 });
@@ -672,8 +757,30 @@ test("08 设置与热词通过已确认 REST 请求保存并立即回显", async
   await page.getByRole("button", { name: "添加热词" }).click();
   await expect(page.getByText("Diffusion Transformer", { exact: true })).toBeVisible();
   const save = state.calls.find((call) => call.method === "PATCH" && call.path === "/api/settings");
-  expect(save?.headers["x-user-confirmed"]).toBe("true");
+  expect(save?.headers["x-write-challenge"]).toMatch(/^write-stage-1-/);
   expect(save?.body).toMatchObject({ major: "智能科学与技术" });
+  expect(
+    state.calls.some(
+      (call) =>
+        call.path === "/api/auth/write-challenges" &&
+        call.body &&
+        (call.body as Record<string, unknown>).method === "PATCH" &&
+        (call.body as Record<string, unknown>).path === "/api/settings",
+    ),
+  ).toBe(true);
+
+  await page.getByRole("button", { name: "删除热词Diffusion Transformer" }).click();
+  await expect(page.getByRole("dialog")).toContainText("第二次确认");
+  expect(
+    state.calls.some((call) => call.method === "DELETE" && call.path.startsWith("/api/hotwords/")),
+  ).toBe(false);
+  await page.getByRole("button", { name: "第二次确认并删除" }).click();
+  await expect(page.getByText("Diffusion Transformer", { exact: true })).toHaveCount(0);
+  const deleted = state.calls.find(
+    (call) => call.method === "DELETE" && call.path.startsWith("/api/hotwords/"),
+  );
+  expect(deleted?.headers["x-write-challenge"]).toMatch(/^write-stage-2-/);
+  expect(state.calls.some((call) => call.path === "/api/auth/write-challenges/advance")).toBe(true);
 });
 
 test("09 通知引用转为语音待办并经过纠错、意图、确认和数据库验证", async ({ page }) => {
@@ -721,6 +828,9 @@ test("10 合成 PCM 贯穿浏览器 AudioWorklet、WebSocket 与录音状态链"
   });
   expect(telemetry.audioBytes).toBeGreaterThan(0);
   expect(telemetry.events).toContain("worklet-module:/audio-processor.js");
+  expect(telemetry.events).toContain(
+    "ws:protocols:campusvoice,campusvoice.ticket.e2e-websocket-ticket",
+  );
   expect(telemetry.events).toContain("ws:control:start");
   expect(telemetry.events).toContain("ws:control:flush");
   expect(telemetry.events).toContain("ws:control:stop");

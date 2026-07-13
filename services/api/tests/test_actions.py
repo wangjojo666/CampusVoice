@@ -4,6 +4,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app.services.verification.service import VerificationReport
+from tests.helpers import confirm_action, confirmed_write
 
 
 def test_completeness_and_low_confidence_risk_are_deterministic(client: TestClient) -> None:
@@ -42,11 +43,9 @@ def test_unknown_payload_fields_are_rejected(client: TestClient) -> None:
 
 
 def test_unique_task_title_is_resolved_without_exposing_an_internal_id(client: TestClient) -> None:
-    task_id = client.post(
-        "/api/tasks",
-        json={"title": "机器学习作业"},
-        headers={"X-User-Confirmed": "true"},
-    ).json()["record_id"]
+    task_id = confirmed_write(client, "POST", "/api/tasks", {"title": "机器学习作业"}).json()[
+        "record_id"
+    ]
 
     prepared = client.post(
         "/api/actions/prepare",
@@ -66,10 +65,11 @@ def test_unique_task_title_is_resolved_without_exposing_an_internal_id(client: T
 
 def test_same_title_candidates_and_missing_title_match_need_input(client: TestClient) -> None:
     for due_at in ("2026-07-18T01:00:00Z", "2026-07-19T01:00:00Z"):
-        created = client.post(
+        created = confirmed_write(
+            client,
+            "POST",
             "/api/tasks",
-            json={"title": "实验报告", "due_at": due_at},
-            headers={"X-User-Confirmed": "true"},
+            {"title": "实验报告", "due_at": due_at},
         )
         assert created.status_code == 201, created.text
 
@@ -98,10 +98,11 @@ def test_same_title_candidates_and_missing_title_match_need_input(client: TestCl
 def test_unique_event_title_is_resolved_before_high_risk_delete_confirmation(
     client: TestClient,
 ) -> None:
-    event_id = client.post(
+    event_id = confirmed_write(
+        client,
+        "POST",
         "/api/events",
-        json={"title": "项目答辩", "start_at": "2026-07-20T01:00:00Z"},
-        headers={"X-User-Confirmed": "true"},
+        {"title": "项目答辩", "start_at": "2026-07-20T01:00:00Z"},
     ).json()["record_id"]
 
     prepared = client.post(
@@ -135,10 +136,7 @@ def test_prepare_and_execute_are_idempotent(client: TestClient) -> None:
     assert reused.json()["error"]["code"] == "idempotency_key_reused"
 
     action_id = first.json()["id"]
-    client.post(
-        f"/api/actions/{action_id}/confirm",
-        json={"confirmed": True, "confirmation_token": "idempotent-confirm"},
-    )
+    confirm_action(client, action_id)
     executed = client.post(f"/api/actions/{action_id}/execute")
     repeated = client.post(f"/api/actions/{action_id}/execute")
     assert executed.json()["success"] is True
@@ -147,10 +145,11 @@ def test_prepare_and_execute_are_idempotent(client: TestClient) -> None:
 
 
 def test_task_update_undo_restores_confirmed_snapshot(client: TestClient) -> None:
-    task_id = client.post(
+    task_id = confirmed_write(
+        client,
+        "POST",
         "/api/tasks",
-        json={"title": "撤销前", "priority": "low"},
-        headers={"X-User-Confirmed": "true"},
+        {"title": "撤销前", "priority": "low"},
     ).json()["record_id"]
     prepared = client.post(
         "/api/actions/prepare",
@@ -161,10 +160,7 @@ def test_task_update_undo_restores_confirmed_snapshot(client: TestClient) -> Non
         },
     ).json()
     action_id = prepared["id"]
-    client.post(
-        f"/api/actions/{action_id}/confirm",
-        json={"confirmed": True, "confirmation_token": "update-undo-confirm"},
-    )
+    confirm_action(client, action_id)
     assert client.post(f"/api/actions/{action_id}/execute").json()["success"] is True
     changed = client.get("/api/tasks").json()["items"][0]
     assert (changed["title"], changed["priority"]) == ("撤销后", "high")
@@ -184,10 +180,7 @@ def test_post_commit_verification_failure_never_reports_success(
         json={"action": "create_task", "payload": {"title": "验证失败测试"}},
     ).json()
     action_id = prepared["id"]
-    client.post(
-        f"/api/actions/{action_id}/confirm",
-        json={"confirmed": True, "confirmation_token": "verify-token-one"},
-    )
+    confirm_action(client, action_id)
 
     async def fail_verification(*_args: object, **_kwargs: object) -> VerificationReport:
         return VerificationReport(False, {"title": False}, ("forced_test_failure",), None)
@@ -217,10 +210,7 @@ def test_database_exception_rolls_back_and_is_logged(client: TestClient) -> None
         json={"action": "create_task", "payload": {"title": "事务回滚"}},
     ).json()
     action_id = prepared["id"]
-    client.post(
-        f"/api/actions/{action_id}/confirm",
-        json={"confirmed": True, "confirmation_token": "rollback-token"},
-    )
+    confirm_action(client, action_id)
 
     async def explode(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("forced database failure")
@@ -254,11 +244,10 @@ def test_expired_action_is_durably_marked_and_rejected(client: TestClient) -> No
     ).json()["id"]
     future = datetime.now(UTC) + timedelta(days=1)
     with patch("app.services.actions.service.utc_now", return_value=future):
-        response = client.post(
-            f"/api/actions/{action_id}/confirm",
-            json={"confirmed": True, "confirmation_token": "expired-confirm"},
-        )
+        response = client.post(f"/api/actions/{action_id}/challenge")
     assert response.status_code == 409
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["Pragma"] == "no-cache"
     assert response.json()["error"]["code"] == "action_expired"
     assert client.get(f"/api/actions/{action_id}").json()["state"] == "expired"
 
@@ -268,10 +257,7 @@ def test_expired_undo_window_is_durably_rejected(client: TestClient) -> None:
         "/api/actions/prepare",
         json={"action": "create_task", "payload": {"title": "撤销过期任务"}},
     ).json()["id"]
-    client.post(
-        f"/api/actions/{action_id}/confirm",
-        json={"confirmed": True, "confirmation_token": "undo-expiry-confirm"},
-    )
+    confirm_action(client, action_id)
     assert client.post(f"/api/actions/{action_id}/execute").json()["success"] is True
 
     future = datetime.now(UTC) + timedelta(days=2)

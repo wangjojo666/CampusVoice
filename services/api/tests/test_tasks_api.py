@@ -1,16 +1,23 @@
 from fastapi.testclient import TestClient
 
+from tests.helpers import confirm_action, confirmed_write
+
 
 def test_task_crud_requires_confirmation_and_verifies_database(client: TestClient) -> None:
     unconfirmed = client.post("/api/tasks", json={"title": "机器学习作业"})
     assert unconfirmed.status_code == 428
-    assert unconfirmed.json()["error"]["code"] == "confirmation_required"
+    assert unconfirmed.json()["error"]["code"] == "write_challenge_required"
     assert client.get("/api/tasks").json()["total"] == 0
 
-    created = client.post(
+    create_payload = {
+        "title": "机器学习作业",
+        "due_at": "2026-07-18T18:00:00+08:00",
+    }
+    created = confirmed_write(
+        client,
+        "POST",
         "/api/tasks",
-        json={"title": "机器学习作业", "due_at": "2026-07-18T18:00:00+08:00"},
-        headers={"X-User-Confirmed": "true"},
+        create_payload,
     )
     assert created.status_code == 201, created.text
     body = created.json()
@@ -19,10 +26,12 @@ def test_task_crud_requires_confirmation_and_verifies_database(client: TestClien
     assert body["record"]["due_at"] == "2026-07-18T10:00:00Z"
     task_id = body["record_id"]
 
-    updated = client.patch(
+    update_payload = {"priority": "high", "expected_version": 1}
+    updated = confirmed_write(
+        client,
+        "PATCH",
         f"/api/tasks/{task_id}",
-        json={"priority": "high", "expected_version": 1},
-        headers={"X-User-Confirmed": "true"},
+        update_payload,
     )
     assert updated.status_code == 200, updated.text
     assert updated.json()["record"]["priority"] == "high"
@@ -34,18 +43,11 @@ def test_task_crud_requires_confirmation_and_verifies_database(client: TestClien
 
 
 def test_duplicate_task_is_blocked_before_execution(client: TestClient) -> None:
-    first = client.post(
-        "/api/tasks",
-        json={"title": "数据库复习", "course": "数据库"},
-        headers={"X-User-Confirmed": "true"},
-    )
+    payload = {"title": "数据库复习", "course": "数据库"}
+    first = confirmed_write(client, "POST", "/api/tasks", payload)
     assert first.status_code == 201
 
-    duplicate = client.post(
-        "/api/tasks",
-        json={"title": "数据库复习", "course": "数据库"},
-        headers={"X-User-Confirmed": "true"},
-    )
+    duplicate = confirmed_write(client, "POST", "/api/tasks", payload)
     assert duplicate.status_code == 428
     pending = duplicate.json()["error"]["details"]["pending_action"]
     assert pending["state"] == "needs_input"
@@ -54,11 +56,9 @@ def test_duplicate_task_is_blocked_before_execution(client: TestClient) -> None:
 
 
 def test_delete_needs_two_unique_confirmations_and_can_be_undone(client: TestClient) -> None:
-    task_id = client.post(
-        "/api/tasks",
-        json={"title": "待删除任务"},
-        headers={"X-User-Confirmed": "true"},
-    ).json()["record_id"]
+    task_id = confirmed_write(client, "POST", "/api/tasks", {"title": "待删除任务"}).json()[
+        "record_id"
+    ]
 
     requested = client.delete(f"/api/tasks/{task_id}")
     assert requested.status_code == 428
@@ -67,22 +67,20 @@ def test_delete_needs_two_unique_confirmations_and_can_be_undone(client: TestCli
     assert action["required_confirmations"] == 2
     action_id = action["id"]
 
+    issued = client.post(f"/api/actions/{action_id}/challenge").json()["challenge"]
     first = client.post(
         f"/api/actions/{action_id}/confirm",
-        json={"confirmed": True, "confirmation_token": "delete-token-one"},
+        json={"confirmed": True, "challenge": issued},
     )
     assert first.json()["state"] == "awaiting_second_confirmation"
     duplicate_click = client.post(
         f"/api/actions/{action_id}/confirm",
-        json={"confirmed": True, "confirmation_token": "delete-token-one"},
+        json={"confirmed": True, "challenge": issued},
     )
-    assert duplicate_click.json()["confirmations_received"] == 1
+    assert duplicate_click.status_code == 409
     assert client.post(f"/api/actions/{action_id}/execute").status_code == 409
 
-    second = client.post(
-        f"/api/actions/{action_id}/confirm",
-        json={"confirmed": True, "confirmation_token": "delete-token-two"},
-    )
+    second = confirm_action(client, action_id)
     assert second.json()["state"] == "ready"
     deleted = client.post(f"/api/actions/{action_id}/execute")
     assert deleted.status_code == 200
@@ -98,15 +96,14 @@ def test_delete_needs_two_unique_confirmations_and_can_be_undone(client: TestCli
 
 
 def test_optimistic_version_conflict_does_not_modify_task(client: TestClient) -> None:
-    task_id = client.post(
-        "/api/tasks",
-        json={"title": "版本检查"},
-        headers={"X-User-Confirmed": "true"},
-    ).json()["record_id"]
-    response = client.patch(
+    task_id = confirmed_write(client, "POST", "/api/tasks", {"title": "版本检查"}).json()[
+        "record_id"
+    ]
+    response = confirmed_write(
+        client,
+        "PATCH",
         f"/api/tasks/{task_id}",
-        json={"title": "不应保存", "expected_version": 99},
-        headers={"X-User-Confirmed": "true"},
+        {"title": "不应保存", "expected_version": 99},
     )
     assert response.status_code == 409
     task = client.get("/api/tasks").json()["items"][0]

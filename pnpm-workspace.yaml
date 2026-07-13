@@ -5,3 +5,11 @@ packages:
 allowBuilds:
   sharp: true
   unrs-resolver: true
+
+# Next 16.2.10 still pins vulnerable PostCSS 8.4.31. This narrowly allows the
+# reviewed security release; remove both entries after Next updates upstream.
+minimumReleaseAgeExclude:
+  - postcss@8.5.17
+
+overrides:
+  "next@16.2.10>postcss": "8.5.17"

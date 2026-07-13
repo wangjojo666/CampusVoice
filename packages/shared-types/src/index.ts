@@ -226,7 +226,6 @@ export interface PendingAction {
   requires_second_confirmation?: boolean;
   confirmation_count?: number;
   confirmations_required?: number;
-  confirmation_token?: string;
   expires_at?: ISODateTime;
   missing_fields?: string[];
   ambiguities?: string[];
@@ -293,17 +292,25 @@ export interface ActionLog {
 }
 
 export interface HealthResponse {
-  status: "ok" | "degraded" | "error" | string;
-  service?: string;
-  version?: string;
-  timestamp?: ISODateTime;
-  checks?: Record<string, "ok" | "degraded" | "error" | string>;
+  status: "ok" | "error";
+  service: string;
+  version: string;
+  checks: Record<
+    string,
+    {
+      status: "ok" | "error" | "disabled";
+      message: string;
+    }
+  >;
 }
 
 export interface ApiErrorBody {
   detail?: string | Array<{ loc?: Array<string | number>; msg: string; type?: string }>;
-  message?: string;
-  code?: string;
+  error?: {
+    code: string;
+    message: string;
+    details: Record<string, unknown>;
+  };
   request_id?: string;
 }
 

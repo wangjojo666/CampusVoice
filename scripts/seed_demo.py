@@ -21,15 +21,35 @@ def checked(response: httpx.Response, *, duplicate_ok: bool = True) -> dict[str,
     return payload if isinstance(payload, dict) else {"items": payload}
 
 
+def confirmed_write(
+    client: httpx.Client,
+    method: str,
+    path: str,
+    *,
+    json: object,
+    headers: dict[str, str] | None = None,
+) -> httpx.Response:
+    issued = checked(
+        client.post(
+            "/api/auth/write-challenges",
+            json={"method": method.upper(), "path": path, "body": json},
+        ),
+        duplicate_ok=False,
+    )
+    request_headers = dict(headers or {})
+    request_headers["X-Write-Challenge"] = str(issued["challenge"])
+    return client.request(method, path, headers=request_headers, json=json)
+
+
 def seed(base_url: str) -> None:
-    common_headers = {"X-User-Confirmed": "true"}
     with httpx.Client(base_url=base_url.rstrip("/"), timeout=90) as client:
         checked(client.get("/api/health"), duplicate_ok=False)
 
         settings = checked(
-            client.patch(
+            confirmed_write(
+                client,
+                "PATCH",
                 "/api/settings",
-                headers=common_headers,
                 json={
                     "major": "人工智能",
                     "grade": "2024级",
@@ -57,12 +77,11 @@ def seed(base_url: str) -> None:
         )
 
         task = checked(
-            client.post(
+            confirmed_write(
+                client,
+                "POST",
                 "/api/tasks",
-                headers={
-                    **common_headers,
-                    "Idempotency-Key": "demo-task-nlp-report-v1",
-                },
+                headers={"Idempotency-Key": "demo-task-nlp-report-v1"},
                 json={
                     "title": "提交自然语言处理课程设计报告",
                     "course": "自然语言处理",
@@ -75,12 +94,11 @@ def seed(base_url: str) -> None:
         )
 
         event = checked(
-            client.post(
+            confirmed_write(
+                client,
+                "POST",
                 "/api/events",
-                headers={
-                    **common_headers,
-                    "Idempotency-Key": "demo-event-machine-learning-exam-v1",
-                },
+                headers={"Idempotency-Key": "demo-event-machine-learning-exam-v1"},
                 json={
                     "title": "机器学习期末考试",
                     "course": "机器学习",
@@ -102,9 +120,10 @@ def seed(base_url: str) -> None:
         ]:
             hotword_results.append(
                 checked(
-                    client.post(
+                    confirmed_write(
+                        client,
+                        "POST",
                         "/api/hotwords",
-                        headers=common_headers,
                         json={
                             "term": term,
                             "category": category,

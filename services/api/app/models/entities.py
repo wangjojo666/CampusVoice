@@ -398,6 +398,95 @@ class PendingAction(TimestampMixin, Base):
     result: Mapped[dict[str, Any] | None] = mapped_column(MutableDict.as_mutable(JSON))
 
 
+class ConfirmationNonce(Base):
+    __tablename__ = "confirmation_nonces"
+    __table_args__ = (
+        UniqueConstraint(
+            "pending_action_id",
+            "stage",
+            name="uq_confirmation_nonces_action_stage",
+        ),
+        CheckConstraint("stage > 0 AND stage <= 2", name="confirmation_stage_range"),
+        Index("ix_confirmation_nonces_user_action", "user_id", "pending_action_id"),
+    )
+
+    nonce_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    pending_action_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("pending_actions.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    stage: Mapped[int] = mapped_column(Integer, nullable=False)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    consumed_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+
+
+class WebSocketTicket(Base):
+    __tablename__ = "websocket_tickets"
+    __table_args__ = (Index("ix_websocket_tickets_user_expires", "user_id", "expires_at"),)
+
+    ticket_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    origin: Mapped[str] = mapped_column(String(500), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
+
+
+class WriteChallenge(Base):
+    __tablename__ = "write_challenges"
+    __table_args__ = (
+        UniqueConstraint("flow_id", "stage", name="uq_write_challenges_flow_stage"),
+        CheckConstraint(
+            "required_stages >= 1 AND required_stages <= 2",
+            name="write_required_stages_range",
+        ),
+        CheckConstraint(
+            "stage >= 1 AND stage <= required_stages",
+            name="write_stage_range",
+        ),
+        Index("ix_write_challenges_user_expires", "user_id", "expires_at"),
+        Index("ix_write_challenges_flow_stage", "flow_id", "stage"),
+    )
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    flow_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    method: Mapped[str] = mapped_column(String(10), nullable=False)
+    path: Mapped[str] = mapped_column(String(500), nullable=False)
+    body_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    stage: Mapped[int] = mapped_column(Integer, nullable=False)
+    required_stages: Mapped[int] = mapped_column(Integer, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
+
+
+class PrivacyDeletionChallenge(Base):
+    __tablename__ = "privacy_deletion_challenges"
+    __table_args__ = (
+        CheckConstraint("scope = 'business_data'", name="privacy_scope_supported"),
+        UniqueConstraint("nonce_hash", name="uq_privacy_deletion_challenges_nonce_hash"),
+        Index("ix_privacy_deletion_challenges_user_expires", "user_id", "expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: new_id("pdc"))
+    user_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    scope: Mapped[str] = mapped_column(String(32), nullable=False)
+    nonce_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
+
+
 class ActionLog(Base):
     __tablename__ = "action_logs"
     __table_args__ = (Index("ix_action_logs_user_created", "user_id", "created_at"),)

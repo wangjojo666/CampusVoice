@@ -49,17 +49,24 @@ class ActionRepository:
         )
         return list(logs), int(count or 0)
 
-    async def log_for_action(self, session: AsyncSession, action_id: str) -> ActionLog | None:
+    async def log_for_action(
+        self, session: AsyncSession, user_id: str, action_id: str
+    ) -> ActionLog | None:
         log: ActionLog | None = await session.scalar(
             select(ActionLog)
-            .where(ActionLog.pending_action_id == action_id)
+            .where(ActionLog.pending_action_id == action_id, ActionLog.user_id == user_id)
             .order_by(ActionLog.created_at.desc())
         )
         return log
 
-    async def undo_for_log(self, session: AsyncSession, log_id: str) -> UndoRecord | None:
+    async def undo_for_log(
+        self, session: AsyncSession, user_id: str, log_id: str
+    ) -> UndoRecord | None:
         undo: UndoRecord | None = await session.scalar(
-            select(UndoRecord).where(UndoRecord.action_log_id == log_id)
+            select(UndoRecord).where(
+                UndoRecord.action_log_id == log_id,
+                UndoRecord.user_id == user_id,
+            )
         )
         return undo
 

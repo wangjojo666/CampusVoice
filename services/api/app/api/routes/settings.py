@@ -1,8 +1,6 @@
-from typing import Annotated
+from fastapi import APIRouter
 
-from fastapi import APIRouter, Header
-
-from app.api.dependencies import SessionDependency, UserIdDependency
+from app.api.dependencies import SessionDependency, UserIdDependency, WriteChallengeDependency
 from app.schemas.settings import (
     UserSettingsMutationResponse,
     UserSettingsUpdate,
@@ -26,11 +24,11 @@ async def update_user_settings(
     body: UserSettingsUpdate,
     session: SessionDependency,
     user_id: UserIdDependency,
-    confirmed: Annotated[bool, Header(alias="X-User-Confirmed")] = False,
+    _write_challenge: WriteChallengeDependency,
 ) -> UserSettingsMutationResponse:
     return await UserSettingsService().update(
         session,
         user_id,
         body,
-        confirmed=confirmed,
+        confirmed=True,
     )

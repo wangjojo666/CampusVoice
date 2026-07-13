@@ -1,4 +1,5 @@
 import type { AsrClientMessage, AsrServerMessage } from "@campusvoice/shared-types";
+import { websocketProtocols } from "@/lib/auth";
 
 export interface AsrClientHandlers {
   onMessage: (message: AsrServerMessage) => void;
@@ -75,18 +76,23 @@ export class AsrWebSocketClient {
   private readonly handlers: AsrClientHandlers;
   private readonly url: string;
   private readonly hotwords: string[];
+  private readonly ticket: string;
 
-  constructor(handlers: AsrClientHandlers, options: { url?: string; hotwords?: string[] } = {}) {
+  constructor(
+    handlers: AsrClientHandlers,
+    options: { ticket: string; url?: string; hotwords?: string[] },
+  ) {
     this.handlers = handlers;
     this.url = options.url ?? defaultAsrUrl();
     this.hotwords = options.hotwords ?? [];
+    this.ticket = options.ticket;
   }
 
   connect(): Promise<void> {
     if (this.socket) throw new Error("ASR WebSocket is already connected");
     return new Promise((resolve, reject) => {
       let settled = false;
-      const socket = new WebSocket(this.url);
+      const socket = new WebSocket(this.url, websocketProtocols(this.ticket));
       socket.binaryType = "arraybuffer";
       this.socket = socket;
 

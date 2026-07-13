@@ -52,7 +52,13 @@ class PendingActionView(StrictModel):
 
 class ConfirmActionRequest(StrictModel):
     confirmed: bool = True
-    confirmation_token: str = Field(min_length=8, max_length=160)
+    challenge: str = Field(min_length=32, max_length=2_048)
+
+
+class ConfirmationChallenge(StrictModel):
+    challenge: str
+    stage: int = Field(ge=1, le=2)
+    expires_at: datetime
 
 
 class CancelActionRequest(StrictModel):

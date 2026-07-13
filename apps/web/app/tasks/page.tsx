@@ -1,6 +1,6 @@
 "use client";
 
-import type { Task, TaskCreate, TaskUpdate } from "@campusvoice/shared-types";
+import type { PendingAction, Task, TaskCreate, TaskUpdate } from "@campusvoice/shared-types";
 import { Check, ChevronDown, Clock3, Edit3, Plus, RotateCcw, Search, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
@@ -34,6 +34,7 @@ export default function TasksPage() {
   const [editing, setEditing] = useState<Task | null>(null);
   const [deleting, setDeleting] = useState<Task | null>(null);
   const [deleteText, setDeleteText] = useState("");
+  const [pendingDelete, setPendingDelete] = useState<PendingAction | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -135,11 +136,43 @@ export default function TasksPage() {
     setBusy(true);
     setError(null);
     try {
-      const result = await api.tasks.remove(deleting.id);
+      const action = pendingDelete ?? (await api.tasks.remove(deleting.id));
+      const isFirstConfirmation = action.status === "awaiting_confirmation";
+      if (!isFirstConfirmation && action.status !== "awaiting_second_confirmation") {
+        throw new ApiError("删除操作不在可确认状态，请重新发起。", {
+          status: 409,
+          details: action,
+        });
+      }
+
+      if (pendingDelete === null) setPendingDelete(action);
+      const updated = await api.actions.confirm(action.id, true);
+      setPendingDelete(updated);
+
+      if (isFirstConfirmation) {
+        if (updated.status !== "awaiting_second_confirmation") {
+          throw new ApiError("第一次确认后的状态不安全，未执行删除。", {
+            status: 409,
+            details: updated,
+          });
+        }
+        setDeleteText("");
+        setNotice("第一次确认已记录。请重新输入标题并完成第二次确认。");
+        return;
+      }
+
+      if (updated.status !== "ready") {
+        throw new ApiError("删除操作尚未获得全部确认，未执行。", {
+          status: 409,
+          details: updated,
+        });
+      }
+      const result = await api.actions.execute(updated.id);
       if (!result.success) throw new ApiError(result.message, { status: 409, details: result });
       setNotice(result.message);
       setDeleting(null);
       setDeleteText("");
+      setPendingDelete(null);
       await load();
     } catch (reason) {
       setError(reason instanceof ApiError ? reason.userMessage : "删除失败。");
@@ -333,6 +366,7 @@ export default function TasksPage() {
                   onClick={() => {
                     setDeleting(task);
                     setDeleteText("");
+                    setPendingDelete(null);
                   }}
                   className="btn-ghost !size-9 !min-h-0 !p-0 text-coral-600"
                   aria-label={`删除${task.title}`}
@@ -362,8 +396,18 @@ export default function TasksPage() {
       <Modal
         open={Boolean(deleting)}
         title="高风险：删除待办"
-        description="删除会改变数据。请再次输入待办标题，完成第二次确认。"
-        onClose={() => !busy && setDeleting(null)}
+        description={
+          pendingDelete?.status === "awaiting_second_confirmation"
+            ? "第一次确认已记录。请重新核对目标，并通过独立的第二次交互确认删除。"
+            : "删除会改变数据。请输入完整标题并完成第一次确认。"
+        }
+        onClose={() => {
+          if (!busy) {
+            setDeleting(null);
+            setDeleteText("");
+            setPendingDelete(null);
+          }
+        }}
       >
         {deleting ? (
           <div>
@@ -371,7 +415,11 @@ export default function TasksPage() {
               即将删除：<strong>{deleting.title}</strong>
             </div>
             <label className="mt-4 block">
-              <span className="mb-1.5 block text-sm font-bold text-ink-700">输入完整标题确认</span>
+              <span className="mb-1.5 block text-sm font-bold text-ink-700">
+                {pendingDelete?.status === "awaiting_second_confirmation"
+                  ? "重新输入完整标题进行第二次确认"
+                  : "输入完整标题进行第一次确认"}
+              </span>
               <input
                 autoFocus
                 value={deleteText}
@@ -380,8 +428,21 @@ export default function TasksPage() {
                 placeholder={deleting.title}
               />
             </label>
+            {pendingDelete?.status === "awaiting_second_confirmation" ? (
+              <p className="mt-3 rounded-xl border border-coral-100 bg-white p-3 text-sm font-semibold text-coral-600">
+                第一次确认已完成。只有再次点击下方按钮后，系统才会执行删除。
+              </p>
+            ) : null}
             <div className="mt-5 flex justify-end gap-2">
-              <button type="button" onClick={() => setDeleting(null)} className="btn-secondary">
+              <button
+                type="button"
+                onClick={() => {
+                  setDeleting(null);
+                  setDeleteText("");
+                  setPendingDelete(null);
+                }}
+                className="btn-secondary"
+              >
                 取消
               </button>
               <button
@@ -390,7 +451,14 @@ export default function TasksPage() {
                 onClick={() => void remove()}
                 className="btn-danger"
               >
-                <Trash2 size={16} /> {busy ? "正在删除并验证" : "再次确认删除"}
+                <Trash2 size={16} />
+                {busy
+                  ? pendingDelete?.status === "awaiting_second_confirmation"
+                    ? "正在删除并验证"
+                    : "正在记录第一次确认"
+                  : pendingDelete?.status === "awaiting_second_confirmation"
+                    ? "第二次确认并删除"
+                    : "第一次确认删除"}
               </button>
             </div>
           </div>

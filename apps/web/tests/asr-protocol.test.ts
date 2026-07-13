@@ -13,7 +13,10 @@ class FakeWebSocket {
   onerror: (() => void) | null = null;
   onclose: (() => void) | null = null;
 
-  constructor(readonly url: string) {
+  constructor(
+    readonly url: string,
+    readonly protocols?: string | string[],
+  ) {
     FakeWebSocket.instance = this;
   }
 
@@ -31,11 +34,12 @@ describe("ASR WebSocket protocol", () => {
     vi.stubGlobal("WebSocket", FakeWebSocket);
     const client = new AsrWebSocketClient(
       { onMessage: vi.fn(), onClose: vi.fn(), onError: vi.fn() },
-      { url: "ws://localhost/ws/asr", hotwords: ["机器学习"] },
+      { url: "ws://localhost/ws/asr", hotwords: ["机器学习"], ticket: "short-lived-ticket" },
     );
     const connected = client.connect();
     const socket = FakeWebSocket.instance;
     expect(socket).not.toBeNull();
+    expect(socket?.protocols).toEqual(["campusvoice", "campusvoice.ticket.short-lived-ticket"]);
     socket?.onopen?.();
     expect(JSON.parse(String(socket?.sent[0]))).toEqual({
       type: "start",

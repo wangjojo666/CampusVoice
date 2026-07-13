@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from app.core.config import Settings
 from app.main import create_app
+from tests.helpers import confirm_action
 
 
 @pytest.fixture
@@ -30,9 +31,5 @@ def prepare_and_confirm_once(
     prepared = client.post("/api/actions/prepare", json=request)
     assert prepared.status_code == 201, prepared.text
     action_id = prepared.json()["id"]
-    confirmed = client.post(
-        f"/api/actions/{action_id}/confirm",
-        json={"confirmed": True, "confirmation_token": "confirm-token-one"},
-    )
-    assert confirmed.status_code == 200, confirmed.text
+    confirm_action(client, action_id)
     return action_id

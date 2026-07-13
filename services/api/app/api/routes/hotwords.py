@@ -1,8 +1,13 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Header, Query, status
+from fastapi import APIRouter, Query, status
 
-from app.api.dependencies import SessionDependency, UserIdDependency
+from app.api.dependencies import (
+    MetricsDependency,
+    SessionDependency,
+    UserIdDependency,
+    WriteChallengeDependency,
+)
 from app.models.enums import HotwordCategory
 from app.repositories.hotwords import HotwordRepository
 from app.schemas.domain import (
@@ -41,9 +46,10 @@ async def create_hotword(
     body: HotwordCreate,
     session: SessionDependency,
     user_id: UserIdDependency,
-    confirmed: Annotated[bool, Header(alias="X-User-Confirmed")] = False,
+    _write_challenge: WriteChallengeDependency,
+    metrics: MetricsDependency,
 ) -> HotwordMutationResponse:
-    return await HotwordService().create(session, user_id, body, confirmed=confirmed)
+    return await HotwordService(metrics).create(session, user_id, body, confirmed=True)
 
 
 @router.delete("/{hotword_id}", response_model=HotwordMutationResponse)
@@ -51,13 +57,13 @@ async def delete_hotword(
     hotword_id: str,
     session: SessionDependency,
     user_id: UserIdDependency,
-    confirmed: Annotated[bool, Header(alias="X-User-Confirmed")] = False,
-    second_confirmation: Annotated[bool, Header(alias="X-Second-Confirmation")] = False,
+    _write_challenge: WriteChallengeDependency,
+    metrics: MetricsDependency,
 ) -> HotwordMutationResponse:
-    return await HotwordService().delete(
+    return await HotwordService(metrics).delete(
         session,
         user_id,
         hotword_id,
-        confirmed=confirmed,
-        second_confirmation=second_confirmation,
+        confirmed=True,
+        second_confirmation=True,
     )

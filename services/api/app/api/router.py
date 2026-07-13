@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from app.api.routes import (
     action_logs,
     actions,
+    auth,
     correction,
     documents,
     events,
@@ -10,12 +11,17 @@ from app.api.routes import (
     hotwords,
     intent,
     knowledge,
+    metrics,
+    privacy,
     settings,
     tasks,
 )
 
 api_router = APIRouter()
 api_router.include_router(health.router)
+api_router.include_router(metrics.router)
+api_router.include_router(privacy.router)
+api_router.include_router(auth.router)
 api_router.include_router(tasks.router)
 api_router.include_router(events.router)
 api_router.include_router(hotwords.router)
