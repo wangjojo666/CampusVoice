@@ -10,7 +10,7 @@ describe("HealthStatus", () => {
 
   it("shows the verified healthy state returned by the API", async () => {
     vi.mocked(fetch).mockResolvedValue(
-      new Response(JSON.stringify({ status: "ok", service: "CampusVoice API", version: "0.1.0" }), {
+      new Response(JSON.stringify({ status: "ok", service: "CampusVoice API", version: "0.3.0" }), {
         status: 200,
         headers: { "content-type": "application/json" },
       }),

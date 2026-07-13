@@ -1,5 +1,7 @@
 .next
 coverage
+coverage.json
+**/coverage.json
 dist
 htmlcov
 node_modules

@@ -24,6 +24,7 @@ import type {
 } from "@campusvoice/shared-types";
 
 import { mergeContextHotwords } from "@/lib/asr/context-hotwords";
+import { getAccessToken, handleUnauthorized } from "@/lib/auth";
 
 interface WirePendingAction {
   id: string;
@@ -111,6 +112,192 @@ interface WireActionLog {
   created_at: string;
 }
 
+interface WriteChallenge {
+  challenge: string;
+  stage: number;
+  required_stages: number;
+  expires_at: string;
+}
+
+export interface RadarCard {
+  card_type: "new_notice" | "version_change" | "upcoming_deadline" | "needs_review";
+  change_set_id: string | null;
+  series_id: string;
+  document_id: string | null;
+  title: string;
+  from_revision: number;
+  to_revision: number;
+  change_count: number;
+  affected_tasks: number;
+  affected_events: number;
+  needs_review: boolean;
+  message: string;
+  deadline_at: string | null;
+  applicability: "applicable" | "not_applicable" | "needs_review";
+  applicability_reason: string | null;
+  created_at: string;
+}
+
+export interface NoticeSeries {
+  id: string;
+  canonical_key: string;
+  normalized_title: string;
+  department: string | null;
+  source_key: string | null;
+  version_count: number;
+  current_document_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NoticeClaim {
+  id: string;
+  document_id: string;
+  chunk_id: string;
+  claim_key: string;
+  claim_type: string;
+  value: Record<string, unknown>;
+  normalized_value: Record<string, unknown>;
+  audience_rule: Record<string, unknown>;
+  confidence: number;
+  evidence_text: string;
+  evidence_start: number;
+  evidence_end: number;
+  extractor_version: string;
+  review_state: string;
+}
+
+export interface NoticeVersion {
+  id: string;
+  series_id: string;
+  supersedes_document_id: string | null;
+  revision_number: number;
+  title: string;
+  version_label: string;
+  effective_at: string | null;
+  publish_date: string | null;
+  is_current: boolean;
+  ingest_source: string;
+  claims: NoticeClaim[];
+  created_at: string;
+}
+
+export interface NoticeTimeline {
+  series: NoticeSeries;
+  versions: NoticeVersion[];
+}
+
+export interface NoticeSeriesCreate {
+  canonical_key: string;
+  title: string;
+  department?: string | null;
+  source_key?: string | null;
+}
+
+export interface NoticeVersionCreate {
+  title: string;
+  content: string;
+  revision_number: number;
+  version_label: string;
+  supersedes_document_id: string | null;
+  department?: string | null;
+  publish_date?: string | null;
+  effective_at?: string | null;
+  applicable_group?: string | null;
+  source_url?: string | null;
+  ingest_source: "manual" | "seed" | "upload" | "api";
+}
+
+export interface ChangeEvidence {
+  claim_id: string;
+  document_id: string;
+  chunk_id: string;
+  value: Record<string, unknown>;
+  normalized_value: Record<string, unknown>;
+  evidence_text: string;
+  evidence_start: number;
+  evidence_end: number;
+}
+
+export interface NoticeChangeItem {
+  id: string;
+  claim_key: string;
+  change_type: "added" | "removed" | "changed";
+  severity: "low" | "medium" | "high";
+  confidence: number;
+  review_state: string;
+  before: ChangeEvidence | null;
+  after: ChangeEvidence | null;
+}
+
+export interface NoticeChangeSet {
+  id: string;
+  series_id: string;
+  from_document_id: string;
+  to_document_id: string;
+  algorithm_version: string;
+  status: string;
+  items: NoticeChangeItem[];
+  created_at: string;
+}
+
+export interface ImpactCase {
+  id: string;
+  change_item_id: string;
+  entity_type: "task" | "event";
+  entity_id: string;
+  entity_version: number;
+  reason: string;
+  severity: string;
+  current_snapshot: Record<string, unknown>;
+  proposed_patch: Record<string, unknown>;
+  recommended_action: "apply" | "keep" | "cancel" | "manual_review";
+  requires_manual_review: boolean;
+  status: string;
+  migration_plan_id: string | null;
+}
+
+export interface MigrationItem {
+  id: string;
+  entity_type: "task" | "event";
+  entity_id: string;
+  expected_version: number;
+  before: Record<string, unknown>;
+  after: Record<string, unknown>;
+  source_claim_ids: string[];
+  verification: Record<string, unknown>;
+  execute_verification: Record<string, unknown>;
+  undo_verification: Record<string, unknown>;
+}
+
+export interface MigrationPlan {
+  id: string;
+  change_set_id: string;
+  status: string;
+  risk_level: "low" | "medium" | "high";
+  required_confirmations: 1 | 2;
+  conflicts: Array<Record<string, unknown>>;
+  items: MigrationItem[];
+  verification: Record<string, unknown>;
+  execute_receipt: Record<string, unknown>;
+  undo_receipt: Record<string, unknown>;
+  generation: number;
+  version: number;
+  executed_at: string | null;
+  undone_at: string | null;
+}
+
+export interface MigrationReceipt {
+  plan_id: string;
+  status: string;
+  operation: "execute" | "undo";
+  verified_count: number;
+  total_count: number;
+  all_verified: boolean;
+  items: MigrationItem[];
+  verified_at: string;
+}
+
 const configuredBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "");
 export const API_BASE_URL = configuredBaseUrl || "http://localhost:8000";
 
@@ -134,11 +321,14 @@ export class ApiError extends Error {
 
   get userMessage() {
     if (this.status === 0) return "无法连接服务，请确认后端已启动并检查网络。";
+    if (this.status === 401) return "登录状态已失效，请重新登录。";
+    if (this.status === 403) return this.message || "当前账户无权执行该操作。";
     if (this.status === 400 || this.status === 422)
       return this.message || "提交的信息不完整，请检查后重试。";
     if (this.status === 404) return this.message || "没有找到对应的数据。";
     if (this.status === 409) return this.message || "操作与现有数据冲突，请检查后再试。";
     if (this.status === 410) return "该操作已过期，请重新发起。";
+    if (this.status === 428) return this.message || "该操作还需要用户确认。";
     if (this.status >= 500) return "服务暂时不可用，请稍后重试。";
     return this.message || "请求失败，请重试。";
   }
@@ -178,10 +368,15 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   if (options.body && !bodyIsForm && !headers.has("Content-Type"))
     headers.set("Content-Type", "application/json");
   headers.set("Accept", "application/json");
+  const accessToken = getAccessToken();
+  if (accessToken && !headers.has("Authorization")) {
+    headers.set("Authorization", `Bearer ${accessToken}`);
+  }
 
   try {
     const response = await fetch(`${API_BASE_URL}${path}`, {
       ...options,
+      credentials: options.credentials ?? "include",
       headers,
       signal: options.signal ?? controller.signal,
     });
@@ -194,6 +389,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
           : await response.text();
 
     if (!response.ok) {
+      if (response.status === 401) handleUnauthorized(API_BASE_URL);
       const errorBody =
         payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
       const nested = nestedErrorDetail(errorBody);
@@ -216,7 +412,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
             typeof errorBody.request_id === "string"
               ? errorBody.request_id
               : (response.headers.get("x-request-id") ?? undefined),
-          details: errorBody.detail,
+          details: errorBody.detail ?? nested.details,
         },
       );
     }
@@ -250,11 +446,174 @@ function jsonBody(value: unknown): Pick<RequestInit, "body"> {
   return { body: JSON.stringify(value) };
 }
 
-function confirmationHeaders(second = false): HeadersInit {
+function idempotencyHeaders(): HeadersInit {
+  return { "Idempotency-Key": crypto.randomUUID() };
+}
+
+const migrationIdempotencyFallback = new Map<string, string>();
+
+function migrationIdempotencyKey(operation: "execute" | "undo", planId: string): string {
+  const storageKey = `campusvoice:migration:${operation}:${planId}`;
+  try {
+    if (typeof window !== "undefined") {
+      const existing = window.sessionStorage.getItem(storageKey);
+      if (existing) {
+        migrationIdempotencyFallback.set(storageKey, existing);
+        return existing;
+      }
+      const fallback = migrationIdempotencyFallback.get(storageKey);
+      if (fallback) {
+        window.sessionStorage.setItem(storageKey, fallback);
+        return fallback;
+      }
+      const generated = crypto.randomUUID();
+      migrationIdempotencyFallback.set(storageKey, generated);
+      window.sessionStorage.setItem(storageKey, generated);
+      return generated;
+    }
+  } catch {
+    // Some privacy modes expose sessionStorage but reject access. Keep the key
+    // stable in this module so separated confirmation clicks bind one payload.
+  }
+  const existing = migrationIdempotencyFallback.get(storageKey);
+  if (existing) return existing;
+  const generated = crypto.randomUUID();
+  migrationIdempotencyFallback.set(storageKey, generated);
+  return generated;
+}
+
+async function issueWriteChallenge(
+  method: "POST" | "PATCH" | "DELETE",
+  path: string,
+  body: unknown,
+): Promise<WriteChallenge> {
+  return request<WriteChallenge>("/api/auth/write-challenges", {
+    method: "POST",
+    ...jsonBody({ method, path, body }),
+  });
+}
+
+async function confirmedJsonRequest<T>(
+  method: "POST" | "PATCH",
+  path: string,
+  body: unknown,
+  headers?: HeadersInit,
+): Promise<T> {
+  const issued = await issueWriteChallenge(method, path, body);
+  if (issued.stage !== 1 || issued.required_stages !== 1) {
+    throw new ApiError("写入确认策略与请求不匹配，操作未执行。", {
+      status: 409,
+      details: issued,
+    });
+  }
+  const confirmedHeaders = new Headers(headers);
+  confirmedHeaders.set("X-Write-Challenge", issued.challenge);
+  return request<T>(path, {
+    method,
+    headers: confirmedHeaders,
+    ...jsonBody(body),
+  });
+}
+
+async function challengedJsonRequest<T>(
+  method: "POST" | "PATCH",
+  path: string,
+  body: unknown,
+): Promise<T> {
+  const issued = await issueWriteChallenge(method, path, body);
+  if (issued.stage !== 1 || issued.required_stages !== 1) {
+    throw new ApiError("写入确认阶段不完整，操作未执行。", { status: 409, details: issued });
+  }
+  return request<T>(path, {
+    method,
+    headers: { "X-Write-Challenge": issued.challenge },
+    ...jsonBody(body),
+  });
+}
+
+/**
+ * Resume database verification after the business transaction was already
+ * committed. This may rebuild a two-stage challenge automatically because the
+ * idempotency key can only return/repair the existing receipt; it cannot apply
+ * the migration a second time. Initial high-risk writes must use begin/finish.
+ */
+async function recoveryJsonRequest<T>(
+  method: "POST" | "PATCH",
+  path: string,
+  body: unknown,
+): Promise<T> {
+  let issued = await issueWriteChallenge(method, path, body);
+  if (issued.required_stages === 2) {
+    issued = await request<WriteChallenge>("/api/auth/write-challenges/advance", {
+      method: "POST",
+      ...jsonBody({ challenge: issued.challenge }),
+    });
+  }
+  if (issued.stage !== issued.required_stages) {
+    throw new ApiError("恢复验证的写入确认阶段不完整，操作未执行。", {
+      status: 409,
+      details: issued,
+    });
+  }
+  return request<T>(path, {
+    method,
+    headers: { "X-Write-Challenge": issued.challenge },
+    ...jsonBody(body),
+  });
+}
+
+async function beginTwoStageWrite(
+  method: "POST" | "PATCH" | "DELETE",
+  path: string,
+  body: unknown,
+): Promise<WriteChallenge> {
+  const first = await issueWriteChallenge(method, path, body);
+  if (first.stage !== 1 || first.required_stages !== 2) {
+    throw new ApiError("高风险操作未获得两阶段确认，操作未执行。", {
+      status: 409,
+      details: first,
+    });
+  }
+  const second = await request<WriteChallenge>("/api/auth/write-challenges/advance", {
+    method: "POST",
+    ...jsonBody({ challenge: first.challenge }),
+  });
+  if (second.stage !== 2 || second.required_stages !== 2) {
+    throw new ApiError("高风险操作的第二阶段确认无效，操作未执行。", {
+      status: 409,
+      details: second,
+    });
+  }
+  return second;
+}
+
+function finishTwoStageWrite<T>(
+  method: "POST" | "PATCH" | "DELETE",
+  path: string,
+  body: unknown,
+  challenge: string,
+): Promise<T> {
+  return request<T>(path, {
+    method,
+    headers: { "X-Write-Challenge": challenge },
+    ...jsonBody(body),
+  });
+}
+
+function migrationExecuteBody(plan: MigrationPlan, allowConflicts: boolean) {
   return {
-    "X-User-Confirmed": "true",
-    ...(second ? { "X-Second-Confirmation": "true" } : {}),
-    "Idempotency-Key": crypto.randomUUID(),
+    plan_version: plan.version,
+    idempotency_key: migrationIdempotencyKey("execute", plan.id),
+    allow_conflicts: allowConflicts,
+    confirmation_stages: plan.required_confirmations,
+  };
+}
+
+function migrationUndoBody(plan: MigrationPlan) {
+  return {
+    plan_version: plan.version,
+    idempotency_key: migrationIdempotencyKey("undo", plan.id),
+    confirmation_stages: 2 as const,
   };
 }
 
@@ -340,11 +699,11 @@ function normalizeCitation(citation: WireCitation): KnowledgeEvidence {
   };
 }
 
-async function executeDestructive<T>(
+async function prepareDestructive(
   action: "delete_task" | "delete_event",
   targetId: string,
-): Promise<MutationResult<T>> {
-  let pending = normalizePendingAction(
+): Promise<PendingAction> {
+  return normalizePendingAction(
     await request<WirePendingAction>("/api/actions/prepare", {
       method: "POST",
       ...jsonBody({
@@ -356,50 +715,138 @@ async function executeDestructive<T>(
       }),
     }),
   );
-  for (
-    let step = 0;
-    step < 2 && ["awaiting_confirmation", "awaiting_second_confirmation"].includes(pending.status);
-    step += 1
-  ) {
-    pending = normalizePendingAction(
-      await request<WirePendingAction>(`/api/actions/${encodeURIComponent(pending.id)}/confirm`, {
-        method: "POST",
-        ...jsonBody({ confirmed: true, confirmation_token: crypto.randomUUID() }),
-      }),
-    );
-  }
-  if (pending.status !== "ready") {
-    throw new ApiError("删除操作未获得全部确认，未执行。", { status: 409, details: pending });
-  }
-  const result = normalizeVerification(
-    await request<VerificationResult & { error?: string | null }>(
-      `/api/actions/${encodeURIComponent(pending.id)}/execute`,
-      { method: "POST" },
-    ),
-  );
-  return result as MutationResult<T>;
 }
 
 export const api = {
+  auth: {
+    session: () =>
+      request<{
+        authenticated: boolean;
+        user_id: string;
+        display_name: string;
+        roles: string[];
+        expires_at: string | null;
+      }>("/api/auth/session"),
+    logout: () => request<{ logout_url: string }>("/api/auth/logout", { method: "POST" }),
+    websocketTicket: () =>
+      request<{ ticket: string; expires_at: string }>("/api/auth/ws-ticket", { method: "POST" }),
+  },
+
   health: () => request<HealthResponse>("/api/health", { timeoutMs: 5_000 }),
+
+  radar: {
+    list: (limit = 20) =>
+      request<{ items: RadarCard[]; total: number }>(`/api/notice-radar${asQuery({ limit })}`),
+    series: (limit = 100, offset = 0) =>
+      request<NoticeSeries[]>(`/api/notice-radar/series${asQuery({ limit, offset })}`),
+    createSeries: (body: NoticeSeriesCreate) =>
+      challengedJsonRequest<NoticeSeries>("POST", "/api/notice-radar/series", body),
+    timeline: (seriesId: string) =>
+      request<NoticeTimeline>(`/api/notice-radar/series/${encodeURIComponent(seriesId)}/timeline`),
+    addVersion: (seriesId: string, body: NoticeVersionCreate) =>
+      challengedJsonRequest<NoticeVersion>(
+        "POST",
+        `/api/notice-radar/series/${encodeURIComponent(seriesId)}/versions`,
+        body,
+      ),
+    changeSet: (id: string) =>
+      request<NoticeChangeSet>(`/api/notice-radar/changes/${encodeURIComponent(id)}`),
+    reviewChange: (itemId: string, decision: "approved" | "rejected") => {
+      const path = `/api/notice-radar/changes/items/${encodeURIComponent(itemId)}/review`;
+      return challengedJsonRequest<NoticeChangeItem>("PATCH", path, { decision });
+    },
+    impacts: (changeSetId: string, status?: "open" | "resolved" | "dismissed") =>
+      request<{ items: ImpactCase[]; total: number }>(
+        `/api/notice-radar/impacts${asQuery({ change_set_id: changeSetId, status })}`,
+      ),
+    detectImpacts: (changeSetId: string) => {
+      const path = `/api/notice-radar/changes/${encodeURIComponent(changeSetId)}/impacts/detect`;
+      return challengedJsonRequest<{ items: ImpactCase[]; total: number }>("POST", path, null);
+    },
+    preview: (changeSetId: string) => {
+      const path = `/api/notice-radar/changes/${encodeURIComponent(changeSetId)}/migration-preview`;
+      return challengedJsonRequest<MigrationPlan>("POST", path, null);
+    },
+    plan: (planId: string) =>
+      request<MigrationPlan>(`/api/notice-radar/migrations/${encodeURIComponent(planId)}`),
+    execute: (plan: MigrationPlan, allowConflicts: boolean) => {
+      const path = `/api/notice-radar/migrations/${encodeURIComponent(plan.id)}/execute`;
+      return challengedJsonRequest<MigrationReceipt>(
+        "POST",
+        path,
+        migrationExecuteBody(plan, allowConflicts),
+      );
+    },
+    beginExecute: (plan: MigrationPlan, allowConflicts: boolean) => {
+      const path = `/api/notice-radar/migrations/${encodeURIComponent(plan.id)}/execute`;
+      return beginTwoStageWrite("POST", path, migrationExecuteBody(plan, allowConflicts));
+    },
+    finishExecute: (plan: MigrationPlan, allowConflicts: boolean, challenge: string) => {
+      const path = `/api/notice-radar/migrations/${encodeURIComponent(plan.id)}/execute`;
+      return finishTwoStageWrite<MigrationReceipt>(
+        "POST",
+        path,
+        migrationExecuteBody(plan, allowConflicts),
+        challenge,
+      );
+    },
+    resumeExecute: async (plan: MigrationPlan, allowConflicts: boolean) => {
+      if (!["applied", "verification_failed"].includes(plan.status)) {
+        throw new ApiError("迁移尚未进入可恢复的执行后验证状态。", {
+          status: 409,
+          details: { plan_id: plan.id, status: plan.status },
+        });
+      }
+      const path = `/api/notice-radar/migrations/${encodeURIComponent(plan.id)}/execute`;
+      return recoveryJsonRequest<MigrationReceipt>(
+        "POST",
+        path,
+        migrationExecuteBody(plan, allowConflicts),
+      );
+    },
+    receipt: (planId: string, operation: "execute" | "undo") =>
+      request<MigrationReceipt>(
+        `/api/notice-radar/migrations/${encodeURIComponent(planId)}/receipt${asQuery({ operation })}`,
+      ),
+    resumeUndo: async (plan: MigrationPlan) => {
+      if (!["undo_applied", "undo_verification_failed"].includes(plan.status)) {
+        throw new ApiError("迁移尚未进入可恢复的撤销后验证状态。", {
+          status: 409,
+          details: { plan_id: plan.id, status: plan.status },
+        });
+      }
+      const path = `/api/notice-radar/migrations/${encodeURIComponent(plan.id)}/undo`;
+      return recoveryJsonRequest<MigrationReceipt>("POST", path, migrationUndoBody(plan));
+    },
+    beginUndo: (plan: MigrationPlan) => {
+      const path = `/api/notice-radar/migrations/${encodeURIComponent(plan.id)}/undo`;
+      return beginTwoStageWrite("POST", path, migrationUndoBody(plan));
+    },
+    finishUndo: (plan: MigrationPlan, challenge: string) => {
+      const path = `/api/notice-radar/migrations/${encodeURIComponent(plan.id)}/undo`;
+      return finishTwoStageWrite<MigrationReceipt>(
+        "POST",
+        path,
+        migrationUndoBody(plan),
+        challenge,
+      );
+    },
+  },
 
   tasks: {
     list: (
       filters: { status?: string; course?: string; due_from?: string; due_to?: string } = {},
     ) => listRequest<Task>(`/api/tasks${asQuery(filters)}`),
     create: (data: TaskCreate) =>
-      request<MutationResult<Task>>("/api/tasks", {
-        method: "POST",
-        headers: confirmationHeaders(),
-        ...jsonBody(data),
-      }),
+      confirmedJsonRequest<MutationResult<Task>>("POST", "/api/tasks", data, idempotencyHeaders()),
     update: (id: string, data: TaskUpdate) =>
-      request<MutationResult<Task>>(`/api/tasks/${encodeURIComponent(id)}`, {
-        method: "PATCH",
-        headers: confirmationHeaders(),
-        ...jsonBody(data),
-      }),
-    remove: (id: string) => executeDestructive<Task>("delete_task", id),
+      confirmedJsonRequest<MutationResult<Task>>(
+        "PATCH",
+        `/api/tasks/${encodeURIComponent(id)}`,
+        data,
+        idempotencyHeaders(),
+      ),
+    remove: (id: string) => prepareDestructive("delete_task", id),
   },
 
   events: {
@@ -408,18 +855,20 @@ export const api = {
         `/api/events${asQuery({ starts_after: filters.start, starts_before: filters.end, course: filters.course })}`,
       ),
     create: (data: CalendarEventCreate) =>
-      request<MutationResult<CalendarEvent>>("/api/events", {
-        method: "POST",
-        headers: confirmationHeaders(),
-        ...jsonBody(data),
-      }),
+      confirmedJsonRequest<MutationResult<CalendarEvent>>(
+        "POST",
+        "/api/events",
+        data,
+        idempotencyHeaders(),
+      ),
     update: (id: string, data: CalendarEventUpdate) =>
-      request<MutationResult<CalendarEvent>>(`/api/events/${encodeURIComponent(id)}`, {
-        method: "PATCH",
-        headers: confirmationHeaders(),
-        ...jsonBody(data),
-      }),
-    remove: (id: string) => executeDestructive<CalendarEvent>("delete_event", id),
+      confirmedJsonRequest<MutationResult<CalendarEvent>>(
+        "PATCH",
+        `/api/events/${encodeURIComponent(id)}`,
+        data,
+        idempotencyHeaders(),
+      ),
+    remove: (id: string) => prepareDestructive("delete_event", id),
     checkConflict: (data: { start_at: string; end_at: string; exclude_event_id?: string }) =>
       request<{ conflicts: CalendarEvent[]; has_conflict: boolean }>("/api/events/check-conflict", {
         method: "POST",
@@ -512,31 +961,56 @@ export const api = {
         items: payload.items.map(normalizeHotword),
         total: payload.total,
       })),
-    create: (data: Pick<Hotword, "value" | "category">) =>
-      request<MutationResult<WireHotword>>("/api/hotwords", {
-        method: "POST",
-        headers: confirmationHeaders(),
-        ...jsonBody({ term: data.value, category: data.category, source: "user", weight: 1 }),
-      }).then((payload) => {
+    create: (data: Pick<Hotword, "value" | "category">) => {
+      const body = { term: data.value, category: data.category, source: "user", weight: 1 };
+      return confirmedJsonRequest<MutationResult<WireHotword>>(
+        "POST",
+        "/api/hotwords",
+        body,
+        idempotencyHeaders(),
+      ).then((payload) => {
         if (!payload.record)
           throw new ApiError("热词写入后未能查询到记录。", { status: 409, details: payload });
         return normalizeHotword(payload.record);
-      }),
-    remove: (id: string) =>
+      });
+    },
+    beginRemove: async (id: string) => {
+      const path = `/api/hotwords/${encodeURIComponent(id)}`;
+      const first = await issueWriteChallenge("DELETE", path, null);
+      if (first.stage !== 1 || first.required_stages !== 2) {
+        throw new ApiError("热词删除未获得两阶段确认，操作未执行。", {
+          status: 409,
+          details: first,
+        });
+      }
+      const second = await request<WriteChallenge>("/api/auth/write-challenges/advance", {
+        method: "POST",
+        ...jsonBody({ challenge: first.challenge }),
+      });
+      if (second.stage !== 2 || second.required_stages !== 2) {
+        throw new ApiError("热词删除的第二阶段确认无效，操作未执行。", {
+          status: 409,
+          details: second,
+        });
+      }
+      return second;
+    },
+    finishRemove: (id: string, challenge: string) =>
       request<MutationResult<WireHotword>>(`/api/hotwords/${encodeURIComponent(id)}`, {
         method: "DELETE",
-        headers: confirmationHeaders(true),
+        headers: { "X-Write-Challenge": challenge },
       }),
   },
 
   settings: {
     get: () => request<UserSettings>("/api/settings"),
     update: (data: Partial<UserSettings>) =>
-      request<{ settings: UserSettings }>("/api/settings", {
-        method: "PATCH",
-        headers: confirmationHeaders(),
-        ...jsonBody(data),
-      }).then((response) => response.settings),
+      confirmedJsonRequest<{ settings: UserSettings }>(
+        "PATCH",
+        "/api/settings",
+        data,
+        idempotencyHeaders(),
+      ).then((response) => response.settings),
   },
 
   intent: {
@@ -657,11 +1131,16 @@ export const api = {
         method: "POST",
         ...jsonBody(data),
       }).then(normalizePendingAction),
-    confirm: (id: string, confirmed: boolean, confirmationToken: string) =>
-      request<WirePendingAction>(`/api/actions/${encodeURIComponent(id)}/confirm`, {
+    confirm: async (id: string, confirmed: boolean) => {
+      const issued = await request<{ challenge: string; stage: number; expires_at: string }>(
+        `/api/actions/${encodeURIComponent(id)}/challenge`,
+        { method: "POST" },
+      );
+      return request<WirePendingAction>(`/api/actions/${encodeURIComponent(id)}/confirm`, {
         method: "POST",
-        ...jsonBody({ confirmed, confirmation_token: confirmationToken }),
-      }).then(normalizePendingAction),
+        ...jsonBody({ confirmed, challenge: issued.challenge }),
+      }).then(normalizePendingAction);
+    },
     execute: (id: string) =>
       request<VerificationResult & { error?: string | null }>(
         `/api/actions/${encodeURIComponent(id)}/execute`,

@@ -1,5 +1,8 @@
+import asyncio
 import json
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import suppress
+from time import monotonic
 from uuid import uuid4
 
 import numpy as np
@@ -148,8 +151,17 @@ async def handle_asr_websocket(
     event_hook: Callable[[AsrServerEvent], Awaitable[None]] | None = None,
     close_hook: Callable[[str], Awaitable[None]] | None = None,
     additional_hotwords: Sequence[str] = (),
+    accepted_subprotocol: str | None = None,
+    max_frame_bytes: int = 131_072,
+    max_control_message_bytes: int = 32_768,
+    idle_timeout_seconds: float = 30.0,
+    max_session_seconds: float = 600.0,
+    max_audio_seconds: float = 300.0,
 ) -> None:
-    await websocket.accept()
+    if accepted_subprotocol is None:
+        await websocket.accept()
+    else:
+        await websocket.accept(subprotocol=accepted_subprotocol)
     session_id = str(uuid4())
     adapter: AsrAdapter | None = None
     sender: _EventSender | None = None
@@ -158,13 +170,47 @@ async def handle_asr_websocket(
     vad: PcmEnergyVad | None = None
     provider_vad_enabled = True
     vad_frame_bytes: int | None = None
+    adapter_closed = False
     persistence_closed = False
+    opened_at = monotonic()
+    audio_bytes_received = 0
 
-    async def finalize_persistence() -> None:
-        nonlocal persistence_closed
+    async def close_resources() -> list[Exception]:
+        """Attempt every cleanup exactly once, even when an earlier close fails."""
+
+        nonlocal adapter_closed, persistence_closed
+        failures: list[Exception] = []
+        if adapter is not None and not adapter_closed:
+            adapter_closed = True
+            try:
+                await adapter.close()
+            except Exception as exc:
+                failures.append(exc)
         if close_hook is not None and not persistence_closed:
-            await close_hook(session_id)
             persistence_closed = True
+            try:
+                await close_hook(session_id)
+            except Exception as exc:
+                failures.append(exc)
+        return failures
+
+    async def report_cleanup_failure() -> None:
+        if sender is not None:
+            with suppress(Exception):
+                await sender.send(
+                    "error",
+                    code="session_cleanup_failed",
+                    message="语音识别会话资源清理失败。",
+                    recoverable=False,
+                )
+        with suppress(Exception):
+            await websocket.close(code=1011)
+
+    async def close_resources_or_raise() -> None:
+        failures = await close_resources()
+        if failures:
+            await report_cleanup_failure()
+            raise failures[0]
 
     async def process_pcm_frame(pcm_frame: bytes) -> bool:
         """Process at most one 60 ms VAD frame; return True for a fatal provider error."""
@@ -247,18 +293,61 @@ async def handle_asr_websocket(
             await sender.send(
                 "error", code=exc.code, message=exc.message, recoverable=exc.recoverable
             )
-            await finalize_persistence()
+            await close_resources_or_raise()
             await websocket.close(code=1011)
             return
         sender = _EventSender(websocket, session_id, adapter.provider_name, event_hook)
         await sender.send("ready")
 
         while True:
-            message = await websocket.receive()
+            elapsed = monotonic() - opened_at
+            remaining_session = max_session_seconds - elapsed
+            if remaining_session <= 0:
+                await sender.send(
+                    "error",
+                    code="session_duration_exceeded",
+                    message="语音识别会话已达到最大时长。",
+                    recoverable=False,
+                )
+                await websocket.close(code=1008)
+                return
+            try:
+                session_deadline_is_limit = remaining_session <= idle_timeout_seconds
+                message = await asyncio.wait_for(
+                    websocket.receive(),
+                    timeout=min(idle_timeout_seconds, remaining_session),
+                )
+            except TimeoutError:
+                code = (
+                    "session_duration_exceeded"
+                    if session_deadline_is_limit
+                    else "session_idle_timeout"
+                )
+                await sender.send(
+                    "error",
+                    code=code,
+                    message=(
+                        "语音识别会话已达到最大时长。"
+                        if code == "session_duration_exceeded"
+                        else "语音识别会话因长时间无数据而关闭。"
+                    ),
+                    recoverable=False,
+                )
+                await websocket.close(code=1008)
+                return
             if message["type"] == "websocket.disconnect":
                 break
             pcm = message.get("bytes")
             if pcm is not None:
+                if len(pcm) > max_frame_bytes:
+                    await sender.send(
+                        "error",
+                        code="audio_frame_too_large",
+                        message="单个 PCM 音频帧超过服务端限制。",
+                        recoverable=False,
+                    )
+                    await websocket.close(code=1009)
+                    return
                 if not started:
                     await sender.send(
                         "error",
@@ -277,10 +366,22 @@ async def handle_asr_websocket(
                         recoverable=True,
                     )
                     continue
+                bytes_per_second = 16_000 * 2
+                projected_audio_bytes = audio_bytes_received + len(pcm)
+                if projected_audio_bytes > int(max_audio_seconds * bytes_per_second):
+                    await sender.send(
+                        "error",
+                        code="audio_duration_exceeded",
+                        message="本次会话累计音频时长超过服务端限制。",
+                        recoverable=False,
+                    )
+                    await websocket.close(code=1008)
+                    return
+                audio_bytes_received = projected_audio_bytes
                 frame_size = vad_frame_bytes or len(pcm)
                 for offset in range(0, len(pcm), frame_size):
                     if await process_pcm_frame(pcm[offset : offset + frame_size]):
-                        await finalize_persistence()
+                        await close_resources_or_raise()
                         await websocket.close(code=1011)
                         return
                 continue
@@ -294,6 +395,15 @@ async def handle_asr_websocket(
                     recoverable=True,
                 )
                 continue
+            if len(raw_text.encode("utf-8", errors="replace")) > max_control_message_bytes:
+                await sender.send(
+                    "error",
+                    code="control_message_too_large",
+                    message="JSON 控制消息超过服务端限制。",
+                    recoverable=False,
+                )
+                await websocket.close(code=1009)
+                return
             try:
                 parsed_json = json.loads(raw_text)
                 control = _CLIENT_MESSAGE_ADAPTER.validate_python(parsed_json)
@@ -334,7 +444,7 @@ async def handle_asr_websocket(
                         recoverable=exc.recoverable,
                     )
                     if not exc.recoverable:
-                        await finalize_persistence()
+                        await close_resources_or_raise()
                         await websocket.close(code=1011)
                         return
                     continue
@@ -373,7 +483,7 @@ async def handle_asr_websocket(
                 if callable(reset_provider_vad):
                     await reset_provider_vad()
                 if flush_fatal:
-                    await finalize_persistence()
+                    await close_resources_or_raise()
                     await websocket.close(code=1011)
                     return
             elif isinstance(control, AsrStopMessage):
@@ -399,15 +509,13 @@ async def handle_asr_websocket(
                     reset_provider_vad = getattr(adapter, "reset_vad", None)
                     if callable(reset_provider_vad):
                         await reset_provider_vad()
-                await finalize_persistence()
+                await close_resources_or_raise()
                 await websocket.close(code=close_code)
                 return
     except WebSocketDisconnect:
         pass
     finally:
-        if adapter is not None:
-            await adapter.close()
-        await finalize_persistence()
+        await close_resources_or_raise()
 
 
 def _merge_hotwords(*groups: Sequence[str], limit: int = 500) -> tuple[str, ...]:

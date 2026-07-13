@@ -247,7 +247,7 @@ export default function VoicePage() {
     if (!action) return;
     store.setWorkflowStatus("confirming");
     try {
-      const updated = await api.actions.confirm(action.id, true, crypto.randomUUID());
+      const updated = await api.actions.confirm(action.id, true);
       store.setPendingAction(updated);
       if (updated.status === "ready") await execute(updated);
       else store.setWorkflowStatus("idle");

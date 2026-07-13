@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import threading
 import time
@@ -58,6 +59,15 @@ class StubSocket:
 
     async def close(self, code: int) -> None:
         self.close_code = code
+
+
+class BlockingSocket(StubSocket):
+    async def receive(self) -> dict[str, Any]:
+        try:
+            return next(self.incoming)
+        except StopIteration:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable") from None
 
 
 @pytest.mark.asyncio
@@ -127,6 +137,136 @@ async def test_odd_pcm_frame_is_rejected_before_vad_without_disconnect() -> None
     assert socket.sent[1]["code"] == "invalid_audio_frame"
     assert socket.sent[1]["recoverable"] is True
     assert socket.close_code == 1000
+
+
+@pytest.mark.asyncio
+async def test_oversized_audio_frame_is_rejected_even_before_start() -> None:
+    adapter = StubAsrAdapter()
+    socket = StubSocket([{"type": "websocket.receive", "bytes": b"123456"}])
+
+    await handle_asr_websocket(  # type: ignore[arg-type]
+        socket,
+        lambda: adapter,
+        max_frame_bytes=4,
+    )
+
+    assert socket.sent[-1]["code"] == "audio_frame_too_large"
+    assert socket.sent[-1]["recoverable"] is False
+    assert socket.close_code == 1009
+    assert adapter.closed
+    assert adapter.started_with is None
+
+
+@pytest.mark.asyncio
+async def test_cumulative_audio_duration_limit_rejects_frame_before_feed() -> None:
+    adapter = StubAsrAdapter()
+    pcm = b"\xff\x7f" * 160
+    socket = StubSocket(
+        [
+            {"type": "websocket.receive", "text": '{"type":"start"}'},
+            {"type": "websocket.receive", "bytes": pcm},
+            {"type": "websocket.receive", "bytes": pcm},
+        ]
+    )
+
+    await handle_asr_websocket(  # type: ignore[arg-type]
+        socket,
+        lambda: adapter,
+        max_audio_seconds=0.015,
+    )
+
+    assert [item["code"] for item in socket.sent if item["type"] == "error"] == [
+        "audio_duration_exceeded"
+    ]
+    assert socket.close_code == 1008
+    assert adapter.closed
+
+
+@pytest.mark.asyncio
+async def test_oversized_control_message_has_distinct_fatal_error() -> None:
+    adapter = StubAsrAdapter()
+    socket = StubSocket(
+        [
+            {
+                "type": "websocket.receive",
+                "text": '{"type":"ping","padding":"too-large"}',
+            }
+        ]
+    )
+
+    await handle_asr_websocket(  # type: ignore[arg-type]
+        socket,
+        lambda: adapter,
+        max_control_message_bytes=16,
+    )
+
+    assert socket.sent[-1]["code"] == "control_message_too_large"
+    assert socket.sent[-1]["recoverable"] is False
+    assert socket.close_code == 1009
+    assert adapter.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("idle_timeout", "session_timeout", "expected_code"),
+    [
+        (0.01, 1.0, "session_idle_timeout"),
+        (1.0, 0.01, "session_duration_exceeded"),
+    ],
+)
+async def test_session_time_limits_emit_stable_error_codes(
+    idle_timeout: float,
+    session_timeout: float,
+    expected_code: str,
+) -> None:
+    adapter = StubAsrAdapter()
+    socket = BlockingSocket([])
+
+    await handle_asr_websocket(  # type: ignore[arg-type]
+        socket,
+        lambda: adapter,
+        idle_timeout_seconds=idle_timeout,
+        max_session_seconds=session_timeout,
+    )
+
+    assert socket.sent[-1]["code"] == expected_code
+    assert socket.sent[-1]["recoverable"] is False
+    assert socket.close_code == 1008
+    assert adapter.closed
+
+
+@pytest.mark.asyncio
+async def test_adapter_and_persistence_cleanup_are_each_attempted_once_on_failure() -> None:
+    class FailingCloseAdapter(StubAsrAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            raise RuntimeError("adapter close failed")
+
+    adapter = FailingCloseAdapter()
+    persistence_close_calls = 0
+
+    async def close_persistence(_session_id: str) -> None:
+        nonlocal persistence_close_calls
+        persistence_close_calls += 1
+        raise RuntimeError("persistence close failed")
+
+    socket = StubSocket([{"type": "websocket.disconnect"}])
+
+    with pytest.raises(RuntimeError, match="adapter close failed"):
+        await handle_asr_websocket(  # type: ignore[arg-type]
+            socket,
+            lambda: adapter,
+            close_hook=close_persistence,
+        )
+
+    assert adapter.close_calls == 1
+    assert persistence_close_calls == 1
+    assert socket.sent[-1]["code"] == "session_cleanup_failed"
+    assert socket.close_code == 1011
 
 
 def test_energy_vad_reports_real_speech_boundaries() -> None:

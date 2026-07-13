@@ -1,17 +1,16 @@
 from fastapi.testclient import TestClient
 
+from tests.helpers import confirm_action, confirmed_write
+
 
 def _create_event(client: TestClient, title: str = "高等数学") -> str:
-    response = client.post(
-        "/api/events",
-        json={
-            "title": title,
-            "start_at": "2026-07-18T09:00:00+08:00",
-            "end_at": "2026-07-18T10:00:00+08:00",
-            "location": "A302",
-        },
-        headers={"X-User-Confirmed": "true"},
-    )
+    payload = {
+        "title": title,
+        "start_at": "2026-07-18T09:00:00+08:00",
+        "end_at": "2026-07-18T10:00:00+08:00",
+        "location": "A302",
+    }
+    response = confirmed_write(client, "POST", "/api/events", payload)
     assert response.status_code == 201, response.text
     return response.json()["record_id"]
 
@@ -71,33 +70,60 @@ def test_conflict_requires_explicit_override_and_two_confirmations(client: TestC
     assert overridden["risk_level"] == "high"
     assert overridden["required_confirmations"] == 2
     action_id = overridden["id"]
-    for token in ("override-token-one", "override-token-two"):
-        confirmed = client.post(
-            f"/api/actions/{action_id}/confirm",
-            json={"confirmed": True, "confirmation_token": token},
-        )
-        assert confirmed.status_code == 200
+    for _ in range(2):
+        confirm_action(client, action_id)
     executed = client.post(f"/api/actions/{action_id}/execute")
     assert executed.status_code == 200, executed.text
     assert executed.json()["success"] is True
     assert "time_conflict" in executed.json()["side_effects"]
 
 
-def test_event_requires_timezone_and_valid_interval(client: TestClient) -> None:
-    naive = client.post(
+def test_direct_conflict_override_returns_a_continuable_two_stage_action(
+    client: TestClient,
+) -> None:
+    _create_event(client, "已有直写课程")
+    response = confirmed_write(
+        client,
+        "POST",
         "/api/events",
-        json={"title": "无时区", "start_at": "2026-07-18T09:00:00"},
-        headers={"X-User-Confirmed": "true"},
+        {
+            "title": "直写冲突实验课",
+            "start_at": "2026-07-18T09:30:00+08:00",
+            "end_at": "2026-07-18T10:30:00+08:00",
+            "allow_conflict": True,
+        },
+    )
+
+    assert response.status_code == 428, response.text
+    pending = response.json()["error"]["details"]["pending_action"]
+    assert pending["state"] == "awaiting_confirmation"
+    assert pending["risk_level"] == "high"
+    assert pending["required_confirmations"] == 2
+    for _ in range(2):
+        confirm_action(client, pending["id"])
+    executed = client.post(f"/api/actions/{pending['id']}/execute")
+    assert executed.status_code == 200, executed.text
+    assert executed.json()["success"] is True
+    assert "time_conflict" in executed.json()["side_effects"]
+
+
+def test_event_requires_timezone_and_valid_interval(client: TestClient) -> None:
+    naive = confirmed_write(
+        client,
+        "POST",
+        "/api/events",
+        {"title": "无时区", "start_at": "2026-07-18T09:00:00"},
     )
     assert naive.status_code == 422
-    backwards = client.post(
+    backwards = confirmed_write(
+        client,
+        "POST",
         "/api/events",
-        json={
+        {
             "title": "错误区间",
             "start_at": "2026-07-18T10:00:00+08:00",
             "end_at": "2026-07-18T09:00:00+08:00",
         },
-        headers={"X-User-Confirmed": "true"},
     )
     assert backwards.status_code == 422
 
@@ -113,10 +139,7 @@ def test_event_update_can_be_undone(client: TestClient) -> None:
         },
     ).json()
     action_id = prepared["id"]
-    client.post(
-        f"/api/actions/{action_id}/confirm",
-        json={"confirmed": True, "confirmation_token": "event-update-confirm"},
-    )
+    confirm_action(client, action_id)
     executed = client.post(f"/api/actions/{action_id}/execute")
     assert executed.json()["success"] is True
     assert executed.json()["record"]["title"] == "新日程"

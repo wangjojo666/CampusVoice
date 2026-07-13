@@ -12,7 +12,7 @@ from app.schemas.correction import (
     HotwordSource,
 )
 from app.services.correction.engine import CorrectionEngine
-from app.services.errors import DomainError, NotFoundError, VerificationFailedError
+from app.services.errors import NotFoundError, VerificationFailedError
 
 
 class CorrectionService:
@@ -104,16 +104,10 @@ class CorrectionService:
             owner = await session.scalar(
                 select(VoiceSession.user_id)
                 .join(Transcription, Transcription.voice_session_id == VoiceSession.id)
-                .where(Transcription.id == transcription_id)
+                .where(Transcription.id == transcription_id, VoiceSession.user_id == user_id)
             )
         if owner is None:
             raise NotFoundError("transcription", transcription_id)
-        if owner != user_id:
-            raise DomainError(
-                "transcription_owner_mismatch",
-                "该转写不属于当前用户。",
-                status_code=403,
-            )
 
 
 def _merge_settings_context(

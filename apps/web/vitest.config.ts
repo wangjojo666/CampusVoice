@@ -14,7 +14,18 @@ export default defineConfig({
     coverage: {
       provider: "v8",
       reporter: ["text", "html"],
-      include: ["components/**/*.{ts,tsx}", "lib/asr/**/*.ts"],
+      include: [
+        "app/**/*.{ts,tsx}",
+        "components/**/*.{ts,tsx}",
+        "hooks/**/*.{ts,tsx}",
+        "lib/**/*.ts",
+        "stores/**/*.ts",
+      ],
+      exclude: ["**/*.d.ts"],
+      thresholds: {
+        statements: 60,
+        branches: 45,
+      },
     },
   },
 });

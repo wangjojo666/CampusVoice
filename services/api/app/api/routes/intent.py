@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.api.dependencies import (
     SessionDependency,
@@ -18,8 +18,8 @@ from app.services.intent import (
 router = APIRouter(prefix="/intent", tags=["intent"])
 
 
-def get_intent_parser(settings: SettingsDependency) -> IntentParser:
-    return build_intent_parser(settings)
+def get_intent_parser(request: Request, settings: SettingsDependency) -> IntentParser:
+    return build_intent_parser(settings, metrics=request.app.state.metrics)
 
 
 @router.post("/parse", response_model=IntentResult)

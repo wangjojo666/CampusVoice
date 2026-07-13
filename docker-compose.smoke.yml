@@ -1,0 +1,38 @@
+name: campusvoice-smoke
+
+services:
+  api:
+    build:
+      args:
+        INSTALL_AI: "false"
+    environment:
+      CAMPUSVOICE_ENV: test
+      CAMPUSVOICE_AUTH_MODE: demo
+      CAMPUSVOICE_DEMO_USER_ID: smoke_user
+      # Synthetic smoke-only value shared by both Uvicorn workers. Never use in production.
+      CAMPUSVOICE_CONFIRMATION_SECRET: smoke-only-not-for-production-shared-secret-2026
+      CAMPUSVOICE_DATABASE_URL: sqlite+aiosqlite:////data/campusvoice.db
+      CAMPUSVOICE_DATABASE_AUTO_CREATE: "false"
+      CAMPUSVOICE_CORS_ORIGINS: '["http://localhost:3000","http://127.0.0.1:3000"]'
+      CAMPUSVOICE_ASR_PROVIDER: disabled
+      CAMPUSVOICE_ASR_DEVICE: cpu
+      CAMPUSVOICE_KNOWLEDGE_RETRIEVER: lexical
+      CAMPUSVOICE_EMBEDDING_DEVICE: cpu
+      CAMPUSVOICE_LLM_BASE_URL: ""
+      CAMPUSVOICE_LLM_API_KEY: ""
+      CAMPUSVOICE_LLM_MODEL: ""
+    restart: "no"
+    volumes:
+      - campusvoice_smoke_data:/data
+      - campusvoice_smoke_models:/models
+
+  web:
+    build:
+      args:
+        NEXT_PUBLIC_API_BASE_URL: http://127.0.0.1:8000
+        NEXT_PUBLIC_AUTH_MODE: demo
+    restart: "no"
+
+volumes:
+  campusvoice_smoke_data:
+  campusvoice_smoke_models:

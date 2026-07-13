@@ -13,6 +13,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { PageHeader } from "@/components/layout/page-header";
 import { EvidenceCard } from "@/components/notices/evidence-card";
+import { NoticeVersionImport } from "@/components/notices/notice-version-import";
 import { UploadForm } from "@/components/notices/upload-form";
 import { EmptyState } from "@/components/ui/empty-state";
 import { ErrorState } from "@/components/ui/error-state";
@@ -144,6 +145,8 @@ export default function NoticesPage() {
           {notice}
         </div>
       ) : null}
+
+      <NoticeVersionImport />
 
       <section className="surface mb-6 overflow-hidden">
         <div className="border-b border-mist-200 p-5 sm:p-6">

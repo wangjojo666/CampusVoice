@@ -2,7 +2,12 @@ from typing import Annotated
 
 from fastapi import APIRouter, Header, Query, Response, status
 
-from app.api.dependencies import SessionDependency, UserIdDependency
+from app.api.dependencies import (
+    MetricsDependency,
+    SessionDependency,
+    UserIdDependency,
+    WriteChallengeDependency,
+)
 from app.models.enums import TaskStatus
 from app.schemas.domain import (
     TaskCreate,
@@ -11,9 +16,14 @@ from app.schemas.domain import (
     TaskUpdate,
     TaskView,
 )
+from app.services.actions.service import ActionService
 from app.services.task_service import TaskService
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
+
+
+def _mutation_service(metrics: MetricsDependency) -> TaskService:
+    return TaskService(ActionService(metrics=metrics))
 
 
 @router.get("", response_model=TaskList)
@@ -41,14 +51,15 @@ async def create_task(
     body: TaskCreate,
     session: SessionDependency,
     user_id: UserIdDependency,
-    confirmed: Annotated[bool, Header(alias="X-User-Confirmed")] = False,
+    _write_challenge: WriteChallengeDependency,
+    metrics: MetricsDependency,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> TaskMutationResponse:
-    return await TaskService().create(
+    return await _mutation_service(metrics).create(
         session,
         user_id,
         body,
-        confirmed=confirmed,
+        confirmed=True,
         idempotency_key=idempotency_key,
     )
 
@@ -59,15 +70,16 @@ async def update_task(
     body: TaskUpdate,
     session: SessionDependency,
     user_id: UserIdDependency,
-    confirmed: Annotated[bool, Header(alias="X-User-Confirmed")] = False,
+    _write_challenge: WriteChallengeDependency,
+    metrics: MetricsDependency,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> TaskMutationResponse:
-    return await TaskService().update(
+    return await _mutation_service(metrics).update(
         session,
         user_id,
         task_id,
         body,
-        confirmed=confirmed,
+        confirmed=True,
         idempotency_key=idempotency_key,
     )
 
@@ -81,7 +93,10 @@ async def delete_task(
     task_id: str,
     session: SessionDependency,
     user_id: UserIdDependency,
+    metrics: MetricsDependency,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> Response:
-    await TaskService().prepare_delete(session, user_id, task_id, idempotency_key=idempotency_key)
+    await _mutation_service(metrics).prepare_delete(
+        session, user_id, task_id, idempotency_key=idempotency_key
+    )
     raise AssertionError("prepare_delete always raises a confirmation requirement")

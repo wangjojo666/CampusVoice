@@ -1,6 +1,7 @@
 {
   "name": "@campusvoice/web",
-  "version": "0.1.0",
+  "version": "0.3.0",
+  "license": "Apache-2.0",
   "private": true,
   "scripts": {
     "dev": "next dev --turbopack",
@@ -10,6 +11,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:e2e": "playwright test",
+    "test:e2e:smoke": "playwright test --config playwright.smoke.config.ts",
     "test:e2e:edge": "cross-env PLAYWRIGHT_CHANNEL=msedge playwright test",
     "test:coverage": "vitest run --coverage"
   },

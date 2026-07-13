@@ -17,6 +17,7 @@ import { PageHeader } from "@/components/layout/page-header";
 import { EmptyState } from "@/components/ui/empty-state";
 import { ErrorState } from "@/components/ui/error-state";
 import { LoadingState } from "@/components/ui/loading-state";
+import { Modal } from "@/components/ui/modal";
 import { ApiError, api } from "@/lib/api-client";
 
 const blankSettings: UserSettings = {
@@ -49,6 +50,11 @@ export default function SettingsPage() {
   const [notice, setNotice] = useState<string | null>(null);
   const [newWord, setNewWord] = useState("");
   const [newCategory, setNewCategory] = useState<Hotword["category"]>("custom");
+  const [pendingHotwordRemoval, setPendingHotwordRemoval] = useState<{
+    word: Hotword;
+    challenge: string;
+    expiresAt: string;
+  } | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -109,13 +115,35 @@ export default function SettingsPage() {
     }
   };
 
-  const removeHotword = async (word: Hotword) => {
-    if (!window.confirm(`删除热词“${word.value}”会改变识别词表。请再次确认是否删除。`)) return;
+  const beginRemoveHotword = async (word: Hotword) => {
     setBusy(true);
     setError(null);
     try {
-      await api.hotwords.remove(word.id);
-      setHotwords((current) => current.filter((item) => item.id !== word.id));
+      const next = await api.hotwords.beginRemove(word.id);
+      setPendingHotwordRemoval({
+        word,
+        challenge: next.challenge,
+        expiresAt: next.expires_at,
+      });
+      setNotice("第一次删除确认已记录。请在弹窗中完成独立的第二次确认。");
+    } catch (reason) {
+      setError(reason instanceof ApiError ? reason.userMessage : "无法开始热词删除确认。");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const finishRemoveHotword = async () => {
+    if (!pendingHotwordRemoval) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.hotwords.finishRemove(
+        pendingHotwordRemoval.word.id,
+        pendingHotwordRemoval.challenge,
+      );
+      setHotwords((current) => current.filter((item) => item.id !== pendingHotwordRemoval.word.id));
+      setPendingHotwordRemoval(null);
       setNotice("热词已删除。");
     } catch (reason) {
       setError(reason instanceof ApiError ? reason.userMessage : "热词删除失败。");
@@ -391,7 +419,7 @@ export default function SettingsPage() {
                             <button
                               type="button"
                               disabled={busy}
-                              onClick={() => void removeHotword(word)}
+                              onClick={() => void beginRemoveHotword(word)}
                               className="flex size-6 items-center justify-center rounded-full text-ink-300 hover:bg-coral-50 hover:text-coral-600"
                               aria-label={`删除热词${word.value}`}
                             >
@@ -422,6 +450,42 @@ export default function SettingsPage() {
           </aside>
         </div>
       )}
+      <Modal
+        open={Boolean(pendingHotwordRemoval)}
+        title="第二次确认：删除热词"
+        description="第一次确认已经由服务端记录。只有本次独立点击后，热词才会被删除。"
+        onClose={() => !busy && setPendingHotwordRemoval(null)}
+      >
+        {pendingHotwordRemoval ? (
+          <div>
+            <div className="rounded-2xl border border-coral-100 bg-coral-50 p-4 text-sm text-coral-600">
+              即将删除热词：<strong>{pendingHotwordRemoval.word.value}</strong>
+            </div>
+            <p className="mt-3 text-xs text-ink-400">
+              第二阶段确认有效期至
+              {new Date(pendingHotwordRemoval.expiresAt).toLocaleString("zh-CN")}
+            </p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => setPendingHotwordRemoval(null)}
+                className="btn-secondary"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => void finishRemoveHotword()}
+                className="btn-danger"
+              >
+                <Trash2 size={16} /> {busy ? "正在删除并验证" : "第二次确认并删除"}
+              </button>
+            </div>
+          </div>
+        ) : null}
+      </Modal>
     </div>
   );
 }

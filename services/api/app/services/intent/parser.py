@@ -9,6 +9,7 @@ import httpx
 from pydantic import ValidationError
 
 from app.core.config import Settings
+from app.core.metrics import InMemoryMetrics, observe_component
 from app.schemas.intent import IntentName, IntentResult, IntentSlots
 
 
@@ -39,7 +40,7 @@ class OpenAICompatibleIntentClient:
         self,
         *,
         base_url: str,
-        api_key: str,
+        api_key: str | None,
         model: str,
         timeout_seconds: float = 20,
     ) -> None:
@@ -49,7 +50,7 @@ class OpenAICompatibleIntentClient:
         self._timeout = timeout_seconds
 
     async def _complete(self, messages: list[dict[str, str]]) -> str:
-        headers = {"Authorization": f"Bearer {self._api_key}"}
+        headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
         payload = {
             "model": self._model,
             "temperature": 0,
@@ -509,11 +510,29 @@ class IntentParser:
         llm_client: IntentLlmClient | None = None,
         *,
         timezone_name: str = "Asia/Shanghai",
+        metrics: InMemoryMetrics | None = None,
     ) -> None:
         self._llm = llm_client
         self._timezone = ZoneInfo(timezone_name)
+        self._metrics = metrics
 
     async def parse(
+        self,
+        text: str,
+        *,
+        context: Sequence[str] = (),
+        asr_confidence: float | None = None,
+        now: datetime | None = None,
+    ) -> IntentResult:
+        with observe_component(self._metrics, "intent", "parse"):
+            return await self._parse(
+                text,
+                context=context,
+                asr_confidence=asr_confidence,
+                now=now,
+            )
+
+    async def _parse(
         self,
         text: str,
         *,
@@ -531,11 +550,13 @@ class IntentParser:
             )
             return _enforce_policy(fallback, asr_confidence)
 
-        raw = await self._llm.extract(cleaned, context)
+        with observe_component(self._metrics, "llm", "complete"):
+            raw = await self._llm.extract(cleaned, context)
         try:
             parsed = IntentResult.model_validate(_json_object(raw))
         except (json.JSONDecodeError, ValueError, ValidationError) as first_error:
-            repaired = await self._llm.repair(cleaned, raw, str(first_error))
+            with observe_component(self._metrics, "llm", "complete"):
+                repaired = await self._llm.repair(cleaned, raw, str(first_error))
             try:
                 parsed = IntentResult.model_validate(_json_object(repaired))
             except (json.JSONDecodeError, ValueError, ValidationError) as second_error:
@@ -549,13 +570,21 @@ class IntentParser:
         return _enforce_policy(parsed, asr_confidence)
 
 
-def build_intent_parser(settings: Settings) -> IntentParser:
-    if settings.llm_base_url and settings.llm_api_key and settings.llm_model:
+def build_intent_parser(
+    settings: Settings,
+    *,
+    metrics: InMemoryMetrics | None = None,
+) -> IntentParser:
+    if settings.llm_base_url and settings.llm_model:
         client: IntentLlmClient | None = OpenAICompatibleIntentClient(
             base_url=settings.llm_base_url,
-            api_key=settings.llm_api_key,
+            api_key=(
+                settings.llm_api_key.get_secret_value()
+                if settings.llm_api_key is not None
+                else None
+            ),
             model=settings.llm_model,
         )
     else:
         client = None
-    return IntentParser(client, timezone_name=settings.timezone)
+    return IntentParser(client, timezone_name=settings.timezone, metrics=metrics)

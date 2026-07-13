@@ -98,6 +98,9 @@ export function useAsr() {
       });
       if (!mountedRef.current) return;
       dispatch({ type: "PERMISSION_GRANTED" });
+      // Request the short-lived ticket only after the user has answered the
+      // permission prompt; otherwise it may expire while the prompt is open.
+      const ticket = await api.auth.websocketTicket();
       const client = new AsrWebSocketClient(
         {
           onMessage: handleMessage,
@@ -106,7 +109,7 @@ export function useAsr() {
           onError: (message) =>
             mountedRef.current && dispatch({ type: "FAIL", message, retryable: true }),
         },
-        { hotwords: await hotwordsPromise },
+        { hotwords: await hotwordsPromise, ticket: ticket.ticket },
       );
       clientRef.current = client;
       await client.connect();

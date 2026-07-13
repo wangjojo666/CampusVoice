@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 from uuid import uuid4
 
+from app.core.metrics import InMemoryMetrics, observe_component
 from app.schemas.knowledge import (
     ApplicabilityConflict,
     DocumentChunk,
@@ -55,10 +56,12 @@ class KnowledgeService:
         *,
         retriever: ChunkRetriever | None = None,
         answerer: KnowledgeAnswerer | None = None,
+        metrics: InMemoryMetrics | None = None,
     ) -> None:
         self._repository = repository
         self._retriever = retriever or LexicalRetriever()
         self._answerer = answerer
+        self._metrics = metrics
 
     async def ingest(
         self,
@@ -81,10 +84,11 @@ class KnowledgeService:
         ]
         embed_documents = getattr(self._retriever, "embed_documents", None)
         if callable(embed_documents) and chunks:
-            embeddings = await asyncio.to_thread(
-                embed_documents,
-                [chunk.content for chunk in chunks],
-            )
+            with observe_component(self._metrics, "retrieval", "search"):
+                embeddings = await asyncio.to_thread(
+                    embed_documents,
+                    [chunk.content for chunk in chunks],
+                )
             if len(embeddings) != len(chunks):
                 raise RuntimeError("embedding model returned an unexpected vector count")
             chunks = [
@@ -133,12 +137,13 @@ class KnowledgeService:
             for chunk in await self._repository.list_chunks()
             if chunk.document_id in document_map
         ]
-        ranked = await asyncio.to_thread(
-            self._retriever.rank,
-            query,
-            chunks,
-            limit=top_k * 3,
-        )
+        with observe_component(self._metrics, "retrieval", "search"):
+            ranked = await asyncio.to_thread(
+                self._retriever.rank,
+                query,
+                chunks,
+                limit=top_k * 3,
+            )
         citations: list[KnowledgeCitation] = []
         for chunk, similarity in ranked:
             if similarity < min_similarity or chunk.document_id not in document_map:
@@ -251,7 +256,8 @@ class KnowledgeService:
         if self._answerer is None:
             return None
         try:
-            generated = await self._answerer.generate(question, citations)
+            with observe_component(self._metrics, "llm", "complete"):
+                generated = await self._answerer.generate(question, citations)
         except KnowledgeAnswererError:
             return None
         if not generated.sufficient:

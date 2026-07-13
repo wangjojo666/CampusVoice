@@ -4,12 +4,16 @@ from datetime import timedelta
 from typing import Any
 
 from pydantic import ValidationError
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.metrics import InMemoryMetrics, observe_component
 from app.db.types import utc_now
 from app.models.entities import (
     ActionLog,
     CalendarEvent,
+    ConfirmationNonce,
     PendingAction,
     Task,
     Transcription,
@@ -30,6 +34,7 @@ from app.schemas.actions import (
     ActionPrepareRequest,
     CancelActionRequest,
     ConfirmActionRequest,
+    ConfirmationChallenge,
     ExecutionResult,
     UndoResult,
 )
@@ -43,6 +48,7 @@ from app.schemas.domain import (
     TaskUpdate,
     TaskView,
 )
+from app.security.confirmation import ConfirmationChallengeService
 from app.services.actions.completeness import (
     entity_for_action,
     missing_required_fields,
@@ -101,13 +107,22 @@ def _action_label(action: ActionType) -> str:
 
 
 class ActionService:
-    def __init__(self, *, action_ttl_minutes: int = 30, undo_ttl_minutes: int = 1_440) -> None:
+    def __init__(
+        self,
+        *,
+        action_ttl_minutes: int = 30,
+        undo_ttl_minutes: int = 1_440,
+        confirmation_service: ConfirmationChallengeService | None = None,
+        metrics: InMemoryMetrics | None = None,
+    ) -> None:
         self.action_ttl_minutes = action_ttl_minutes
         self.undo_ttl_minutes = undo_ttl_minutes
         self.actions = ActionRepository()
         self.tasks = TaskRepository()
         self.events = EventRepository()
         self.verifier = VerificationService()
+        self.confirmation_service = confirmation_service
+        self.metrics = metrics
 
     async def prepare(
         self, session: AsyncSession, user_id: str, request: ActionPrepareRequest
@@ -245,7 +260,14 @@ class ActionService:
     ) -> str | None:
         resolved_session_id = request.voice_session_id
         if request.transcription_id:
-            transcription = await session.get(Transcription, request.transcription_id)
+            transcription = await session.scalar(
+                select(Transcription)
+                .join(VoiceSession, VoiceSession.id == Transcription.voice_session_id)
+                .where(
+                    Transcription.id == request.transcription_id,
+                    VoiceSession.user_id == user_id,
+                )
+            )
             if transcription is None:
                 raise NotFoundError("transcription", request.transcription_id)
             if resolved_session_id and resolved_session_id != transcription.voice_session_id:
@@ -258,15 +280,14 @@ class ActionService:
             resolved_session_id = transcription.voice_session_id
         if not resolved_session_id:
             return None
-        voice_session = await session.get(VoiceSession, resolved_session_id)
+        voice_session = await session.scalar(
+            select(VoiceSession).where(
+                VoiceSession.id == resolved_session_id,
+                VoiceSession.user_id == user_id,
+            )
+        )
         if voice_session is None:
             raise NotFoundError("voice_session", resolved_session_id)
-        if voice_session.user_id != user_id:
-            raise DomainError(
-                "voice_source_owner_mismatch",
-                "语音来源不属于当前用户。",
-                status_code=403,
-            )
         return resolved_session_id
 
     async def _resolve_target(
@@ -425,6 +446,64 @@ class ActionService:
             },
         )
 
+    async def issue_confirmation_challenge(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        action_id: str,
+    ) -> ConfirmationChallenge:
+        await self._reject_if_expired(session, user_id, action_id)
+        action = await self._pending_or_404(session, user_id, action_id)
+        if action.state not in {
+            PendingActionState.AWAITING_CONFIRMATION,
+            PendingActionState.AWAITING_SECOND_CONFIRMATION,
+        }:
+            raise ConflictError(
+                "invalid_action_state",
+                "A confirmation challenge cannot be issued in the current state",
+                {"state": action.state.value},
+            )
+        if self.confirmation_service is None:
+            raise DomainError(
+                "confirmation_service_unavailable",
+                "The confirmation service is not configured",
+                status_code=503,
+            )
+        challenge, stage, expires_at = self.confirmation_service.issue(action, user_id)
+        return ConfirmationChallenge(
+            challenge=challenge,
+            stage=stage,
+            expires_at=expires_at,
+        )
+
+    async def confirm_direct(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        action_id: str,
+    ) -> PendingAction:
+        """Record one explicit form submission for non-high-risk direct mutations."""
+        await self._reject_if_expired(session, user_id, action_id)
+        async with session.begin():
+            action = await self._pending_or_404(session, user_id, action_id, lock=True)
+            if (
+                action.required_confirmations != 1
+                or action.state != PendingActionState.AWAITING_CONFIRMATION
+            ):
+                raise ConflictError(
+                    "challenge_confirmation_required",
+                    "This action must use the challenge confirmation workflow",
+                )
+            now = utc_now()
+            action.confirmation_history.append(
+                {"method": "authenticated_form", "stage": 1, "confirmed_at": now.isoformat()}
+            )
+            action.confirmations_received = 1
+            action.state = PendingActionState.READY
+            action.confirmed_at = now
+            action.confirmed_payload = dict(action.payload)
+        return action
+
     async def confirm(
         self,
         session: AsyncSession,
@@ -433,43 +512,75 @@ class ActionService:
         request: ConfirmActionRequest,
     ) -> PendingAction:
         await self._reject_if_expired(session, user_id, action_id)
-        async with session.begin():
-            action = await self._pending_or_404(session, user_id, action_id, lock=True)
-            if action.state in TERMINAL_STATES or action.state == PendingActionState.NEEDS_INPUT:
-                raise ConflictError(
-                    "invalid_action_state",
-                    f"Action in state '{action.state.value}' cannot be confirmed",
-                    {"state": action.state.value},
+        try:
+            async with session.begin():
+                action = await self._pending_or_404(session, user_id, action_id, lock=True)
+                if (
+                    action.state in TERMINAL_STATES
+                    or action.state == PendingActionState.NEEDS_INPUT
+                ):
+                    raise ConflictError(
+                        "invalid_action_state",
+                        f"Action in state '{action.state.value}' cannot be confirmed",
+                        {"state": action.state.value},
+                    )
+                if action.state not in {
+                    PendingActionState.AWAITING_CONFIRMATION,
+                    PendingActionState.AWAITING_SECOND_CONFIRMATION,
+                }:
+                    raise ConflictError(
+                        "invalid_action_state", "Action cannot be confirmed in its current state"
+                    )
+                if not request.confirmed:
+                    action.state = PendingActionState.CANCELLED
+                    action.cancelled_at = utc_now()
+                    action.last_error = "user_declined_confirmation"
+                    return action
+                if self.confirmation_service is None:
+                    raise DomainError(
+                        "confirmation_service_unavailable",
+                        "The confirmation service is not configured",
+                        status_code=503,
+                    )
+                verified = self.confirmation_service.verify(
+                    request.challenge,
+                    action=action,
+                    user_id=user_id,
                 )
-            if action.state not in {
-                PendingActionState.AWAITING_CONFIRMATION,
-                PendingActionState.AWAITING_SECOND_CONFIRMATION,
-                PendingActionState.READY,
-            }:
-                raise ConflictError(
-                    "invalid_action_state", "Action cannot be confirmed in its current state"
+                now = utc_now()
+                session.add(
+                    ConfirmationNonce(
+                        nonce_hash=verified.nonce_hash,
+                        pending_action_id=action.id,
+                        user_id=user_id,
+                        stage=verified.stage,
+                        payload_hash=verified.payload_hash,
+                        expires_at=verified.expires_at,
+                        consumed_at=now,
+                    )
                 )
-            if not request.confirmed:
-                action.state = PendingActionState.CANCELLED
-                action.cancelled_at = utc_now()
-                action.last_error = "user_declined_confirmation"
-                return action
-
-            tokens = {item["token"] for item in action.confirmation_history}
-            if request.confirmation_token in tokens:
-                return action
-
-            now = utc_now()
-            action.confirmation_history.append(
-                {"token": request.confirmation_token, "confirmed_at": now.isoformat()}
-            )
-            action.confirmations_received += 1
-            if action.confirmations_received >= action.required_confirmations:
-                action.state = PendingActionState.READY
-                action.confirmed_at = now
-                action.confirmed_payload = dict(action.payload)
-            else:
-                action.state = PendingActionState.AWAITING_SECOND_CONFIRMATION
+                await session.flush()
+                action.confirmation_history.append(
+                    {
+                        "nonce_hash": verified.nonce_hash,
+                        "stage": verified.stage,
+                        "payload_hash": verified.payload_hash,
+                        "confirmed_at": now.isoformat(),
+                    }
+                )
+                action.confirmations_received += 1
+                if action.confirmations_received >= action.required_confirmations:
+                    action.state = PendingActionState.READY
+                    action.confirmed_at = now
+                    action.confirmed_payload = dict(action.payload)
+                else:
+                    action.state = PendingActionState.AWAITING_SECOND_CONFIRMATION
+        except IntegrityError as exc:
+            await session.rollback()
+            raise ConflictError(
+                "confirmation_replayed",
+                "This confirmation stage was already consumed",
+            ) from exc
         return action
 
     async def cancel(
@@ -498,6 +609,17 @@ class ActionService:
         return action
 
     async def execute(self, session: AsyncSession, user_id: str, action_id: str) -> ExecutionResult:
+        with observe_component(self.metrics, "action", "execute") as observation:
+            result = await self._execute(session, user_id, action_id)
+            observation.error = not result.success
+            return result
+
+    async def _execute(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        action_id: str,
+    ) -> ExecutionResult:
         await self._reject_if_expired(session, user_id, action_id)
         operation: AppliedOperation | None = None
         action_type: ActionType | None = None
@@ -578,7 +700,7 @@ class ActionService:
         assert operation is not None and action_type is not None
         report = await self._verify(session, user_id, action_type, operation)
         action = await self._pending_or_404(session, user_id, action_id)
-        verification_log = await self.actions.log_for_action(session, action_id)
+        verification_log = await self.actions.log_for_action(session, user_id, action_id)
         result = _execution_result(action, operation, report)
         if report.success:
             action.state = PendingActionState.EXECUTED
@@ -837,6 +959,18 @@ class ActionService:
         action_type: ActionType,
         operation: AppliedOperation,
     ) -> VerificationReport:
+        with observe_component(self.metrics, "verification", "verify") as observation:
+            report = await self._verify_operation(session, user_id, action_type, operation)
+            observation.error = not report.success
+            return report
+
+    async def _verify_operation(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        action_type: ActionType,
+        operation: AppliedOperation,
+    ) -> VerificationReport:
         if action_type in {
             ActionType.CREATE_TASK,
             ActionType.UPDATE_TASK,
@@ -869,19 +1003,19 @@ class ActionService:
                 raise ConflictError(
                     "invalid_action_state", "Only a successfully executed action can be undone"
                 )
-            log = await self.actions.log_for_action(session, action_id)
+            log = await self.actions.log_for_action(session, user_id, action_id)
             if log is None:
                 raise ConflictError("undo_unavailable", "No operation log is available for undo")
-            undo = await self.actions.undo_for_log(session, log.id)
+            undo = await self.actions.undo_for_log(session, user_id, log.id)
             if undo is None or undo.state != UndoState.AVAILABLE:
                 raise ConflictError("undo_unavailable", "This operation cannot be undone")
             operation = await self._apply_undo(session, action, undo)
 
         report = await self._verify_undo(session, user_id, action, operation)
         action = await self._pending_or_404(session, user_id, action_id)
-        log = await self.actions.log_for_action(session, action_id)
+        log = await self.actions.log_for_action(session, user_id, action_id)
         assert log is not None
-        undo = await self.actions.undo_for_log(session, log.id)
+        undo = await self.actions.undo_for_log(session, user_id, log.id)
         assert undo is not None
         base = _execution_result(
             action, operation, report, action_name=f"undo_{action.action_type.value}"
@@ -1001,6 +1135,18 @@ class ActionService:
         action: PendingAction,
         operation: AppliedOperation,
     ) -> VerificationReport:
+        with observe_component(self.metrics, "verification", "verify") as observation:
+            report = await self._verify_undo_operation(session, user_id, action, operation)
+            observation.error = not report.success
+            return report
+
+    async def _verify_undo_operation(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        action: PendingAction,
+        operation: AppliedOperation,
+    ) -> VerificationReport:
         if action.entity_type == EntityType.TASK:
             return await self.verifier.verify_task(
                 session,
@@ -1081,9 +1227,9 @@ class ActionService:
         async with session.begin():
             action = await self._pending_or_404(session, user_id, action_id, lock=True)
             if action.state == PendingActionState.EXECUTED:
-                log = await self.actions.log_for_action(session, action_id)
+                log = await self.actions.log_for_action(session, user_id, action_id)
                 if log is not None:
-                    undo = await self.actions.undo_for_log(session, log.id)
+                    undo = await self.actions.undo_for_log(session, user_id, log.id)
                     if (
                         undo is not None
                         and undo.state == UndoState.AVAILABLE
@@ -1151,6 +1297,8 @@ def _task_business_fields(snapshot: dict[str, Any]) -> dict[str, Any]:
         "status",
         "source_type",
         "source_document_id",
+        "source_chunk_id",
+        "source_claim_id",
     }
     return {key: snapshot.get(key) for key in keys}
 
@@ -1167,6 +1315,8 @@ def _event_business_fields(snapshot: dict[str, Any]) -> dict[str, Any]:
         "reminder_minutes",
         "source_type",
         "source_document_id",
+        "source_chunk_id",
+        "source_claim_id",
     }
     return {key: snapshot.get(key) for key in keys}
 

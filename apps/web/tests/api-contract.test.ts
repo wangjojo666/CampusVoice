@@ -71,6 +71,33 @@ describe("API wire contract adapters", () => {
     await expect(api.actions.execute("action-1")).rejects.toMatchObject(expected);
   });
 
+  it("preserves nested confirmation details and gives authentication errors safe UI text", async () => {
+    const pendingAction = { id: "action-high-risk", required_confirmations: 2 };
+    vi.mocked(fetch).mockResolvedValue(
+      jsonResponse(
+        {
+          error: {
+            code: "confirmation_required",
+            message: "Two confirmations are required",
+            details: { pending_action: pendingAction },
+          },
+        },
+        428,
+      ),
+    );
+
+    const error = await api.actions.execute("action-high-risk").catch((reason: unknown) => reason);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({
+      code: "confirmation_required",
+      details: { pending_action: pendingAction },
+      userMessage: "Two confirmations are required",
+    });
+    expect(new ApiError("raw provider text", { status: 401 }).userMessage).toBe(
+      "登录状态已失效，请重新登录。",
+    );
+  });
+
   it("maps knowledge citations without inventing page numbers", async () => {
     vi.mocked(fetch).mockResolvedValue(
       jsonResponse({
@@ -115,24 +142,35 @@ describe("API wire contract adapters", () => {
   });
 
   it("sends explicit confirmation and unwraps verified settings updates", async () => {
-    vi.mocked(fetch).mockResolvedValue(
-      jsonResponse({
-        success: true,
-        verified_fields: { major: true },
-        message: "设置已更新并验证",
-        settings: {
-          major: "人工智能",
-          grade: "2024级",
-          current_courses: [{ id: "course-1", code: "AI301", name: "机器学习", teacher: "张老师" }],
-          teacher_names: ["张老师"],
-          default_reminder_minutes: 30,
-          timezone: "Asia/Shanghai",
-          asr_provider: "funasr",
-          asr_model: "paraformer-zh-streaming",
-          asr_device: "cuda:0",
-        },
-      }),
-    );
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(
+        jsonResponse({
+          challenge: "server-issued-write-challenge",
+          stage: 1,
+          required_stages: 1,
+          expires_at: "2026-07-12T12:02:00Z",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          success: true,
+          verified_fields: { major: true },
+          message: "设置已更新并验证",
+          settings: {
+            major: "人工智能",
+            grade: "2024级",
+            current_courses: [
+              { id: "course-1", code: "AI301", name: "机器学习", teacher: "张老师" },
+            ],
+            teacher_names: ["张老师"],
+            default_reminder_minutes: 30,
+            timezone: "Asia/Shanghai",
+            asr_provider: "funasr",
+            asr_model: "paraformer-zh-streaming",
+            asr_device: "cuda:0",
+          },
+        }),
+      );
 
     const settings = await api.settings.update({
       major: "人工智能",
@@ -147,8 +185,20 @@ describe("API wire contract adapters", () => {
       name: "机器学习",
       teacher: "张老师",
     });
-    const options = vi.mocked(fetch).mock.calls[0]?.[1];
-    expect(new Headers(options?.headers).get("X-User-Confirmed")).toBe("true");
+    expect(vi.mocked(fetch).mock.calls[0]?.[0]).toContain("/api/auth/write-challenges");
+    expect(JSON.parse(String(vi.mocked(fetch).mock.calls[0]?.[1]?.body))).toMatchObject({
+      method: "PATCH",
+      path: "/api/settings",
+      body: {
+        current_courses: [{ code: "AI301", name: "机器学习", teacher: "张老师" }],
+        asr_device: "cuda:0",
+      },
+    });
+    const options = vi.mocked(fetch).mock.calls[1]?.[1];
+    expect(new Headers(options?.headers).get("X-Write-Challenge")).toBe(
+      "server-issued-write-challenge",
+    );
+    expect(new Headers(options?.headers).get("X-User-Confirmed")).toBeNull();
     expect(JSON.parse(String(options?.body))).toMatchObject({
       current_courses: [{ code: "AI301", name: "机器学习", teacher: "张老师" }],
       asr_device: "cuda:0",
@@ -307,5 +357,100 @@ describe("API wire contract adapters", () => {
       undone: true,
       undoable: false,
     });
+  });
+
+  it("prepares a destructive task action without confirming or executing it", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(
+      jsonResponse(
+        {
+          id: "action-delete-task",
+          action_type: "delete_task",
+          entity_type: "task",
+          target_id: "task-1",
+          payload: {},
+          state: "awaiting_confirmation",
+          risk_level: "high",
+          risk_factors: ["deletes_data"],
+          missing_fields: [],
+          ambiguities: [],
+          blocking_reasons: [],
+          diagnostics: {},
+          required_confirmations: 2,
+          confirmations_received: 0,
+          expires_at: "2026-07-12T12:00:00Z",
+          attempt_count: 0,
+          max_attempts: 2,
+          last_error: null,
+        },
+        201,
+      ),
+    );
+
+    const pending = await api.tasks.remove("task-1");
+
+    expect(pending).toMatchObject({
+      id: "action-delete-task",
+      status: "awaiting_confirmation",
+      confirmations_required: 2,
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(fetch).mock.calls[0]?.[0]).toContain("/api/actions/prepare");
+    expect(JSON.parse(String(vi.mocked(fetch).mock.calls[0]?.[1]?.body))).toMatchObject({
+      action: "delete_task",
+      target_id: "task-1",
+      hard_to_undo: true,
+    });
+  });
+
+  it("consumes hotword stage one without deleting and uses stage two for DELETE", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(
+        jsonResponse({
+          challenge: "hotword-stage-one",
+          stage: 1,
+          required_stages: 2,
+          expires_at: "2026-07-12T12:02:00Z",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          challenge: "hotword-stage-two",
+          stage: 2,
+          required_stages: 2,
+          expires_at: "2026-07-12T12:02:00Z",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          success: true,
+          action: "delete_hotword",
+          record_id: "hotword-1",
+          verified_fields: { absent: true },
+          side_effects: [],
+          message: "热词已删除",
+          record: null,
+        }),
+      );
+
+    const pending = await api.hotwords.beginRemove("hotword-1");
+
+    expect(pending.challenge).toBe("hotword-stage-two");
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(fetch).mock.calls[0]?.[0]).toContain("/api/auth/write-challenges");
+    expect(JSON.parse(String(vi.mocked(fetch).mock.calls[0]?.[1]?.body))).toMatchObject({
+      method: "DELETE",
+      path: "/api/hotwords/hotword-1",
+      body: null,
+    });
+    expect(vi.mocked(fetch).mock.calls[1]?.[0]).toContain("/api/auth/write-challenges/advance");
+
+    await api.hotwords.finishRemove("hotword-1", pending.challenge);
+
+    const deleteCall = vi.mocked(fetch).mock.calls[2];
+    expect(deleteCall?.[0]).toContain("/api/hotwords/hotword-1");
+    expect(deleteCall?.[1]?.method).toBe("DELETE");
+    expect(new Headers(deleteCall?.[1]?.headers).get("X-Write-Challenge")).toBe(
+      "hotword-stage-two",
+    );
   });
 });

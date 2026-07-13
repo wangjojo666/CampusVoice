@@ -14,6 +14,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { PageHeader } from "@/components/layout/page-header";
+import { CampusRadar } from "@/components/radar/campus-radar";
 import { EmptyState } from "@/components/ui/empty-state";
 import { ErrorState } from "@/components/ui/error-state";
 import { LoadingState } from "@/components/ui/loading-state";
@@ -111,6 +112,8 @@ export default function HomePage() {
           <ErrorState message={error} onRetry={() => void load()} compact />
         </div>
       ) : null}
+
+      <CampusRadar />
 
       <section className="mb-6 grid gap-4 sm:grid-cols-3">
         <div className="surface flex items-center gap-4 p-4">

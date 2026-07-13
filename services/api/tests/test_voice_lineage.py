@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from app.services.asr import AsrSessionConfig, TranscriptResult
+from tests.helpers import confirm_action, confirmed_write
 
 
 class LineageAsrAdapter:
@@ -39,21 +40,30 @@ class LineageAsrAdapter:
 
 
 def test_settings_hotwords_and_voice_lineage_reach_action_log(client: TestClient) -> None:
-    updated = client.patch(
+    updated = confirmed_write(
+        client,
+        "PATCH",
         "/api/settings",
-        json={
+        {
             "current_courses": [
                 {"code": "AI301", "name": "机器学习", "teacher": "张老师"},
             ],
             "teacher_names": ["张老师", "李老师"],
         },
-        headers={"X-User-Confirmed": "true"},
     )
     assert updated.status_code == 200, updated.text
 
     adapter = LineageAsrAdapter()
     client.app.state.asr_adapter_factory = lambda: adapter
-    with client.websocket_connect("/ws/asr") as websocket:
+    origin = "http://localhost:3000"
+    ticket_response = client.post("/api/auth/ws-ticket", headers={"Origin": origin})
+    assert ticket_response.status_code == 200, ticket_response.text
+    ticket = ticket_response.json()["ticket"]
+    with client.websocket_connect(
+        "/ws/asr",
+        headers={"Origin": origin},
+        subprotocols=["campusvoice", f"campusvoice.ticket.{ticket}"],
+    ) as websocket:
         ready = websocket.receive_json()
         websocket.send_json({"type": "start", "hotwords": ["自定义"]})
         websocket.send_json({"type": "stop"})
@@ -113,11 +123,7 @@ def test_settings_hotwords_and_voice_lineage_reach_action_log(client: TestClient
     )
     assert prepared.status_code == 201, prepared.text
     action_id = prepared.json()["id"]
-    confirmed = client.post(
-        f"/api/actions/{action_id}/confirm",
-        json={"confirmed": True, "confirmation_token": "voice-lineage-confirm"},
-    )
-    assert confirmed.status_code == 200, confirmed.text
+    confirm_action(client, action_id)
     executed = client.post(f"/api/actions/{action_id}/execute")
     assert executed.status_code == 200
     assert executed.json()["success"] is True

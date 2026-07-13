@@ -16,6 +16,8 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 .coverage
+coverage.json
+**/coverage.json
 htmlcov/
 *.egg-info/
 .venv/

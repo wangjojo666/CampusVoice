@@ -21,19 +21,34 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: pnpm audit --audit-level=high
       - run: pnpm format:check
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
+      - run: pnpm test:coverage
       - run: pnpm --filter @campusvoice/web exec playwright install --with-deps chromium
       - run: pnpm test:e2e
       - run: pnpm build
 
   backend:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:8.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     env:
+      CAMPUSVOICE_ENV: test
+      CAMPUSVOICE_AUTH_MODE: demo
       CAMPUSVOICE_DATABASE_URL: sqlite+aiosqlite:///./ci.db
       CAMPUSVOICE_DATABASE_AUTO_CREATE: "false"
+      CAMPUSVOICE_TEST_REDIS_URL: redis://127.0.0.1:6379/15
     defaults:
       run:
         working-directory: services/api
@@ -43,14 +58,22 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e ".[dev]"
+          cache-dependency-path: services/api/requirements/dev.lock
+      - run: python -m pip install --require-hashes --requirement requirements/dev.lock
+      - run: python -m pip_audit --require-hashes --disable-pip --requirement requirements/runtime.lock
+      - run: python -m pip_audit --require-hashes --disable-pip --requirement requirements/dev.lock
       - run: python -m ruff check app tests
       - run: python -m ruff format --check app tests
       - run: python -m mypy app
       - run: python -m alembic upgrade head
+      - run: python -m app.jobs.retention
+      - run: python -m app.jobs.sqlite_backup create ci.db ci-backup.db
+      - run: python -m app.jobs.sqlite_backup verify ci-backup.db
       - run: python -m alembic check
-      - run: python -m pytest --cov=app --cov-report=term-missing
+      - run: python -m alembic downgrade base
+      - run: python -m alembic upgrade head
+      - run: python -m pytest --cov=app --cov-fail-under=80 --cov-report=term-missing --cov-report=json:coverage.json
+      - run: python scripts/check_critical_coverage.py coverage.json
 
   containers:
     runs-on: ubuntu-latest
@@ -58,5 +81,26 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker compose config --quiet
       - run: docker compose -f docker-compose.yml -f docker-compose.gpu.yml config --quiet
+      - run: docker compose -f docker-compose.yml -f docker-compose.smoke.yml config --quiet
+      - run: docker compose -f docker-compose.yml -f docker-compose.multi-worker.yml --profile multi-worker config --quiet
       - run: docker build --file services/api/Dockerfile --tag campusvoice-api:ci .
       - run: docker build --file apps/web/Dockerfile --tag campusvoice-web:ci .
+
+  full-stack-smoke:
+    needs: [frontend, backend, containers]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @campusvoice/web exec playwright install --with-deps chromium
+      - run: bash scripts/run-compose-smoke.sh
+        env:
+          CAMPUSVOICE_EXTRA_COMPOSE_FILE: docker-compose.multi-worker.yml
+          COMPOSE_PROFILES: multi-worker

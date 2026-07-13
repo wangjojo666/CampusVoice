@@ -1,14 +1,13 @@
-from uuid import uuid4
-
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.entities import PendingAction
 from app.models.enums import ActionType
 from app.repositories.events import EventRepository
-from app.schemas.actions import ActionPrepareRequest, ConfirmActionRequest, PendingActionView
+from app.schemas.actions import ActionPrepareRequest, PendingActionView
 from app.schemas.domain import EventCreate, EventMutationResponse, EventUpdate, EventView
 from app.services.actions.service import ActionService
 from app.services.errors import ConfirmationRequiredError, VerificationFailedError
+from app.services.lineage import validate_notice_lineage
 
 
 class EventService:
@@ -25,6 +24,13 @@ class EventService:
         confirmed: bool,
         idempotency_key: str | None,
     ) -> EventMutationResponse:
+        await validate_notice_lineage(
+            session,
+            user_id,
+            document_id=data.source_document_id,
+            chunk_id=data.source_chunk_id,
+            claim_id=data.source_claim_id,
+        )
         action = await self.actions.prepare(
             session,
             user_id,
@@ -47,6 +53,13 @@ class EventService:
         confirmed: bool,
         idempotency_key: str | None,
     ) -> EventMutationResponse:
+        await validate_notice_lineage(
+            session,
+            user_id,
+            document_id=data.source_document_id,
+            chunk_id=data.source_chunk_id,
+            claim_id=data.source_claim_id,
+        )
         action = await self.actions.prepare(
             session,
             user_id,
@@ -88,14 +101,13 @@ class EventService:
         action: PendingAction,
         confirmed: bool,
     ) -> EventMutationResponse:
-        if not confirmed or action.state.value == "needs_input":
+        if (
+            not confirmed
+            or action.state.value == "needs_input"
+            or action.required_confirmations != 1
+        ):
             raise ConfirmationRequiredError(_action_dict(action))
-        action = await self.actions.confirm(
-            session,
-            user_id,
-            action.id,
-            ConfirmActionRequest(confirmed=True, confirmation_token=f"direct-{uuid4().hex}"),
-        )
+        action = await self.actions.confirm_direct(session, user_id, action.id)
         if action.state.value != "ready":
             raise ConfirmationRequiredError(_action_dict(action))
         result = await self.actions.execute(session, user_id, action.id)
