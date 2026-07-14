@@ -16,6 +16,7 @@ from app.core.config import Settings
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 START_DEMO = REPO_ROOT / "scripts" / "start_demo.ps1"
+STOP_DEMO = REPO_ROOT / "scripts" / "stop_demo.ps1"
 
 
 def _powershell_executable() -> str:
@@ -31,12 +32,18 @@ def _copy_start_script(tmp_path: Path) -> tuple[Path, Path]:
     script_path = repo_root / "scripts" / "start_demo.ps1"
     script_path.parent.mkdir(parents=True)
     shutil.copy2(START_DEMO, script_path)
+    shutil.copy2(STOP_DEMO, script_path.with_name("stop_demo.ps1"))
     return repo_root, script_path
 
 
 def _run_powershell_json(repo_root: Path, script_path: Path, command: str) -> dict[str, Any]:
     escaped_script = str(script_path).replace("'", "''")
-    source = textwrap.dedent(command).replace("__START_DEMO__", escaped_script)
+    escaped_stop_script = str(script_path.with_name("stop_demo.ps1")).replace("'", "''")
+    source = (
+        textwrap.dedent(command)
+        .replace("__START_DEMO__", escaped_script)
+        .replace("__STOP_DEMO__", escaped_stop_script)
+    )
     environment = os.environ.copy()
     environment["CAMPUSVOICE_TEST_PYTHON"] = sys.executable
     completed = subprocess.run(
@@ -82,6 +89,151 @@ def _assert_restored(
         else:
             assert state["Exists"] is False
             assert state["Value"] is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="start_demo.ps1 launches Windows processes")
+def test_tracked_process_preserves_windows_arguments_with_spaces_quotes_and_backslashes(
+    tmp_path: Path,
+) -> None:
+    repo_root, script_path = _copy_start_script(tmp_path / "repository with spaces")
+    payload = _run_powershell_json(
+        repo_root,
+        script_path,
+        r"""
+        [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+        . '__START_DEMO__'
+
+        [IO.Directory]::CreateDirectory($RuntimeRoot) | Out-Null
+        $Stdout = Join-Path $RuntimeRoot 'argv.stdout.log'
+        $Stderr = Join-Path $RuntimeRoot 'argv.stderr.log'
+        $Expected = @(
+            'argument with spaces'
+            'quote"inside'
+            'trailing path\'
+            ''
+        )
+        $PythonCode = 'import json, sys; print(json.dumps(sys.argv[1:]))'
+        $ChildArguments = @('-c', $PythonCode) + $Expected
+        $Record = Start-TrackedProcess `
+            -Name 'api' `
+            -FilePath $env:CAMPUSVOICE_TEST_PYTHON `
+            -Arguments $ChildArguments `
+            -WorkingDirectory $RepoRoot `
+            -Stdout $Stdout `
+            -Stderr $Stderr `
+            -Marker 'argv-regression-marker'
+        Wait-Process -Id ([int]$Record.pid) -Timeout 10 -ErrorAction SilentlyContinue
+        $StillRunning = [bool](Get-Process -Id ([int]$Record.pid) -ErrorAction SilentlyContinue)
+        if ($StillRunning) {
+            Stop-Process -Id ([int]$Record.pid) -Force -ErrorAction SilentlyContinue
+        }
+        [pscustomobject]@{
+            StillRunning = $StillRunning
+            Stdout = if (Test-Path -LiteralPath $Stdout) {
+                ([string]::Join("", [string[]]@(Get-Content -LiteralPath $Stdout))).Trim()
+            }
+            else { '' }
+            Stderr = if (Test-Path -LiteralPath $Stderr) {
+                ([string]::Join("", [string[]]@(Get-Content -LiteralPath $Stderr))).Trim()
+            }
+            else { '' }
+        } | ConvertTo-Json -Compress
+        """,
+    )
+
+    assert payload["StillRunning"] is False
+    assert payload["Stderr"] == ""
+    assert json.loads(payload["Stdout"]) == [
+        "argument with spaces",
+        'quote"inside',
+        "trailing path\\",
+        "",
+    ]
+
+
+def test_stale_pid_marker_state_is_removed_without_stopping_the_process(tmp_path: Path) -> None:
+    repo_root, script_path = _copy_start_script(tmp_path)
+    payload = _run_powershell_json(
+        repo_root,
+        script_path,
+        r"""
+        [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+        . '__START_DEMO__'
+
+        [IO.Directory]::CreateDirectory($RuntimeRoot) | Out-Null
+        $Marker = 'expected-campusvoice-marker'
+        $script:MockCommandLine = 'unrelated-process --serve'
+        function Get-CimInstance {
+            [CmdletBinding()]
+            param(
+                [Parameter(Position = 0)][string]$ClassName,
+                [string]$Filter
+            )
+            return [pscustomobject]@{
+                ProcessId = 4242
+                ParentProcessId = 1
+                CommandLine = $script:MockCommandLine
+                Name = 'unrelated.exe'
+            }
+        }
+        function Get-NetTCPConnection {
+            [CmdletBinding()]
+            param([string]$State, [int]$LocalPort)
+            return $null
+        }
+        function Stop-Process {
+            throw 'stale marker must never stop the unrelated process'
+        }
+        function Write-TestState {
+            [ordered]@{
+                version = 1
+                repo_root = $RepoRoot
+                processes = @(
+                    [ordered]@{
+                        name = 'api'
+                        pid = 4242
+                        marker = $Marker
+                        stdout = 'unused.stdout.log'
+                        stderr = 'unused.stderr.log'
+                    }
+                )
+            } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StateFile -Encoding UTF8
+        }
+
+        Write-TestState
+        $script:MockCommandLine = "python -m uvicorn --app-dir $Marker"
+        $MatchingFailure = $null
+        try {
+            Assert-NoRecordedDemoProcesses
+        }
+        catch {
+            $MatchingFailure = $_.Exception.Message
+        }
+        $MatchingStateExists = Test-Path -LiteralPath $StateFile
+        Remove-Item -LiteralPath $StateFile -Force
+
+        Write-TestState
+        $script:MockCommandLine = 'unrelated-process --serve'
+        Assert-NoRecordedDemoProcesses
+        $StartRemovedStaleState = -not (Test-Path -LiteralPath $StateFile)
+
+        Write-TestState
+        & '__STOP_DEMO__'
+        $StopRemovedStaleState = -not (Test-Path -LiteralPath $StateFile)
+
+        [pscustomobject]@{
+            MatchingFailure = $MatchingFailure
+            MatchingStateExists = $MatchingStateExists
+            StartRemovedStaleState = $StartRemovedStaleState
+            StopRemovedStaleState = $StopRemovedStaleState
+        } | ConvertTo-Json -Compress
+        """,
+    )
+
+    assert "already has recorded demo processes" in payload["MatchingFailure"]
+    assert payload["MatchingStateExists"] is True
+    assert payload["StartRemovedStaleState"] is True
+    assert payload["StopRemovedStaleState"] is True
 
 
 def test_demo_main_isolates_ambient_configuration_and_restores_it(tmp_path: Path) -> None:

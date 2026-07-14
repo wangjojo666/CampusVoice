@@ -71,6 +71,47 @@ function Restore-ProcessEnvironment($Snapshot) {
     }
 }
 
+function ConvertTo-WindowsCommandLineArgument([AllowEmptyString()][string]$Argument) {
+    if ($null -eq $Argument) {
+        $Argument = ""
+    }
+    if ($Argument.Length -gt 0 -and $Argument -notmatch '[\s"]') {
+        return $Argument
+    }
+
+    $Builder = New-Object System.Text.StringBuilder
+    [void]$Builder.Append('"')
+    $BackslashCount = 0
+    foreach ($Character in $Argument.ToCharArray()) {
+        if ($Character -eq '\') {
+            $BackslashCount++
+            continue
+        }
+        if ($Character -eq '"') {
+            [void]$Builder.Append((('\' * (($BackslashCount * 2) + 1)) -join ""))
+            [void]$Builder.Append('"')
+            $BackslashCount = 0
+            continue
+        }
+        if ($BackslashCount -gt 0) {
+            [void]$Builder.Append((('\' * $BackslashCount) -join ""))
+            $BackslashCount = 0
+        }
+        [void]$Builder.Append($Character)
+    }
+    if ($BackslashCount -gt 0) {
+        [void]$Builder.Append((('\' * ($BackslashCount * 2)) -join ""))
+    }
+    [void]$Builder.Append('"')
+    return $Builder.ToString()
+}
+
+function Join-WindowsCommandLineArguments([string[]]$Arguments) {
+    return (@($Arguments | ForEach-Object {
+                ConvertTo-WindowsCommandLineArgument ([string]$_)
+            }) -join " ")
+}
+
 function Get-IsolatedDemoConfiguration([string]$DatabasePath = $DemoDatabasePath) {
     $AllowedDataRoot = [IO.Path]::GetFullPath($DemoDataRoot)
     $ResolvedDatabasePath = [IO.Path]::GetFullPath($DatabasePath)
@@ -159,6 +200,67 @@ function Get-RecordValue($Record, [string]$Key) {
     return ""
 }
 
+function Get-TrackedProcessRecordStatus($Record) {
+    $RecordPid = 0
+    $Marker = Get-RecordValue $Record "marker"
+    $Name = Get-RecordValue $Record "name"
+    if ($Name -notin @("api", "web") -or
+        -not [int]::TryParse((Get-RecordValue $Record "pid"), [ref]$RecordPid) -or
+        $RecordPid -le 0 -or
+        [string]::IsNullOrWhiteSpace($Marker)) {
+        return [pscustomobject]@{
+            status = "invalid"
+            name = $Name
+            pid = $RecordPid
+            marker = $Marker
+            process = $null
+        }
+    }
+
+    $Root = Get-CimInstance Win32_Process -Filter "ProcessId=$RecordPid" -ErrorAction SilentlyContinue
+    if (-not $Root) {
+        $Status = "exited"
+    }
+    elseif (-not $Root.CommandLine) {
+        $Status = "unverifiable"
+    }
+    elseif ($Root.CommandLine.Contains($Marker)) {
+        $Status = "matching"
+    }
+    else {
+        $Status = "stale"
+    }
+    return [pscustomobject]@{
+        status = $Status
+        name = $Name
+        pid = $RecordPid
+        marker = $Marker
+        process = $Root
+    }
+}
+
+function Assert-NoRecordedDemoProcesses {
+    if (-not (Test-Path -LiteralPath $StateFile)) {
+        return
+    }
+
+    $Existing = Get-Content -Raw -LiteralPath $StateFile | ConvertFrom-Json
+    $BlockingRecords = New-Object System.Collections.ArrayList
+    foreach ($Record in @($Existing.processes)) {
+        $RecordStatus = Get-TrackedProcessRecordStatus $Record
+        if ($RecordStatus.status -in @("matching", "unverifiable", "invalid")) {
+            [void]$BlockingRecords.Add($Record)
+        }
+        elseif ($RecordStatus.status -eq "stale") {
+            Write-Warning "Removed stale process state for PID $($RecordStatus.pid); its command line belongs to another process."
+        }
+    }
+    if ($BlockingRecords.Count -gt 0) {
+        throw "This worktree already has recorded demo processes. Run scripts/stop_demo.ps1 first."
+    }
+    Remove-Item -LiteralPath $StateFile -Force
+}
+
 function Get-RemainingStartupSeconds([string]$Label) {
     $Remaining = [int][Math]::Ceiling(($StartupDeadline - (Get-Date)).TotalSeconds)
     if ($Remaining -le 0) {
@@ -237,9 +339,11 @@ function Invoke-Checked(
     })
     $Command = "`$ProgressPreference = 'SilentlyContinue'; Set-Location -LiteralPath $WorkingPath; & $CommandPath $($QuotedArguments -join ' '); `$CampusVoiceExitCode = `$LASTEXITCODE; [IO.File]::WriteAllText($ExitStatusPath, [string]`$CampusVoiceExitCode); exit `$CampusVoiceExitCode"
     $EncodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
-    $Process = Start-Process -FilePath "powershell.exe" -ArgumentList @(
+    $PowerShellArguments = Join-WindowsCommandLineArguments @(
         "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $EncodedCommand
-    ) -WorkingDirectory $WorkingDirectory -WindowStyle Hidden `
+    )
+    $Process = Start-Process -FilePath "powershell.exe" -ArgumentList $PowerShellArguments `
+        -WorkingDirectory $WorkingDirectory -WindowStyle Hidden `
         -RedirectStandardOutput $Stdout -RedirectStandardError $Stderr -PassThru
     try {
         Wait-Process -Id $Process.Id -Timeout $Remaining -ErrorAction SilentlyContinue
@@ -293,7 +397,8 @@ function Start-TrackedProcess(
     [string]$Stderr,
     [string]$Marker
 ) {
-    $Process = Start-Process -FilePath $FilePath -ArgumentList $Arguments `
+    $ProcessArguments = Join-WindowsCommandLineArguments $Arguments
+    $Process = Start-Process -FilePath $FilePath -ArgumentList $ProcessArguments `
         -WorkingDirectory $WorkingDirectory -WindowStyle Hidden `
         -RedirectStandardOutput $Stdout -RedirectStandardError $Stderr -PassThru
     foreach ($LogPath in @($Stdout, $Stderr)) {
@@ -449,14 +554,7 @@ function Invoke-CampusVoiceDemo {
             Write-Host "Database target: $($DemoConfiguration.DatabasePath)"
             Write-Host "Environment: development; auth: demo; ASR: disabled (local quota)"
 
-            if (Test-Path -LiteralPath $StateFile) {
-                $Existing = Get-Content -Raw -LiteralPath $StateFile | ConvertFrom-Json
-                $Running = @($Existing.processes | Where-Object { Get-Process -Id $_.pid -ErrorAction SilentlyContinue })
-                if ($Running.Count -gt 0) {
-                    throw "This worktree already has recorded demo processes. Run scripts/stop_demo.ps1 first."
-                }
-                Remove-Item -LiteralPath $StateFile -Force
-            }
+            Assert-NoRecordedDemoProcesses
 
             Assert-PortFree 8000
             Assert-PortFree 3000

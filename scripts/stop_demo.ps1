@@ -19,6 +19,45 @@ function Get-RecordValue($Record, [string]$Key) {
     return ""
 }
 
+function Get-TrackedProcessRecordStatus($Record) {
+    $RecordPid = 0
+    $Marker = Get-RecordValue $Record "marker"
+    $Name = Get-RecordValue $Record "name"
+    if ($Name -notin @("api", "web") -or
+        -not [int]::TryParse((Get-RecordValue $Record "pid"), [ref]$RecordPid) -or
+        $RecordPid -le 0 -or
+        [string]::IsNullOrWhiteSpace($Marker)) {
+        return [pscustomobject]@{
+            status = "invalid"
+            name = $Name
+            pid = $RecordPid
+            marker = $Marker
+            process = $null
+        }
+    }
+
+    $Root = Get-CimInstance Win32_Process -Filter "ProcessId=$RecordPid" -ErrorAction SilentlyContinue
+    if (-not $Root) {
+        $Status = "exited"
+    }
+    elseif (-not $Root.CommandLine) {
+        $Status = "unverifiable"
+    }
+    elseif ($Root.CommandLine.Contains($Marker)) {
+        $Status = "matching"
+    }
+    else {
+        $Status = "stale"
+    }
+    return [pscustomobject]@{
+        status = $Status
+        name = $Name
+        pid = $RecordPid
+        marker = $Marker
+        process = $Root
+    }
+}
+
 function Get-DescendantProcessIds([int]$RootPid) {
     $All = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
     $Result = New-Object System.Collections.ArrayList
@@ -48,29 +87,30 @@ $RemainingRecords = New-Object System.Collections.ArrayList
 $Records = @($State.processes)
 [array]::Reverse($Records)
 foreach ($Record in $Records) {
-    $RecordPid = 0
-    $Marker = [string]$Record.marker
-    $Name = [string]$Record.name
-    if ($Name -notin @("api", "web") -or
-        -not [int]::TryParse([string]$Record.pid, [ref]$RecordPid) -or
-        $RecordPid -le 0 -or
-        [string]::IsNullOrWhiteSpace($Marker)) {
+    $RecordStatus = Get-TrackedProcessRecordStatus $Record
+    $RecordPid = [int]$RecordStatus.pid
+    $Marker = [string]$RecordStatus.marker
+    $Name = [string]$RecordStatus.name
+    if ($RecordStatus.status -eq "invalid") {
         [void]$RemainingRecords.Add($Record)
         Write-Warning "Skipped an invalid process record."
         continue
     }
-
-    $Root = Get-CimInstance Win32_Process -Filter "ProcessId=$RecordPid" -ErrorAction SilentlyContinue
-    if (-not $Root) {
+    if ($RecordStatus.status -eq "exited") {
         Write-Host "${Name}: PID $RecordPid already exited."
         continue
     }
-    if (-not $Root.CommandLine -or -not $Root.CommandLine.Contains($Marker)) {
+    if ($RecordStatus.status -eq "stale") {
+        Write-Warning "${Name}: PID $RecordPid belongs to another process; stale state was removed without stopping it."
+        continue
+    }
+    if ($RecordStatus.status -eq "unverifiable") {
         [void]$RemainingRecords.Add($Record)
-        Write-Warning "${Name}: PID $RecordPid did not match the recorded command line and was not stopped."
+        Write-Warning "${Name}: PID $RecordPid command line could not be verified and was not stopped."
         continue
     }
 
+    $Root = $RecordStatus.process
     $Descendants = @(Get-DescendantProcessIds $RecordPid)
     $Snapshots = @{}
     foreach ($ProcessId in (@($RecordPid) + @($Descendants))) {
