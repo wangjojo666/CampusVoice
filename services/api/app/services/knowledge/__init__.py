@@ -10,6 +10,8 @@ from app.services.knowledge.repository import (
     SqlAlchemyKnowledgeRepository,
 )
 from app.services.knowledge.service import (
+    DocumentLimitError,
+    DocumentLimits,
     DocumentParseError,
     InMemoryKnowledgeRepository,
     KnowledgeRepository,
@@ -17,6 +19,8 @@ from app.services.knowledge.service import (
 )
 
 __all__ = [
+    "DocumentLimitError",
+    "DocumentLimits",
     "DocumentParseError",
     "DuplicateDocumentError",
     "GroundedAnswer",
