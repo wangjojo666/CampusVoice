@@ -20,7 +20,27 @@ def parse_payload(action: ActionType, payload: dict[str, Any]) -> PayloadModel:
         if action in {ActionType.CREATE_TASK, ActionType.UPDATE_TASK}:
             return TaskDraft.model_validate(payload)
         if action in {ActionType.CREATE_EVENT, ActionType.UPDATE_EVENT}:
-            return EventDraft.model_validate(payload)
+            parsed_event = EventDraft.model_validate(payload)
+            if (
+                action in {ActionType.CREATE_EVENT, ActionType.UPDATE_EVENT}
+                and "end_at" in parsed_event.model_fields_set
+                and parsed_event.end_at is None
+            ):
+                raise DomainError(
+                    "invalid_action_payload",
+                    "The action payload does not match the required schema",
+                    status_code=422,
+                    details={
+                        "errors": [
+                            {
+                                "type": "value_error",
+                                "loc": ["end_at"],
+                                "msg": "event field cannot be null: end_at",
+                            }
+                        ]
+                    },
+                )
+            return parsed_event
         if payload:
             raise DomainError(
                 "invalid_action_payload",
@@ -30,11 +50,15 @@ def parse_payload(action: ActionType, payload: dict[str, Any]) -> PayloadModel:
             )
         return TaskDraft() if action == ActionType.DELETE_TASK else EventDraft()
     except ValidationError as exc:
+        errors = [
+            {"type": item["type"], "loc": list(item["loc"]), "msg": item["msg"]}
+            for item in exc.errors(include_url=False)
+        ]
         raise DomainError(
             "invalid_action_payload",
             "The action payload does not match the required schema",
             status_code=422,
-            details={"errors": exc.errors(include_url=False)},
+            details={"errors": errors},
         ) from exc
 
 

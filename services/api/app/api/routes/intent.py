@@ -7,6 +7,7 @@ from app.api.dependencies import (
     SettingsDependency,
     UserIdDependency,
 )
+from app.models.entities import UserSettings
 from app.schemas.intent import IntentParseRequest, IntentResult
 from app.services.intent import (
     ConversationService,
@@ -31,6 +32,7 @@ async def parse_intent(
 ) -> IntentResult:
     conversations = ConversationService()
     async with session.begin():
+        user_settings = await session.get(UserSettings, user_id)
         persisted_context = await conversations.context_for(
             session,
             user_id,
@@ -41,6 +43,7 @@ async def parse_intent(
             request.text,
             context=[*persisted_context, *request.context],
             asr_confidence=request.asr_confidence,
+            timezone_name=user_settings.timezone if user_settings is not None else None,
         )
     except IntentParseError as exc:
         raise HTTPException(

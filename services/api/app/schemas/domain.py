@@ -51,13 +51,20 @@ class TaskUpdate(StrictModel):
     source_document_id: str | None = None
     source_chunk_id: str | None = None
     source_claim_id: str | None = None
-    expected_version: int | None = Field(default=None, ge=1)
+    expected_version: int = Field(ge=1)
 
     @model_validator(mode="after")
     def has_changes(self) -> "TaskUpdate":
         changed = self.model_fields_set - {"expected_version"}
         if not changed:
             raise ValueError("at least one task field must be supplied")
+        null_fields = {
+            name
+            for name in self.model_fields_set & {"title", "priority", "status", "source_type"}
+            if getattr(self, name) is None
+        }
+        if null_fields:
+            raise ValueError(f"task fields cannot be null: {', '.join(sorted(null_fields))}")
         if self.due_at and self.reminder_at and self.reminder_at > self.due_at:
             raise ValueError("reminder_at must not be later than due_at")
         return self
@@ -77,6 +84,17 @@ class TaskDraft(StrictModel):
     source_chunk_id: str | None = None
     source_claim_id: str | None = None
     expected_version: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def reject_null_required_fields(self) -> "TaskDraft":
+        null_fields = {
+            name
+            for name in self.model_fields_set & {"title", "priority", "status", "source_type"}
+            if getattr(self, name) is None
+        }
+        if null_fields:
+            raise ValueError(f"task fields cannot be null: {', '.join(sorted(null_fields))}")
+        return self
 
 
 class TaskView(StrictModel):
@@ -121,6 +139,8 @@ class EventCreate(StrictModel):
 
     @model_validator(mode="after")
     def end_follows_start(self) -> "EventCreate":
+        if "end_at" in self.model_fields_set and self.end_at is None:
+            raise ValueError("end_at cannot be null; omit it to use the default duration")
         if self.end_at is not None and self.end_at <= self.start_at:
             raise ValueError("end_at must be later than start_at")
         return self
@@ -140,13 +160,21 @@ class EventUpdate(StrictModel):
     source_chunk_id: str | None = None
     source_claim_id: str | None = None
     allow_conflict: bool = False
-    expected_version: int | None = Field(default=None, ge=1)
+    expected_version: int = Field(ge=1)
 
     @model_validator(mode="after")
     def validate_patch(self) -> "EventUpdate":
         changed = self.model_fields_set - {"allow_conflict", "expected_version"}
         if not changed:
             raise ValueError("at least one event field must be supplied")
+        null_fields = {
+            name
+            for name in self.model_fields_set
+            & {"title", "start_at", "end_at", "reminder_minutes", "source_type"}
+            if getattr(self, name) is None
+        }
+        if null_fields:
+            raise ValueError(f"event fields cannot be null: {', '.join(sorted(null_fields))}")
         if self.start_at and self.end_at and self.end_at <= self.start_at:
             raise ValueError("end_at must be later than start_at")
         return self
@@ -169,6 +197,14 @@ class EventDraft(StrictModel):
 
     @model_validator(mode="after")
     def end_follows_start(self) -> "EventDraft":
+        null_fields = {
+            name
+            for name in self.model_fields_set
+            & {"title", "start_at", "reminder_minutes", "source_type"}
+            if getattr(self, name) is None
+        }
+        if null_fields:
+            raise ValueError(f"event fields cannot be null: {', '.join(sorted(null_fields))}")
         if self.start_at and self.end_at and self.end_at <= self.start_at:
             raise ValueError("end_at must be later than start_at")
         return self

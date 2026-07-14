@@ -1,10 +1,24 @@
+import asyncio
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import func, select
 
+from app.models.entities import PendingAction
 from app.services.verification.service import VerificationReport
 from tests.helpers import confirm_action, confirmed_write
+
+
+def _pending_action_count(client: TestClient) -> int:
+    async def count() -> int:
+        factory = client.app.state.session_factory
+        async with factory() as session:
+            result = await session.scalar(select(func.count(PendingAction.id)))
+            return int(result or 0)
+
+    return asyncio.run(count())
 
 
 def test_completeness_and_low_confidence_risk_are_deterministic(client: TestClient) -> None:
@@ -42,6 +56,85 @@ def test_unknown_payload_fields_are_rejected(client: TestClient) -> None:
     assert response.json()["error"]["code"] == "invalid_action_payload"
 
 
+def test_action_prepare_rejects_null_end_for_create_without_writing(client: TestClient) -> None:
+    assert _pending_action_count(client) == 0
+
+    response = client.post(
+        "/api/actions/prepare",
+        json={
+            "action": "create_event",
+            "payload": {
+                "title": "显式空结束时间",
+                "start_at": "2026-07-18T09:00:00+08:00",
+                "end_at": None,
+            },
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_action_payload"
+    assert client.get("/api/events").json() == {"items": [], "total": 0}
+    assert _pending_action_count(client) == 0
+
+
+@pytest.mark.parametrize("field", ["title", "priority", "status", "source_type"])
+def test_action_prepare_rejects_null_task_fields_without_modifying_target(
+    client: TestClient,
+    field: str,
+) -> None:
+    task_id = confirmed_write(client, "POST", "/api/tasks", {"title": "动作空值待办"}).json()[
+        "record_id"
+    ]
+    task_before = client.get("/api/tasks").json()["items"][0]
+
+    response = client.post(
+        "/api/actions/prepare",
+        json={
+            "action": "update_task",
+            "target_id": task_id,
+            "payload": {field: None},
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_action_payload"
+    assert client.get("/api/tasks").json()["items"][0] == task_before
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["title", "start_at", "end_at", "reminder_minutes", "source_type"],
+)
+def test_action_prepare_rejects_null_event_fields_without_modifying_target(
+    client: TestClient,
+    field: str,
+) -> None:
+    event_id = confirmed_write(
+        client,
+        "POST",
+        "/api/events",
+        {
+            "title": "动作空值日程",
+            "start_at": "2026-07-18T09:00:00+08:00",
+            "end_at": "2026-07-18T10:00:00+08:00",
+        },
+    ).json()["record_id"]
+    event_before = client.get("/api/events").json()["items"][0]
+
+    response = client.post(
+        "/api/actions/prepare",
+        json={
+            "action": "update_event",
+            "target_id": event_id,
+            "payload": {field: None},
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_action_payload"
+    assert client.get("/api/events").json()["items"][0] == event_before
+
+
 def test_unique_task_title_is_resolved_without_exposing_an_internal_id(client: TestClient) -> None:
     task_id = confirmed_write(client, "POST", "/api/tasks", {"title": "机器学习作业"}).json()[
         "record_id"
@@ -59,6 +152,7 @@ def test_unique_task_title_is_resolved_without_exposing_an_internal_id(client: T
     assert prepared.status_code == 201, prepared.text
     body = prepared.json()
     assert body["target_id"] == task_id
+    assert body["payload"]["expected_version"] == 1
     assert body["state"] == "awaiting_confirmation"
     assert body["diagnostics"]["target_resolution"] == "unique_title_match"
 
@@ -114,6 +208,30 @@ def test_unique_event_title_is_resolved_before_high_risk_delete_confirmation(
     assert prepared.json()["target_id"] == event_id
     assert prepared.json()["state"] == "awaiting_confirmation"
     assert prepared.json()["required_confirmations"] == 2
+
+
+def test_unique_event_title_update_freezes_current_version(client: TestClient) -> None:
+    event_id = confirmed_write(
+        client,
+        "POST",
+        "/api/events",
+        {"title": "版本冻结答辩", "start_at": "2026-07-20T01:00:00Z"},
+    ).json()["record_id"]
+
+    prepared = client.post(
+        "/api/actions/prepare",
+        json={
+            "action": "update_event",
+            "target_title": "版本冻结答辩",
+            "payload": {"location": "A101"},
+        },
+    )
+
+    assert prepared.status_code == 201, prepared.text
+    body = prepared.json()
+    assert body["target_id"] == event_id
+    assert body["payload"]["expected_version"] == 1
+    assert body["diagnostics"]["target_resolution"] == "unique_title_match"
 
 
 def test_prepare_and_execute_are_idempotent(client: TestClient) -> None:

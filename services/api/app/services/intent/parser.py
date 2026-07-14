@@ -130,7 +130,7 @@ def _json_object(raw: str) -> dict[str, Any]:
 
 
 def _find_date(text: str, today: date) -> str | None:
-    relative = {"今天": 0, "明天": 1, "后天": 2}
+    relative = {"今天": 0, "今晚": 0, "明天": 1, "后天": 2}
     for token, offset in relative.items():
         if token in text:
             return (today + timedelta(days=offset)).isoformat()
@@ -183,7 +183,7 @@ def _hour_number(value: str) -> int | None:
 
 def _find_times(text: str) -> tuple[str | None, str | None]:
     pattern = re.compile(
-        r"(?:(?P<period>凌晨|早上|上午|中午|下午|晚上))?"
+        r"(?:(?P<period>凌晨|早上|上午|中午|下午|晚上|今晚))?"
         r"(?P<hour>\d{1,2}|[零一二两三四五六七八九十]{1,3})"
         r"(?:[:点时](?P<minute>\d{1,2})?分?)"
     )
@@ -195,7 +195,7 @@ def _find_times(text: str) -> tuple[str | None, str | None]:
             continue
         minute = int(match.group("minute") or 0)
         period = match.group("period") or ""
-        if period in {"下午", "晚上"} and hour < 12:
+        if period in {"下午", "晚上", "今晚"} and hour < 12:
             hour += 12
         if period == "中午" and hour < 11:
             hour += 12
@@ -222,9 +222,9 @@ def _extract_title(text: str, intent: IntentName) -> str | None:
         cleaned = candidate
         cleaned = re.sub(r"20\d{2}[年\-/]\d{1,2}[月\-/]\d{1,2}日?", "", cleaned)
         cleaned = re.sub(r"\d{1,2}月\d{1,2}[日号]", "", cleaned)
-        cleaned = re.sub(r"(?:今天|明天|后天)", "", cleaned)
+        cleaned = re.sub(r"(?:今天|今晚|明天|后天)", "", cleaned)
         cleaned = re.sub(
-            r"(?:凌晨|早上|上午|中午|下午|晚上)?(?:\d{1,2}|[零一二两三四五六七八九十]{1,3})(?:[:点时]\d{0,2}分?)",
+            r"(?:凌晨|早上|上午|中午|下午|晚上|今晚)?(?:\d{1,2}|[零一二两三四五六七八九十]{1,3})(?:[:点时]\d{0,2}分?)",
             "",
             cleaned,
         )
@@ -264,13 +264,13 @@ def _extract_target_title(text: str, intent: IntentName) -> str | None:
             maxsplit=1,
         )[0]
         candidate = re.split(
-            r"到(?:今天|明天|后天|20\d{2}[年\-/]|\d{1,2}月)", candidate, maxsplit=1
+            r"到(?:今天|今晚|明天|后天|20\d{2}[年\-/]|\d{1,2}月)", candidate, maxsplit=1
         )[0]
     candidate = re.sub(r"20\d{2}[年\-/]\d{1,2}[月\-/]\d{1,2}日?", "", candidate)
     candidate = re.sub(r"\d{1,2}月\d{1,2}[日号]", "", candidate)
-    candidate = re.sub(r"(?:今天|明天|后天)", "", candidate)
+    candidate = re.sub(r"(?:今天|今晚|明天|后天)", "", candidate)
     candidate = re.sub(
-        r"(?:凌晨|早上|上午|中午|下午|晚上)?"
+        r"(?:凌晨|早上|上午|中午|下午|晚上|今晚)?"
         r"(?:\d{1,2}|[零一二两三四五六七八九十]{1,3})(?:[:点时]\d{0,2}分?)",
         "",
         candidate,
@@ -495,12 +495,12 @@ def _enrich_deterministically(
     parsed_date = _find_date(text, now.date())
     start_time, end_time = _find_times(text)
     if result.intent in {IntentName.CREATE_EVENT, IntentName.UPDATE_EVENT}:
-        slots.date = slots.date or parsed_date
-        slots.start_time = slots.start_time or start_time
-        slots.end_time = slots.end_time or end_time
+        slots.date = parsed_date or slots.date
+        slots.start_time = start_time or slots.start_time
+        slots.end_time = end_time or slots.end_time
     elif result.intent in {IntentName.CREATE_TASK, IntentName.UPDATE_TASK}:
-        slots.due_date = slots.due_date or parsed_date
-        slots.due_time = slots.due_time or start_time
+        slots.due_date = parsed_date or slots.due_date
+        slots.due_time = start_time or slots.due_time
     return result.model_copy(update={"slots": slots})
 
 
@@ -523,6 +523,7 @@ class IntentParser:
         context: Sequence[str] = (),
         asr_confidence: float | None = None,
         now: datetime | None = None,
+        timezone_name: str | None = None,
     ) -> IntentResult:
         with observe_component(self._metrics, "intent", "parse"):
             return await self._parse(
@@ -530,6 +531,7 @@ class IntentParser:
                 context=context,
                 asr_confidence=asr_confidence,
                 now=now,
+                timezone_name=timezone_name,
             )
 
     async def _parse(
@@ -539,11 +541,18 @@ class IntentParser:
         context: Sequence[str] = (),
         asr_confidence: float | None = None,
         now: datetime | None = None,
+        timezone_name: str | None = None,
     ) -> IntentResult:
         cleaned = text.strip()
         if not cleaned:
             raise IntentParseError("empty_text", "请输入或转写一段文本后再解析。")
-        current = now or datetime.now(self._timezone)
+        timezone = ZoneInfo(timezone_name) if timezone_name is not None else self._timezone
+        if now is None:
+            current = datetime.now(timezone)
+        elif now.tzinfo is None:
+            current = now.replace(tzinfo=timezone)
+        else:
+            current = now.astimezone(timezone)
         if self._llm is None:
             fallback = _enrich_deterministically(
                 _fallback_parse(cleaned, current, context), cleaned, current
