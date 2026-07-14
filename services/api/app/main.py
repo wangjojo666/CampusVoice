@@ -6,7 +6,8 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import SecretStr
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.api.router import api_router
 from app.api.routes import asr, health
@@ -21,6 +22,56 @@ from app.security.authentication import build_authenticator
 from app.security.oidc import OidcClient
 from app.services.asr.connections import build_asr_quota_registry
 from app.services.errors import DomainError
+
+
+async def _initialize_demo_user(
+    session_factory: async_sessionmaker[AsyncSession], settings: Settings
+) -> None:
+    async with session_factory() as session, session.begin():
+        user = await session.get(User, settings.demo_user_id)
+        if user is None:
+            session.add(
+                User(
+                    id=settings.demo_user_id,
+                    display_name="CampusVoice Demo User",
+                )
+            )
+
+        user_settings = await session.get(UserSettings, settings.demo_user_id)
+        if user_settings is None:
+            session.add(
+                UserSettings(
+                    user_id=settings.demo_user_id,
+                    timezone=settings.timezone,
+                    asr_model_config={
+                        "provider": settings.asr_provider,
+                        "model": settings.asr_model,
+                        "device": settings.asr_device,
+                    },
+                )
+            )
+
+
+async def _demo_user_is_initialized(
+    session_factory: async_sessionmaker[AsyncSession], user_id: str
+) -> bool:
+    async with session_factory() as session:
+        user = await session.get(User, user_id)
+        user_settings = await session.get(UserSettings, user_id)
+    return user is not None and user_settings is not None
+
+
+async def _ensure_demo_user(
+    session_factory: async_sessionmaker[AsyncSession], settings: Settings
+) -> None:
+    try:
+        await _initialize_demo_user(session_factory, settings)
+    except IntegrityError:
+        # Another worker can commit the same bootstrap rows after this worker's
+        # existence check. Only accept the conflict when that full bootstrap
+        # transaction is now visible; unrelated integrity failures still surface.
+        if not await _demo_user_is_initialized(session_factory, settings.demo_user_id):
+            raise
 
 
 def create_app(
@@ -43,31 +94,12 @@ def create_app(
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         await application.state.asr_connections.start()
-        if should_initialize:
-            async with database_engine.begin() as connection:
-                await connection.run_sync(Base.metadata.create_all)
-        if settings.auth_mode == "demo":
-            async with session_factory() as session, session.begin():
-                user = await session.get(User, settings.demo_user_id)
-                if user is None:
-                    session.add(
-                        User(
-                            id=settings.demo_user_id,
-                            display_name="CampusVoice Demo User",
-                        )
-                    )
-                    session.add(
-                        UserSettings(
-                            user_id=settings.demo_user_id,
-                            timezone=settings.timezone,
-                            asr_model_config={
-                                "provider": settings.asr_provider,
-                                "model": settings.asr_model,
-                                "device": settings.asr_device,
-                            },
-                        )
-                    )
         try:
+            if should_initialize:
+                async with database_engine.begin() as connection:
+                    await connection.run_sync(Base.metadata.create_all)
+            if settings.auth_mode == "demo":
+                await _ensure_demo_user(session_factory, settings)
             yield
         finally:
             await application.state.asr_connections.close()

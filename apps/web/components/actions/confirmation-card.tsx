@@ -30,11 +30,35 @@ const fieldLabels: Record<string, string> = {
   end_at: "结束时间",
   location: "地点",
   reminder_minutes: "提前提醒",
+  source_type: "输入来源",
   target_id: "目标记录",
 };
 
-function renderValue(value: unknown) {
+const sourceLabels: Record<string, string> = {
+  manual: "文本演示",
+  voice: "语音转写",
+  document: "校园通知",
+  system: "系统生成",
+};
+
+const riskReasonLabels: Record<string, string> = {
+  modifies_data: "将写入或修改数据",
+  deletes_data: "将删除数据",
+  batch_operation: "将批量修改多条记录",
+  low_asr_confidence: "语音识别置信度较低",
+  missing_required_fields: "仍有必填字段缺失",
+  time_conflict: "检测到时间冲突",
+  duplicate_record: "检测到可能重复的记录",
+  overwrites_existing_data: "将覆盖已有数据",
+  hard_to_undo: "操作难以撤销",
+};
+
+function renderValue(value: unknown, key: string) {
   if (value === null || value === undefined || value === "") return "未设置";
+  if (key === "source_type" && typeof value === "string") return sourceLabels[value] ?? value;
+  if (typeof value === "string" && ["due_at", "reminder_at", "start_at", "end_at"].includes(key))
+    return formatDateTime(value);
+  if (key === "reminder_minutes" && typeof value === "number") return `${value} 分钟`;
   if (typeof value === "boolean") return value ? "是" : "否";
   if (Array.isArray(value)) return value.join("、");
   if (typeof value === "object") return JSON.stringify(value);
@@ -93,7 +117,7 @@ export function ConfirmationCard({
             <div key={key} className="border-b border-mist-100 pb-2.5">
               <dt className="text-xs font-bold text-ink-400">{fieldLabels[key] ?? key}</dt>
               <dd className="mt-1 break-words text-sm font-semibold text-ink-800">
-                {renderValue(value)}
+                {renderValue(value, key)}
               </dd>
             </div>
           ))}
@@ -106,7 +130,7 @@ export function ConfirmationCard({
               {action.risk_reasons.map((reason) => (
                 <li key={reason} className="flex items-start gap-2">
                   <span className="mt-2 size-1.5 shrink-0 rounded-full bg-ink-300" />
-                  {reason}
+                  {riskReasonLabels[reason] ?? reason}
                 </li>
               ))}
             </ul>

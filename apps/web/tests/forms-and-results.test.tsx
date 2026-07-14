@@ -268,7 +268,7 @@ describe("verification presentation", () => {
     const changed: CorrectionResult = {
       record_id: "cor-2",
       original_text: "计组",
-      corrected_text: "计算机组成原理",
+      corrected_text: "计组",
       changes: [
         {
           start: 0,
@@ -293,15 +293,25 @@ describe("verification presentation", () => {
     const onUndo = vi.fn();
     const success: VerificationResult = {
       success: true,
-      action: "create_task",
-      record_id: "task-1",
-      verified_fields: { title: true, due_at: false },
+      action: "create_event",
+      record_id: "event-1",
+      verified_fields: { title: true, start_at: true },
       side_effects: ["time_conflict"],
       message: "数据库记录已重新查询",
+      record: {
+        ...event,
+        title: "机器学习考试",
+        location: "教学楼 B205",
+        reminder_minutes: 1440,
+      },
     };
     const { rerender } = render(<ExecutionResult result={success} onUndo={onUndo} />);
     expect(screen.getByText("数据库验证成功")).toBeInTheDocument();
-    expect(screen.getByText("time_conflict")).toBeInTheDocument();
+    expect(screen.getByText("机器学习考试")).toBeInTheDocument();
+    expect(screen.getByText("教学楼 B205")).toBeInTheDocument();
+    expect(screen.getByText("提前 1440 分钟提醒")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "查看日历" })).toHaveAttribute("href", "/calendar");
+    expect(screen.getByText("新日程与已有安排存在时间冲突")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "撤销本次操作" }));
     expect(onUndo).toHaveBeenCalledOnce();
 

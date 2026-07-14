@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://campusvoice.local/schemas/public-asr-demo-inference.schema.json",
+  "title": "CampusVoice public speech simulated-noise ASR observation",
+  "description": "A prepared source row plus one fixed-model ASR observation. Runtime validation is authoritative.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "speech_dataset",
+    "speech_source",
+    "speech_dataset_version",
+    "speech_license",
+    "speech_usage_restrictions",
+    "clip_id",
+    "transcript",
+    "anonymous_speaker_id",
+    "split",
+    "speech_path",
+    "checksum",
+    "noise_source",
+    "noise_clip_id",
+    "noise_license",
+    "noise_license_verified",
+    "noise_license_verified_at",
+    "noise_attribution",
+    "noise_category",
+    "noise_path",
+    "snr_db",
+    "mix_seed",
+    "sample_id",
+    "mixed_audio_path",
+    "mixed_audio_checksum",
+    "actual_snr_db",
+    "sample_rate_hz",
+    "audio_duration_ms",
+    "mix_algorithm",
+    "system",
+    "model_name",
+    "model_version",
+    "device",
+    "inference_parameters",
+    "inference_status",
+    "hypothesis_text",
+    "latency_ms"
+  ],
+  "properties": {
+    "speech_dataset": { "type": "string", "minLength": 1 },
+    "speech_source": { "type": "string", "pattern": "^https://.+" },
+    "speech_dataset_version": { "type": "string", "minLength": 1 },
+    "speech_license": { "type": "string", "minLength": 1 },
+    "speech_usage_restrictions": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "clip_id": { "type": "string", "minLength": 1 },
+    "transcript": { "type": "string", "minLength": 1 },
+    "anonymous_speaker_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]{1,64}$"
+    },
+    "split": { "enum": ["tuning", "test"] },
+    "speech_path": { "type": "string", "minLength": 1 },
+    "checksum": { "type": "string", "pattern": "^(sha256:)?[0-9a-fA-F]{64}$" },
+    "noise_source": { "type": "string", "pattern": "^https://.+" },
+    "noise_clip_id": { "type": "string", "minLength": 1 },
+    "noise_license": { "enum": ["CC0-1.0", "CC-BY-4.0"] },
+    "noise_license_verified": { "const": true },
+    "noise_license_verified_at": { "type": "string", "format": "date" },
+    "noise_attribution": { "type": "string" },
+    "noise_category": { "enum": ["cafeteria", "corridor", "outdoor"] },
+    "noise_path": { "type": "string", "minLength": 1 },
+    "snr_db": { "enum": [20, 10, 5] },
+    "mix_seed": { "type": "integer", "minimum": 0 },
+    "sample_id": { "type": "string", "minLength": 1 },
+    "reference_text": { "type": "string", "minLength": 1 },
+    "mixed_audio_path": { "type": "string", "minLength": 1 },
+    "speech_audio_checksum": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "noise_audio_checksum": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "mixed_audio_checksum": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "actual_snr_db": { "type": "number" },
+    "sample_rate_hz": { "const": 16000 },
+    "audio_duration_ms": { "type": "number", "exclusiveMinimum": 0 },
+    "common_gain": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+    "mix_algorithm": { "type": "string", "minLength": 1 },
+    "system": { "type": "string", "minLength": 1 },
+    "model_name": { "type": "string", "minLength": 1 },
+    "model_version": { "type": "string", "minLength": 1 },
+    "device": { "type": "string", "minLength": 1 },
+    "inference_parameters": { "type": "object" },
+    "inference_status": { "enum": ["COMPLETED", "FAILED", "NOT_RUN"] },
+    "hypothesis_text": { "type": ["string", "null"] },
+    "latency_ms": { "type": ["number", "null"], "minimum": 0 },
+    "reference_keywords": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "reference_terms": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "inference_status": { "const": "COMPLETED" } },
+        "required": ["inference_status"]
+      },
+      "then": {
+        "properties": {
+          "hypothesis_text": { "type": "string" },
+          "latency_ms": { "type": "number", "minimum": 0 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "inference_status": { "const": "NOT_RUN" } },
+        "required": ["inference_status"]
+      },
+      "then": {
+        "properties": {
+          "hypothesis_text": { "const": null },
+          "latency_ms": { "const": null }
+        }
+      }
+    }
+  ]
+}

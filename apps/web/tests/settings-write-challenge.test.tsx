@@ -100,14 +100,17 @@ describe("SettingsPage write challenges", () => {
     expect(screen.queryByRole("button", { name: "删除热词机器学习" })).not.toBeInTheDocument();
   });
 
-  it("shows ASR deployment fields as read-only and excludes them from save payloads", async () => {
+  it("keeps ASR deployment state collapsed and excludes it from save payloads", async () => {
     render(<SettingsPage />);
     await waitFor(() => expect(mocks.getSettings).toHaveBeenCalledTimes(1));
 
-    expect(screen.getByRole("combobox", { name: "识别提供方" })).toBeDisabled();
-    expect(screen.getByLabelText("模型")).toHaveAttribute("readonly");
-    expect(screen.getByLabelText("运行设备")).toHaveAttribute("readonly");
-    expect(screen.getByText(/由服务器部署配置决定，仅供查看/)).toBeInTheDocument();
+    const technicalState = screen.getByText("技术状态").closest("details");
+    expect(technicalState).not.toHaveAttribute("open");
+    expect(screen.queryByRole("combobox", { name: "识别提供方" })).not.toBeInTheDocument();
+    expect(screen.getByText("这些设置会影响什么")).toBeInTheDocument();
+    expect(screen.getAllByText("funasr").length).toBeGreaterThan(0);
+    expect(screen.getByText("paraformer-zh-streaming")).toBeInTheDocument();
+    expect(screen.getByText("cpu")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
     await waitFor(() => expect(mocks.updateSettings).toHaveBeenCalledTimes(1));

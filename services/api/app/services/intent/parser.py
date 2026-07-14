@@ -169,19 +169,54 @@ _CHINESE_DIGITS = {
 }
 
 
-def _hour_number(value: str) -> int | None:
+def _chinese_number(value: str) -> int | None:
     if value.isdigit():
         return int(value)
-    if value == "十":
-        return 10
-    if value.startswith("十") and value[1:] in _CHINESE_DIGITS:
-        return 10 + _CHINESE_DIGITS[value[1:]]
-    if value.endswith("十") and value[:-1] in _CHINESE_DIGITS:
-        return _CHINESE_DIGITS[value[:-1]] * 10
-    return _CHINESE_DIGITS.get(value)
+    if value in _CHINESE_DIGITS:
+        return _CHINESE_DIGITS[value]
+    if "十" not in value:
+        return None
+    tens_text, ones_text = value.split("十", 1)
+    tens = 1 if not tens_text else _CHINESE_DIGITS.get(tens_text)
+    ones = 0 if not ones_text else _CHINESE_DIGITS.get(ones_text)
+    if tens is None or ones is None:
+        return None
+    return tens * 10 + ones
+
+
+def _hour_number(value: str) -> int | None:
+    return _chinese_number(value)
+
+
+_REMINDER_PATTERN = re.compile(
+    r"提前\s*(?:"
+    r"(?P<half>半)\s*(?:个)?\s*小时|"
+    r"(?P<amount>\d{1,4}|[零一二两三四五六七八九十]{1,3})\s*(?:个)?\s*"
+    r"(?P<unit>分钟|小时|天)"
+    r")\s*(?:提醒|通知)(?:我)?"
+)
+
+
+def _find_reminder_minutes(text: str) -> int | None:
+    match = _REMINDER_PATTERN.search(text)
+    if match is None:
+        return None
+    if match.group("half"):
+        return 30
+    amount = _chinese_number(match.group("amount"))
+    if amount is None:
+        return None
+    multiplier = {"分钟": 1, "小时": 60, "天": 1440}[match.group("unit")]
+    minutes = amount * multiplier
+    return minutes if 0 <= minutes <= 525_600 else None
+
+
+def _without_reminder_phrases(text: str) -> str:
+    return _REMINDER_PATTERN.sub("", text)
 
 
 def _find_times(text: str) -> tuple[str | None, str | None]:
+    text = _without_reminder_phrases(text)
     pattern = re.compile(
         r"(?:(?P<period>凌晨|早上|上午|中午|下午|晚上|今晚))?"
         r"(?P<hour>\d{1,2}|[零一二两三四五六七八九十]{1,3})"
@@ -219,7 +254,7 @@ def _extract_title(text: str, intent: IntentName) -> str | None:
         )
     )
     for candidate in candidates:
-        cleaned = candidate
+        cleaned = _without_reminder_phrases(candidate)
         cleaned = re.sub(r"20\d{2}[年\-/]\d{1,2}[月\-/]\d{1,2}日?", "", cleaned)
         cleaned = re.sub(r"\d{1,2}月\d{1,2}[日号]", "", cleaned)
         cleaned = re.sub(r"(?:今天|今晚|明天|后天)", "", cleaned)
@@ -286,7 +321,7 @@ def _new_title(text: str) -> str | None:
 
 
 def _classify_intent(text: str) -> IntentName:
-    normalized = re.sub(r"\s+", "", text)
+    normalized = _without_reminder_phrases(re.sub(r"\s+", "", text))
     create_signal = any(
         word in normalized for word in ("创建", "新建", "添加", "加到", "加入", "安排", "记一个")
     )
@@ -333,14 +368,14 @@ def _classify_intent(text: str) -> IntentName:
         return IntentName.DELETE_EVENT
     if delete_signal and task_signal:
         return IntentName.DELETE_TASK
-    if update_signal and event_signal:
-        return IntentName.UPDATE_EVENT
-    if update_signal and task_signal:
-        return IntentName.UPDATE_TASK
     if create_signal and event_signal:
         return IntentName.CREATE_EVENT
     if create_signal and task_signal:
         return IntentName.CREATE_TASK
+    if update_signal and event_signal:
+        return IntentName.UPDATE_EVENT
+    if update_signal and task_signal:
+        return IntentName.UPDATE_TASK
     if notice_signal and (query_signal or not (create_signal or update_signal or delete_signal)):
         return IntentName.SEARCH_NOTICE
     if event_signal and query_signal:
@@ -364,6 +399,7 @@ def _fallback_parse_single(text: str, now: datetime) -> IntentResult:
 
     parsed_date = _find_date(normalized, now.date())
     start_time, end_time = _find_times(normalized)
+    reminder_minutes = _find_reminder_minutes(normalized)
     if intent in {IntentName.CREATE_TASK, IntentName.CREATE_EVENT}:
         title = _extract_title(text, intent)
     elif intent in {
@@ -375,7 +411,11 @@ def _fallback_parse_single(text: str, now: datetime) -> IntentResult:
         title = _extract_target_title(text, intent)
     else:
         title = None
-    slots = IntentSlots(title=title, new_title=_new_title(text))
+    slots = IntentSlots(
+        title=title,
+        new_title=_new_title(text),
+        reminder_minutes=reminder_minutes,
+    )
     if intent in {IntentName.CREATE_EVENT, IntentName.UPDATE_EVENT}:
         slots.date = parsed_date
         slots.start_time = start_time
@@ -414,6 +454,7 @@ def _continue_from_context(
     normalized = re.sub(r"\s+", "", text)
     parsed_date = _find_date(normalized, now.date())
     start_time, end_time = _find_times(normalized)
+    reminder_minutes = _find_reminder_minutes(normalized)
     for previous_text in reversed(context):
         previous = _fallback_parse_single(previous_text, now)
         if previous.intent not in _MUTATING_INTENTS:
@@ -423,9 +464,15 @@ def _continue_from_context(
             slots.date = parsed_date or slots.date
             slots.start_time = start_time or slots.start_time
             slots.end_time = end_time or slots.end_time
+            slots.reminder_minutes = (
+                reminder_minutes if reminder_minutes is not None else slots.reminder_minutes
+            )
         elif previous.intent in {IntentName.CREATE_TASK, IntentName.UPDATE_TASK}:
             slots.due_date = parsed_date or slots.due_date
             slots.due_time = start_time or slots.due_time
+            slots.reminder_minutes = (
+                reminder_minutes if reminder_minutes is not None else slots.reminder_minutes
+            )
             if "未完成" in normalized:
                 slots.status = "pending"
             elif "完成" in normalized:
@@ -435,7 +482,7 @@ def _continue_from_context(
             IntentName.DELETE_TASK,
             IntentName.UPDATE_EVENT,
             IntentName.DELETE_EVENT,
-        } and not (parsed_date or start_time or end_time):
+        } and not (parsed_date or start_time or end_time or reminder_minutes is not None):
             slots.title = _extract_target_title(text, previous.intent) or slots.title
         return IntentResult(
             intent=previous.intent,
@@ -494,6 +541,11 @@ def _enrich_deterministically(
     slots = result.slots.model_copy(deep=True)
     parsed_date = _find_date(text, now.date())
     start_time, end_time = _find_times(text)
+    reminder_minutes = _find_reminder_minutes(text)
+    if slots.title:
+        slots.title = _without_reminder_phrases(slots.title).strip("，,。.!！?？ ：:") or None
+    if reminder_minutes is not None:
+        slots.reminder_minutes = reminder_minutes
     if result.intent in {IntentName.CREATE_EVENT, IntentName.UPDATE_EVENT}:
         slots.date = parsed_date or slots.date
         slots.start_time = start_time or slots.start_time

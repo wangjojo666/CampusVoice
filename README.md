@@ -1,12 +1,100 @@
 # CampusVoice 声程
 
-## v0.3 校园通知变化雷达
+> **语音是第一入口，可验证执行是核心价值。**
+
+CampusVoice 是面向大学生的可验证校园语音学习助手：说一句，系统实时转写校园术语、允许纠错，并理解为待办或日程；只有在你确认后才执行，写入结果可验证、可撤销。它不是通用 ASR 产品，也不会把模型输出冒充为执行成功。
+
+## 真实页面演示入口
+
+依赖启动后，打开以下真实运行页面：
+
+- [首页语音主入口](http://localhost:3000/)：录音状态、实时转写、置信度、延迟和示例指令。
+- [完整语音流程](http://localhost:3000/voice)：继续理解、风险检查、确认、执行与结果验证。
+
+演示主链路为：
+
+**转写 → 校园术语纠错 → 理解与风险检查 → 确认 → 执行 → 数据库复验 → 可撤销**
+
+如需 README 或答辩截图，必须从上述实际运行页面截取；可以使用合成业务数据，但不得使用 AI 生成的假界面代替产品截图。
+
+## 公开语音演示评测
+
+演示评测仅接受**通过许可闸门的公开真人语音＋可复现的模拟校园噪声**。这不等同于真实校园实地测试，也不是“真实学生授权录音测试”。当前仓库不提交公开数据集原始音频，CI 不下载大型数据集或模型；没有完成数据准备和真实推理时，状态必须是 `NOT_RUN`，不得生成或展示 CER、准确率、延迟等占位数字。
+
+当前准入结论：Mozilla Common Voice 中国大陆中文 26.0 可在遵守禁止识别说话人、禁止重新托管或分享数据等条件下用于本地评测；WenetSpeech 数据明确限非商业用途，且音频版权仍归原始来源，因此**默认不得用于项目宣传演示**。版本、官方依据和环境声逐条筛选规则见[公开音频许可闸门](docs/evaluation/public-audio-licensing.md)。
+
+## 五分钟启动（已安装依赖）
+
+首次安装、ASR 模型下载和 GPU 配置不计入五分钟；下面的快速路径用于启动真实 Web/API 页面和合成业务数据，不会下载模型或伪造语音结果。
+
+在 Windows PowerShell 中，从仓库根目录一键完成依赖检查、迁移、API 启动、幂等 seed、Web 启动与有限时健康检查：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start_demo.ps1
+```
+
+停止时只会读取本工作树记录的 PID，并核对命令行后停止对应进程树：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop_demo.ps1
+```
+
+脚本不会创建 `.env`、下载模型或终止其他 Node/Python 进程。一键启动始终使用 `development` 环境、本工作树内的本地 SQLite 演示库、`DATABASE_AUTO_CREATE=false`、API/Web 一致的 `demo` 认证、`disabled` ASR、本地 ASR 配额和 `localhost` 端点；调用终端中的同名环境变量不会改变这些默认值，脚本退出时会恢复原值。外部或自定义数据库不受一键脚本支持，请使用下方手工开发流程。若 Python 3.11 不在默认候选位置，可向启动脚本传入 `-PythonExecutable C:\path\to\python.exe`。
+
+以下手工流程保留用于开发调试：
+
+终端一：
+
+```powershell
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+conda activate campusvoice
+Set-Location services/api
+alembic upgrade head
+python -m uvicorn app.main:app --reload --port 8000
+```
+
+终端二：
+
+```powershell
+pnpm install --frozen-lockfile
+pnpm dev:web
+```
+
+API 就绪后，可在仓库根目录运行 `python scripts/seed_demo.py` 写入可重复的合成课程、待办、日程和通知。真实 ASR 需要按下文配置 FunASR；未配置时页面会显示真实错误，不回退到伪造转写。
+
+## 可复现的公开语音评测
+
+先准备本地 source manifest，再执行确定性校验与噪声混合；原始音频和生成结果必须留在 Git 忽略目录中：
+
+```powershell
+python scripts/prepare_public_asr_demo.py C:\path\to\public-asr-source.jsonl `
+  --output-dir data/evaluation/generated/public-asr-demo
+```
+
+完成真实 ASR 推理并填写 inference manifest 后，生成一致的 JSON 与 Markdown 报告：
+
+```powershell
+$testDate = Get-Date -Format yyyy-MM-dd
+python scripts/evaluate_public_asr_demo.py `
+  data/evaluation/generated/public-asr-demo/inference.jsonl `
+  --json-report data/evaluation/results/public-asr-demo.json `
+  --markdown-report data/evaluation/results/public-asr-demo.md `
+  --test-date $testDate
+```
+
+source/inference 字段、许可校验、speaker-disjoint 约束和 `NOT_RUN` 行为见 [`data/evaluation/manifests/README.md`](data/evaluation/manifests/README.md)。报告只有在实际推理记录存在时才包含指标。
+
+## 宣传边界
+
+有真实、可复核结果后，可以准确说明指定数据集版本、测试 split、样本量、噪声类别、SNR、模型与硬件，并报告对应指标。在此之前禁止使用“经真实校园环境验证”“真实学生授权录音测试”“所有方言表现领先”“复杂校园环境高准确率”“行业领先”或“自动监测校园通知”等表述。
+
+## 现有能力：v0.3 校园通知变化雷达
 
 声程现在可以把同一 `NoticeSeries` 中显式确认的 v1/v2 版本编译为带原文证据的结构化变化，按确定性规范化比较 claim，判断专业/年级/课程适用性，并只找出仍精确依赖旧 claim（或业务字段仍等于旧 claim 值）的待办和日程。用户手工改过的值不会因为仍指向旧文档而被覆盖；supporting claims 进入来源历史但不会替换 primary source claim。v1 适用而 v2 不再适用时会产生 `keep`、`cancel` 或 `manual_review` 建议，不会静默显示零影响。
 
 迁移预览按 change set 生成递增 generation，冻结整组 before/after、实体版本、来源与稳定排序的日历冲突。审核被拒绝会使 ready plan 失效并 dismiss 影响；重新通过审核后只能创建新 generation。普通更新一次确认；冲突覆盖和整组撤销使用两次分离交互、请求体绑定、一次性 write challenge，第一次只准备最终 challenge，第二次才写入。执行在数据库事务和状态锁内重新校验审核、适用性、实体版本、旧 claim 依赖与当前冲突；任一变化都使整组零写入。执行与撤销分别保存不可互相覆盖的回执，提交后使用全新数据库会话逐项复查；断线恢复先读取最新 plan，只有 `applied`/`undo_applied` 等已提交状态才用相同幂等键补做核验，`verified`/`undone` 只读回执，`ready` 必须重新确认。
 
-首页 `Campus Radar` 展示 new notice、version change、upcoming deadline 和 needs review 四类卡片；详情页依次展示 v1/v2 diff 与证据、Impact Canvas、真实日历时间线、确认面板、数据库核验详情和整组撤销。验证失败会显示实际数据库快照并允许继续核验，瞬时失败使用同一 plan 和 sessionStorage 中的稳定幂等键重试。通知页还可创建或选择 series、查看时间线、显式导入 v1/v2、选择 predecessor，并在后继关系有歧义时要求确认。合成演示运行 `python scripts/seed_demo.py`，会建立“2026 人工智能专业考试安排”v1（09:00–11:00 / A302）和 v2（14:00–16:00 / B205）、一个考试日程、两个复习待办、一条“携带校园卡”任务提醒及来源链。任务提醒绑定 v1 的材料证据，截止与提醒时间会随考试时间迁移；重复运行不会创建重复版本或安排。
+首页 `Campus Radar` 展示 new notice、version change、upcoming deadline 和 needs review 四类卡片；详情页依次展示 v1/v2 diff 与证据、Impact Canvas、真实日历时间线、确认面板、数据库核验详情和整组撤销。验证失败会显示实际数据库快照并允许继续核验，瞬时失败使用同一 plan 和 sessionStorage 中的稳定幂等键重试。通知页还可创建或选择 series、查看时间线、显式导入 v1/v2、选择 predecessor，并在后继关系有歧义时要求确认。合成演示运行 `python scripts/seed_demo.py`，会建立“2026 机器学习考试安排”v1（09:00–11:00 / A302）和 v2（14:00–16:00 / B205）、一个考试日程、两个复习待办、一条“携带校园卡”任务提醒及来源链。任务提醒绑定 v1 的材料证据，截止与提醒时间会随考试时间迁移；重复运行不会创建重复版本或安排。
 
 设计与安全语义见 [`ADR 0007`](docs/decisions/0007-notice-evidence-impact-migrations.md)，API 与表结构见 [`services/api/docs/api-contract.md`](services/api/docs/api-contract.md) 和 [`services/api/docs/data-model.md`](services/api/docs/data-model.md)。
 
@@ -38,7 +126,7 @@
 - 可选：支持 CUDA 的 NVIDIA GPU。本机验证组合为 PyTorch/Torchaudio 2.11.0 + CUDA 13.0。
 - Docker 部署需要 Docker Desktop/Engine 和 Compose；Windows 家庭版使用 WSL 2 Linux 容器。
 
-所有示例资料均为合成数据。项目不连接真实教务系统，也不应存储真实学生隐私数据。
+仓库内置的业务数据与清单示例均为合成数据。可选的公开语音评测只在本地读取另行取得、通过许可闸门的音频，不随仓库分发。项目不连接真实教务系统，也不应存储真实学生隐私数据。
 
 ## 原生本地启动
 
@@ -245,7 +333,7 @@ python scripts/evaluate_intent.py data/evaluation/manifests/intent.jsonl --outpu
 python scripts/evaluate_reliability.py data/evaluation/manifests/reliability.jsonl --output data/evaluation/results/reliability.json
 ```
 
-仓库还提供 `data/evaluation/manifests/examples` 下的合成小样例，用于验证命令与指标管线；它们不是正式实验结果，也不能替代目标为 150 至 200 条授权语音的评测集。
+仓库还提供 `data/evaluation/manifests/examples` 下的合成小样例，用于验证命令与指标管线；它们不是正式实验结果，也不能替代通过许可闸门的公开真人语音或另行明确授权语音评测集。
 
 一条命令可重复生成默认 160 条 WAV、源清单、四路 ASR 待推理模板和数据卡：
 

@@ -22,10 +22,12 @@ const mocks = vi.hoisted(() => ({
   listTasks: vi.fn(),
   listEvents: vi.fn(),
   listActionLogs: vi.fn(),
+  listRadar: vi.fn(),
   listDocuments: vi.fn(),
   uploadDocument: vi.fn(),
   askKnowledge: vi.fn(),
   searchKnowledge: vi.fn(),
+  undoAction: vi.fn(),
 }));
 
 vi.mock("next/link", () => ({
@@ -69,6 +71,8 @@ vi.mock("@/lib/api-client", () => ({
     tasks: { list: mocks.listTasks },
     events: { list: mocks.listEvents },
     actionLogs: { list: mocks.listActionLogs },
+    actions: { undo: mocks.undoAction },
+    radar: { list: mocks.listRadar },
     documents: { list: mocks.listDocuments, upload: mocks.uploadDocument },
     knowledge: { ask: mocks.askKnowledge, search: mocks.searchKnowledge },
   },
@@ -176,14 +180,141 @@ beforeEach(() => {
   mocks.listTasks.mockReset().mockResolvedValue({ items: [], total: 0 });
   mocks.listEvents.mockReset().mockResolvedValue({ items: [], total: 0 });
   mocks.listActionLogs.mockReset().mockResolvedValue({ items: [], total: 0 });
+  mocks.listRadar.mockReset().mockResolvedValue({ items: [], total: 0 });
   mocks.listDocuments.mockReset().mockResolvedValue({ items: [], total: 0 });
   mocks.uploadDocument.mockReset().mockResolvedValue(uploadedDocument);
   mocks.askKnowledge.mockReset();
   mocks.searchKnowledge.mockReset();
+  mocks.undoAction.mockReset();
 });
 
 describe("dashboard business states", () => {
-  it("shows only today's actionable work, verified totals, and the voice continuation", async () => {
+  it("places the voice-first entry before Campus Radar and fills examples into the shared workflow", async () => {
+    const user = userEvent.setup();
+
+    render(<HomePage />);
+
+    expect(screen.getByRole("heading", { name: "说一句，校园安排自动落地" })).toBeInTheDocument();
+    const voiceEntry = screen.getByRole("region", { name: "直接说出任务、日程或校园问题" });
+    const campusRadar = screen.getByRole("region", { name: "与我有关的通知变化" });
+    expect(
+      voiceEntry.compareDocumentPosition(campusRadar) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
+
+    await user.click(
+      screen.getByRole("button", {
+        name: "新建待办：后天下午三点提交人工智能作业，提前一天提醒我。",
+      }),
+    );
+    expect(useAssistantStore.getState().transcript).toBe(
+      "新建待办：后天下午三点提交人工智能作业，提前一天提醒我。",
+    );
+    expect(useAssistantStore.getState().inputMode).toBe("text_demo");
+    expect(screen.getByText("文本指令演示，不是语音识别结果")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "进入完整确认流程" })).toHaveAttribute(
+      "href",
+      "/voice",
+    );
+  });
+
+  it("clears stale workflow state when a new Home command starts", async () => {
+    const user = userEvent.setup();
+    const store = useAssistantStore.getState();
+    store.setCorrection({
+      record_id: "correction-old",
+      original_text: "旧指令",
+      corrected_text: "旧指令",
+      changes: [],
+    });
+    store.setIntent({
+      intent: "create_task",
+      confidence: 0.9,
+      slots: { title: "旧待办" },
+      missing_fields: [],
+      ambiguities: [],
+      source_text: "旧指令",
+      requires_confirmation: true,
+    });
+    store.setExecution({
+      success: true,
+      action: "create_task",
+      record_id: "task-old",
+      verified_fields: { title: true },
+      side_effects: [],
+      message: "旧记录已验证",
+    });
+    store.setLastExecutedActionId("action-old");
+
+    render(<HomePage />);
+    await user.click(
+      screen.getByRole("button", {
+        name: "新建待办：后天下午三点提交人工智能作业，提前一天提醒我。",
+      }),
+    );
+
+    expect(useAssistantStore.getState()).toMatchObject({
+      transcript: "新建待办：后天下午三点提交人工智能作业，提前一天提醒我。",
+      inputMode: "text_demo",
+      correction: null,
+      intent: null,
+      execution: null,
+      lastExecutedActionId: null,
+    });
+    expect(screen.queryByText("旧记录已验证")).not.toBeInTheDocument();
+  });
+
+  it("shows the verified Home record and binds undo to its executed action", async () => {
+    const user = userEvent.setup();
+    mocks.undoAction.mockResolvedValue({
+      success: true,
+      action: "undo_create_event",
+      record_id: "event-verified",
+      verified_fields: { deleted: true },
+      side_effects: [],
+      message: "日程已撤销并复验",
+    });
+    const store = useAssistantStore.getState();
+    store.setTranscript("创建机器学习考试日程");
+    store.setIntent({
+      intent: "create_event",
+      confidence: 0.98,
+      slots: { title: "机器学习考试" },
+      missing_fields: [],
+      ambiguities: [],
+      source_text: "创建机器学习考试日程",
+      requires_confirmation: true,
+    });
+    store.setExecution({
+      success: true,
+      action: "create_event",
+      record_id: "event-verified",
+      verified_fields: { title: true, start_at: true },
+      side_effects: [],
+      message: "日程已写入并复验",
+      record: event({
+        id: "event-verified",
+        title: "机器学习考试",
+        location: "教学楼 B205",
+        reminder_minutes: 1440,
+      }),
+    });
+    store.setLastExecutedActionId("action-verified");
+
+    render(<HomePage />);
+
+    expect(screen.getByText("已确认并完成数据库写入")).toBeInTheDocument();
+    expect(screen.getByText("字段完整；无新增风险")).toBeInTheDocument();
+    expect(screen.getByText("机器学习考试")).toBeInTheDocument();
+    expect(screen.getByText("教学楼 B205")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "查看日历" })).toHaveAttribute("href", "/calendar");
+
+    await user.click(screen.getByRole("button", { name: "撤销本次操作" }));
+    expect(mocks.undoAction).toHaveBeenCalledWith("action-verified");
+    expect(await screen.findByText("日程已撤销并复验")).toBeInTheDocument();
+    expect(useAssistantStore.getState().lastExecutedActionId).toBeNull();
+  });
+
+  it("shows upcoming seeded work, verified totals, and the voice continuation", async () => {
     const user = userEvent.setup();
     mocks.listTasks.mockResolvedValue({
       items: [
@@ -215,17 +346,21 @@ describe("dashboard business states", () => {
     expect(screen.getByText("整理课程笔记")).toBeInTheDocument();
     expect(screen.getByText("算法答疑")).toBeInTheDocument();
     expect(screen.queryByText("已完成报告")).not.toBeInTheDocument();
-    expect(screen.queryByText("下周任务")).not.toBeInTheDocument();
-    expect(screen.queryByText("明天班会")).not.toBeInTheDocument();
-    expect(screen.getByText("今日待处理").previousElementSibling).toHaveTextContent("2");
-    expect(screen.getByText("今日日程").previousElementSibling).toHaveTextContent("1");
+    expect(screen.getByText("下周任务")).toBeInTheDocument();
+    expect(screen.getByText("明天班会")).toBeInTheDocument();
+    expect(screen.getByText("待处理事项").previousElementSibling).toHaveTextContent("3");
+    expect(screen.getByText("日程记录").previousElementSibling).toHaveTextContent("2");
     expect(screen.getByText("最近验证成功").previousElementSibling).toHaveTextContent("1");
     expect(screen.getByText("待办写入后已重新查询验证")).toBeInTheDocument();
     expect(screen.getByText("日程验证失败")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "模拟语音识别" }));
     expect(useAssistantStore.getState().transcript).toBe("明天完成数据库作业");
-    expect(screen.getByRole("link", { name: "继续理解并检查" })).toHaveAttribute("href", "/voice");
+    expect(useAssistantStore.getState().inputMode).toBe("voice");
+    expect(screen.getByRole("link", { name: "进入完整确认流程" })).toHaveAttribute(
+      "href",
+      "/voice",
+    );
   });
 
   it("keeps successful sections usable after a partial load error and retries all data", async () => {
@@ -238,7 +373,7 @@ describe("dashboard business states", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("服务暂时不可用，请稍后重试。");
-    expect(screen.getByText("今天还没有安排")).toBeInTheDocument();
+    expect(screen.getByText("还没有近期安排")).toBeInTheDocument();
     expect(screen.getByText("还没有操作记录")).toBeInTheDocument();
 
     await user.click(within(alert).getByRole("button", { name: "重试" }));

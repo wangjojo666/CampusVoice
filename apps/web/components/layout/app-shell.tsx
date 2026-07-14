@@ -8,7 +8,6 @@ import {
   ListTodo,
   LogOut,
   Mic2,
-  Settings2,
   Waves,
 } from "lucide-react";
 import Link from "next/link";
@@ -28,7 +27,6 @@ const navigation = [
   { href: "/tasks", label: "待办", icon: ListTodo },
   { href: "/calendar", label: "日历", icon: CalendarDays },
   { href: "/notices", label: "校园通知", icon: FileText },
-  { href: "/settings", label: "热词与设置", icon: Settings2 },
 ] as const;
 
 function isActive(pathname: string, href: string) {
@@ -230,7 +228,7 @@ export function AppShell({
 
       <nav
         aria-label="移动端主导航"
-        className="fixed inset-x-3 bottom-3 z-40 grid grid-cols-6 rounded-2xl border border-mist-200 bg-white/94 p-1.5 shadow-[0_16px_45px_rgba(18,27,34,.18)] backdrop-blur-xl lg:hidden"
+        className="fixed inset-x-3 bottom-3 z-40 grid grid-cols-5 rounded-2xl border border-mist-200 bg-white/94 p-1.5 shadow-[0_16px_45px_rgba(18,27,34,.18)] backdrop-blur-xl lg:hidden"
       >
         {navigation.map(({ href, label, icon: Icon }) => {
           const active = isActive(pathname, href);

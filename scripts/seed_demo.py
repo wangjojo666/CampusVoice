@@ -11,12 +11,33 @@ import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE_DOCUMENTS = ROOT / "data" / "sample-documents"
+DEMO_SETTINGS_UPDATE: dict[str, Any] = {
+    "major": "人工智能",
+    "grade": "2024 级",
+    "current_courses": [
+        {"code": "AI2401", "name": "机器学习", "teacher": "林知远"},
+        {"code": "AI2402", "name": "自然语言处理", "teacher": "周明澜"},
+    ],
+    "teacher_names": ["林知远", "周明澜"],
+    "default_reminder_minutes": 1440,
+    "timezone": "Asia/Shanghai",
+}
 
 
 def checked(response: httpx.Response, *, duplicate_ok: bool = True) -> dict[str, Any]:
     if duplicate_ok and response.status_code == 409:
         return {"status": "already_exists", "detail": response.json()}
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        try:
+            response_body = response.json()
+        except ValueError:
+            response_body = response.text
+        raise RuntimeError(
+            f"{response.request.method} {response.request.url} returned "
+            f"{response.status_code}; response body: {response_body!r}"
+        ) from exc
     payload = response.json()
     return payload if isinstance(payload, dict) else {"items": payload}
 
@@ -55,7 +76,7 @@ def seed_notice_radar(client: httpx.Client) -> dict[str, Any]:
     )
     series_rows = checked(client.get("/api/notice-radar/series"), duplicate_ok=False)["items"]
     series = next(
-        (item for item in series_rows if item["canonical_key"] == "ai-exam-2026"),
+        (item for item in series_rows if item["canonical_key"] == "machine-learning-exam-2026"),
         None,
     )
     if series is None:
@@ -65,8 +86,8 @@ def seed_notice_radar(client: httpx.Client) -> dict[str, Any]:
                 "POST",
                 "/api/notice-radar/series",
                 json={
-                    "canonical_key": "ai-exam-2026",
-                    "title": "2026 人工智能专业考试安排",
+                    "canonical_key": "machine-learning-exam-2026",
+                    "title": "2026 机器学习考试安排",
                     "department": "计算机学院教务办公室",
                     "source_key": "synthetic-demo/ai-exam",
                 },
@@ -80,10 +101,10 @@ def seed_notice_radar(client: httpx.Client) -> dict[str, Any]:
             "POST",
             f"/api/notice-radar/series/{series['id']}/versions",
             json={
-                "title": "2026 人工智能专业考试安排",
+                "title": "2026 机器学习考试安排",
                 "content": (
                     "适用于 2024 级人工智能专业。\n"
-                    "考试时间：2026-07-18 09:00–11:00。\n"
+                    "机器学习考试时间：2026-07-18 09:00–11:00。\n"
                     "地点：教学楼 A302。\n"
                     "要求携带校园卡。提前 1440 分钟提醒。"
                 ),
@@ -115,7 +136,8 @@ def seed_notice_radar(client: httpx.Client) -> dict[str, Any]:
             "/api/events",
             headers={"Idempotency-Key": "radar-ai-exam-event-v1"},
             json={
-                "title": "人工智能专业考试",
+                "title": "机器学习考试",
+                "course": "机器学习",
                 "start_at": "2026-07-18T09:00:00+08:00",
                 "end_at": "2026-07-18T11:00:00+08:00",
                 "location": "教学楼 A302",
@@ -127,8 +149,8 @@ def seed_notice_radar(client: httpx.Client) -> dict[str, Any]:
     task_results = []
     for index, (title, due_at) in enumerate(
         (
-            ("完成考试知识点复习", "2026-07-17T20:00:00+08:00"),
-            ("完成模拟题复盘", "2026-07-18T08:00:00+08:00"),
+            ("复习机器学习考试知识点", "2026-07-17T20:00:00+08:00"),
+            ("完成机器学习模拟题复盘", "2026-07-18T08:00:00+08:00"),
         ),
         start=1,
     ):
@@ -144,6 +166,7 @@ def seed_notice_radar(client: httpx.Client) -> dict[str, Any]:
                         "due_at": due_at,
                         "reminder_at": "2026-07-17T08:00:00+08:00",
                         "priority": "high",
+                        "course": "机器学习",
                         **lineage,
                     },
                 )
@@ -157,7 +180,7 @@ def seed_notice_radar(client: httpx.Client) -> dict[str, Any]:
             "/api/tasks",
             headers={"Idempotency-Key": "radar-ai-exam-campus-card-v1"},
             json={
-                "title": "携带校园卡参加人工智能专业考试",
+                "title": "携带校园卡参加机器学习考试",
                 "description": "考试材料提醒：请在入场时携带校园卡。",
                 "due_at": "2026-07-18T09:00:00+08:00",
                 "reminder_at": "2026-07-18T08:00:00+08:00",
@@ -176,10 +199,10 @@ def seed_notice_radar(client: httpx.Client) -> dict[str, Any]:
             "POST",
             f"/api/notice-radar/series/{series['id']}/versions",
             json={
-                "title": "2026 人工智能专业考试安排",
+                "title": "2026 机器学习考试安排",
                 "content": (
                     "适用于 2024 级人工智能专业同学。\n"
-                    "考试时间：2026-07-18 14:00–16:00。\n"
+                    "机器学习考试时间：2026-07-18 14:00–16:00。\n"
                     "地点改为：教学楼 B205。\n"
                     "请按时参加，要求携带校园卡。提前 1440 分钟提醒。"
                 ),
@@ -207,8 +230,8 @@ def seed_notice_radar(client: httpx.Client) -> dict[str, Any]:
     }
 
 
-def seed(base_url: str) -> None:
-    with httpx.Client(base_url=base_url.rstrip("/"), timeout=90) as client:
+def seed(base_url: str, request_timeout_seconds: float = 10.0) -> None:
+    with httpx.Client(base_url=base_url.rstrip("/"), timeout=request_timeout_seconds) as client:
         checked(client.get("/api/health"), duplicate_ok=False)
 
         settings = checked(
@@ -216,28 +239,7 @@ def seed(base_url: str) -> None:
                 client,
                 "PATCH",
                 "/api/settings",
-                json={
-                    "major": "人工智能",
-                    "grade": "2024 级",
-                    "current_courses": [
-                        {
-                            "code": "AI2401",
-                            "name": "机器学习",
-                            "teacher": "林知远",
-                        },
-                        {
-                            "code": "AI2402",
-                            "name": "自然语言处理",
-                            "teacher": "周明澜",
-                        },
-                    ],
-                    "teacher_names": ["林知远", "周明澜"],
-                    "default_reminder_minutes": 1440,
-                    "timezone": "Asia/Shanghai",
-                    "asr_provider": "funasr",
-                    "asr_model": "paraformer-zh-streaming",
-                    "asr_device": "cuda:0",
-                },
+                json=DEMO_SETTINGS_UPDATE,
             ),
             duplicate_ok=False,
         )
@@ -254,24 +256,6 @@ def seed(base_url: str) -> None:
                     "due_at": "2026-07-20T15:59:00Z",
                     "reminder_at": "2026-07-19T15:59:00Z",
                     "priority": "high",
-                    "source_type": "manual",
-                },
-            )
-        )
-
-        event = checked(
-            confirmed_write(
-                client,
-                "POST",
-                "/api/events",
-                headers={"Idempotency-Key": "demo-event-machine-learning-exam-v1"},
-                json={
-                    "title": "机器学习期末考试",
-                    "course": "机器学习",
-                    "start_at": "2026-07-18T01:00:00Z",
-                    "end_at": "2026-07-18T03:00:00Z",
-                    "location": "教学楼A302",
-                    "reminder_minutes": 1440,
                     "source_type": "manual",
                 },
             )
@@ -336,7 +320,7 @@ def seed(base_url: str) -> None:
         {
             "settings": bool(settings),
             "task": task.get("record_id", task.get("status")),
-            "event": event.get("record_id", event.get("status")),
+            "event": radar["event"],
             "hotwords": len(hotword_results),
             "documents": len(document_results),
             "notice_radar": radar,
@@ -346,9 +330,10 @@ def seed(base_url: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base-url", default="http://127.0.0.1:8000")
+    parser.add_argument("--base-url", default="http://localhost:8000")
+    parser.add_argument("--request-timeout-seconds", type=float, default=10.0)
     args = parser.parse_args()
-    seed(args.base_url)
+    seed(args.base_url, args.request_timeout_seconds)
 
 
 if __name__ == "__main__":

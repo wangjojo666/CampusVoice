@@ -1,5 +1,25 @@
 import type { VerificationResult } from "@campusvoice/shared-types";
-import { AlertCircle, CheckCircle2, Database, RotateCcw, XCircle } from "lucide-react";
+import {
+  AlertCircle,
+  BellRing,
+  CalendarDays,
+  CheckCircle2,
+  Clock3,
+  Database,
+  ListTodo,
+  MapPin,
+  RotateCcw,
+  XCircle,
+} from "lucide-react";
+import Link from "next/link";
+
+import { formatDateTime } from "@/lib/format";
+
+const sideEffectLabels: Record<string, string> = {
+  duplicate_task_created: "创建后检测到重复待办",
+  duplicate_event_created: "创建后检测到重复日程",
+  time_conflict: "新日程与已有安排存在时间冲突",
+};
 
 export function ExecutionResult({
   result,
@@ -10,6 +30,10 @@ export function ExecutionResult({
   onRetry?: () => void;
   onUndo?: () => void;
 }>) {
+  const record = result.record ?? null;
+  const eventRecord = record && "start_at" in record ? record : null;
+  const taskRecord = record && "due_at" in record ? record : null;
+
   return (
     <section
       aria-live="polite"
@@ -32,6 +56,42 @@ export function ExecutionResult({
       </div>
 
       <div className="p-5">
+        {result.success && record ? (
+          <div className="mb-4 rounded-2xl border border-teal-100 bg-teal-50/45 p-4">
+            <p className="text-base font-extrabold text-ink-900">{record.title}</p>
+            <div className="mt-3 grid gap-2 text-xs text-ink-600 sm:grid-cols-2">
+              <p className="flex items-start gap-2">
+                <Clock3 className="mt-0.5 shrink-0 text-teal-600" size={14} />
+                {eventRecord
+                  ? `${formatDateTime(eventRecord.start_at)} 至 ${formatDateTime(eventRecord.end_at)}`
+                  : taskRecord?.due_at
+                    ? `截止 ${formatDateTime(taskRecord.due_at)}`
+                    : "未设置截止时间"}
+              </p>
+              {eventRecord?.location ? (
+                <p className="flex items-start gap-2">
+                  <MapPin className="mt-0.5 shrink-0 text-teal-600" size={14} />
+                  {eventRecord.location}
+                </p>
+              ) : null}
+              <p className="flex items-start gap-2">
+                <BellRing className="mt-0.5 shrink-0 text-teal-600" size={14} />
+                {eventRecord
+                  ? eventRecord.reminder_minutes === null ||
+                    eventRecord.reminder_minutes === undefined
+                    ? "未设置提醒"
+                    : `提前 ${eventRecord.reminder_minutes} 分钟提醒`
+                  : taskRecord?.reminder_at
+                    ? formatDateTime(taskRecord.reminder_at)
+                    : "未设置提醒"}
+              </p>
+            </div>
+            <Link href={eventRecord ? "/calendar" : "/tasks"} className="mt-3 btn-secondary">
+              {eventRecord ? <CalendarDays size={15} /> : <ListTodo size={15} />}
+              {eventRecord ? "查看日历" : "查看待办"}
+            </Link>
+          </div>
+        ) : null}
         {result.record_id ? (
           <p className="mb-4 flex items-center gap-2 text-sm text-ink-500">
             <Database size={16} /> 记录 ID：
@@ -59,7 +119,7 @@ export function ExecutionResult({
             <p className="font-bold">检测到附带影响</p>
             <ul className="mt-1 list-inside list-disc space-y-1">
               {result.side_effects.map((effect) => (
-                <li key={effect}>{effect}</li>
+                <li key={effect}>{sideEffectLabels[effect] ?? effect}</li>
               ))}
             </ul>
           </div>

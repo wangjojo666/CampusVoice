@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://campusvoice.local/schemas/public-asr-demo-source.schema.json",
+  "title": "CampusVoice public speech and simulated noise source recipe",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "speech_dataset",
+    "speech_source",
+    "speech_dataset_version",
+    "speech_license",
+    "speech_usage_restrictions",
+    "clip_id",
+    "transcript",
+    "anonymous_speaker_id",
+    "split",
+    "speech_path",
+    "checksum",
+    "noise_source",
+    "noise_clip_id",
+    "noise_license",
+    "noise_license_verified",
+    "noise_license_verified_at",
+    "noise_attribution",
+    "noise_category",
+    "noise_path",
+    "snr_db",
+    "mix_seed"
+  ],
+  "properties": {
+    "speech_dataset": {
+      "const": "Common Voice Scripted Speech 26.0 - Chinese (China)"
+    },
+    "speech_source": {
+      "const": "https://mozilladatacollective.com/datasets/cmqim47x700tunq074za20dq1"
+    },
+    "speech_dataset_version": {
+      "const": "cv-corpus-26.0-2026-06-12"
+    },
+    "speech_license": {
+      "const": "CC0-1.0"
+    },
+    "speech_usage_restrictions": {
+      "type": "array",
+      "uniqueItems": true,
+      "allOf": [
+        { "contains": { "const": "no_speaker_identification" } },
+        { "contains": { "const": "no_rehosting" } },
+        { "contains": { "const": "no_resharing" } }
+      ],
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "clip_id": { "type": "string", "minLength": 1 },
+    "transcript": { "type": "string", "minLength": 1 },
+    "anonymous_speaker_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]{1,64}$"
+    },
+    "split": { "enum": ["tuning", "test"] },
+    "speech_path": { "type": "string", "minLength": 1 },
+    "checksum": {
+      "type": "string",
+      "pattern": "^(sha256:)?[0-9a-fA-F]{64}$"
+    },
+    "noise_source": {
+      "type": "string",
+      "pattern": "^https://.+"
+    },
+    "noise_clip_id": { "type": "string", "minLength": 1 },
+    "noise_license": { "enum": ["CC0-1.0", "CC-BY-4.0"] },
+    "noise_license_verified": { "const": true },
+    "noise_license_verified_at": {
+      "type": "string",
+      "format": "date"
+    },
+    "noise_attribution": { "type": "string" },
+    "noise_category": { "enum": ["cafeteria", "corridor", "outdoor"] },
+    "noise_path": { "type": "string", "minLength": 1 },
+    "snr_db": { "enum": [20, 10, 5] },
+    "mix_seed": { "type": "integer", "minimum": 0 }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "noise_license": { "const": "CC-BY-4.0" } },
+        "required": ["noise_license"]
+      },
+      "then": {
+        "properties": { "noise_attribution": { "minLength": 1 } }
+      }
+    }
+  ]
+}

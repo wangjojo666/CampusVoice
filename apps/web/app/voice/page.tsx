@@ -7,7 +7,16 @@ import type {
   IntentResult,
   PendingAction,
 } from "@campusvoice/shared-types";
-import { ArrowRight, BrainCircuit, RotateCcw, ShieldCheck, Sparkles } from "lucide-react";
+import {
+  ArrowRight,
+  BrainCircuit,
+  Keyboard,
+  RotateCcw,
+  Settings2,
+  ShieldCheck,
+  Sparkles,
+} from "lucide-react";
+import Link from "next/link";
 import { useCallback, useState } from "react";
 
 import { ConfirmationCard } from "@/components/actions/confirmation-card";
@@ -79,6 +88,7 @@ export default function VoicePage() {
       try {
         const result = await api.actions.execute(action.id);
         store.setExecution(result);
+        store.setLastExecutedActionId(result.success ? action.id : null);
         store.setPendingAction(result.success ? null : action);
         store.setWorkflowStatus(result.success ? "succeeded" : "error");
         if (result.success) store.setSourceDocumentId(null);
@@ -131,7 +141,12 @@ export default function VoicePage() {
         store.setError("当前意图不能作为可靠操作执行。");
         return;
       }
-      const normalized = actionRequestFrom(intent, store.sourceDocumentId, userSettings);
+      const normalized = actionRequestFrom(
+        intent,
+        store.sourceDocumentId,
+        userSettings,
+        store.inputMode === "text_demo" ? "manual" : "voice",
+      );
       store.setWorkflowStatus("preparing");
       try {
         const action = await api.actions.prepare({
@@ -284,7 +299,7 @@ export default function VoicePage() {
   };
 
   const undo = async () => {
-    const actionId = store.pendingAction?.id;
+    const actionId = store.lastExecutedActionId ?? store.pendingAction?.id;
     if (!actionId) {
       try {
         const logs = await api.actionLogs.list(10);
@@ -297,6 +312,7 @@ export default function VoicePage() {
         }
         const result = await api.actions.undo(latest.action_id ?? latest.id);
         store.setExecution(result);
+        if (result.success) store.setLastExecutedActionId(null);
       } catch (reason) {
         store.setError(reason instanceof ApiError ? reason.userMessage : "撤销失败，请重试。");
       }
@@ -304,6 +320,7 @@ export default function VoicePage() {
     }
     const result = await api.actions.undo(actionId);
     store.setExecution(result);
+    if (result.success) store.setLastExecutedActionId(null);
   };
 
   const clarificationQuestion =
@@ -325,26 +342,31 @@ export default function VoicePage() {
   return (
     <div>
       <PageHeader
-        eyebrow="Voice workflow"
-        title="语音助手"
-        description="从实时转写到数据库验证，每一步都可见、可确认。涉及写入的数据不会只凭 AI 回答就宣告成功。"
+        eyebrow="校园语音识别"
+        title="说出安排，确认后再执行"
+        description="实时识别校园术语并保留可编辑转写，再依次完成理解、风险检查、确认与数据库验证；涉及写入的数据不会只凭 AI 回答就宣告成功。"
         actions={
-          store.transcript ? (
-            <button
-              type="button"
-              onClick={() => {
-                store.reset();
-                setConversationId(null);
-                setScheduleResults(null);
-                setVoiceSessionId(null);
-                setTranscriptionId(null);
-                setOriginalTranscript("");
-              }}
-              className="btn-secondary"
-            >
-              <RotateCcw size={16} /> 新指令
-            </button>
-          ) : undefined
+          <div className="flex flex-wrap gap-2">
+            <Link href="/settings" className="btn-secondary">
+              <Settings2 size={16} /> 识别增强
+            </Link>
+            {store.transcript ? (
+              <button
+                type="button"
+                onClick={() => {
+                  store.reset();
+                  setConversationId(null);
+                  setScheduleResults(null);
+                  setVoiceSessionId(null);
+                  setTranscriptionId(null);
+                  setOriginalTranscript("");
+                }}
+                className="btn-secondary"
+              >
+                <RotateCcw size={16} /> 新指令
+              </button>
+            ) : null}
+          </div>
         }
       />
 
@@ -353,6 +375,7 @@ export default function VoicePage() {
           <AsrRecorder
             onTranscriptChange={(text, confidence) => {
               store.setTranscript(text);
+              store.setInputMode("voice");
               setAsrConfidence(confidence);
             }}
             onSourceChange={handleAsrSource}
@@ -377,6 +400,13 @@ export default function VoicePage() {
                 </div>
                 <Sparkles className="text-teal-500" size={20} />
               </div>
+              {store.inputMode === "text_demo" ? (
+                <div className="mb-3 flex items-start gap-2 rounded-xl border border-gold-100 bg-gold-100/45 p-3 text-xs font-semibold leading-5 text-amber-800">
+                  <Keyboard className="mt-0.5 shrink-0" size={15} />
+                  文本指令演示：这段文字由你点击示例填入，不是 ASR
+                  转写。后续纠错、理解、确认、写入和数据库验证仍调用真实服务。
+                </div>
+              ) : null}
               <textarea
                 value={store.transcript}
                 onChange={(event) => store.setTranscript(event.target.value)}

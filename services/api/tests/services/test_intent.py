@@ -41,6 +41,76 @@ async def test_fallback_parses_create_event_and_computes_required_fields() -> No
 
 
 @pytest.mark.asyncio
+async def test_explicit_create_wins_over_reminder_wording() -> None:
+    result = await IntentParser().parse(
+        "新建待办：后天下午三点提交人工智能作业，提前一天提醒我。",
+        now=datetime(2026, 7, 14, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert result.intent == IntentName.CREATE_TASK
+    assert result.slots.title == "提交人工智能作业"
+    assert result.slots.due_date == "2026-07-16"
+    assert result.slots.due_time == "15:00"
+    assert result.slots.reminder_minutes == 1440
+    assert result.missing_fields == []
+    assert result.requires_confirmation is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reminder_text", "expected_minutes"),
+    [
+        ("提前半小时提醒我", 30),
+        ("提前两个小时提醒我", 120),
+        ("提前12小时通知我", 720),
+    ],
+)
+async def test_fallback_extracts_reminder_without_polluting_event_title_or_time(
+    reminder_text: str,
+    expected_minutes: int,
+) -> None:
+    result = await IntentParser().parse(
+        f"创建日程：明天下午三点项目组会，{reminder_text}。",
+        now=datetime(2026, 7, 14, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert result.intent == IntentName.CREATE_EVENT
+    assert result.slots.title == "项目组会"
+    assert result.slots.date == "2026-07-15"
+    assert result.slots.start_time == "15:00"
+    assert result.slots.end_time is None
+    assert result.slots.reminder_minutes == expected_minutes
+    assert result.missing_fields == []
+
+
+@pytest.mark.asyncio
+async def test_deterministic_enrichment_cleans_reminder_from_llm_title() -> None:
+    llm = InvalidThenValidLlm(
+        """{
+          "intent":"create_event",
+          "confidence":0.9,
+          "slots":{"title":"项目组会，提前半小时提醒我"},
+          "missing_fields":[],
+          "ambiguities":[],
+          "source_text":"wrong",
+          "requires_confirmation":false
+        }"""
+    )
+
+    result = await IntentParser(llm).parse(
+        "创建日程：明天下午三点项目组会，提前半小时提醒我。",
+        now=datetime(2026, 7, 14, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert result.intent == IntentName.CREATE_EVENT
+    assert result.slots.title == "项目组会"
+    assert result.slots.start_time == "15:00"
+    assert result.slots.end_time is None
+    assert result.slots.reminder_minutes == 30
+    assert result.missing_fields == []
+
+
+@pytest.mark.asyncio
 async def test_fallback_returns_unknown_without_create_signal() -> None:
     result = await IntentParser().parse("机器学习是什么")
 
