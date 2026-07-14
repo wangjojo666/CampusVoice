@@ -18,6 +18,7 @@ from app.models.entities import (
     Task,
     Transcription,
     UndoRecord,
+    UserSettings,
     VoiceSession,
 )
 from app.models.enums import (
@@ -127,13 +128,6 @@ class ActionService:
     async def prepare(
         self, session: AsyncSession, user_id: str, request: ActionPrepareRequest
     ) -> PendingAction:
-        (
-            request,
-            resolution_missing,
-            resolution_ambiguities,
-            resolution_blockers,
-            resolution_diagnostics,
-        ) = await self._resolve_target(session, user_id, request)
         voice_session_id = await self._validate_voice_source(session, user_id, request)
         if (voice_session_id or request.transcription_id) and not (
             request.source_text and request.source_text.strip()
@@ -149,17 +143,20 @@ class ActionService:
             "voice_session_id": voice_session_id,
             "transcription_id": request.transcription_id,
         }
+        requested_payload_model = parse_payload(request.action, request.payload)
+        requested_payload = requested_payload_model.model_dump(mode="json", exclude_unset=True)
         if request.idempotency_key:
             existing = await self.actions.by_idempotency_key(
                 session, user_id, request.idempotency_key
             )
             if existing is not None:
-                parsed = parse_payload(request.action, request.payload)
-                canonical = parsed.model_dump(mode="json", exclude_unset=True)
+                existing_requested_payload = existing.execution_options.get("requested_payload")
+                if not isinstance(existing_requested_payload, dict):
+                    existing_requested_payload = existing.payload
                 if (
                     existing.action_type != request.action
-                    or existing.payload != canonical
-                    or existing.target_id != request.target_id
+                    or existing_requested_payload != requested_payload
+                    or not self._idempotency_target_matches(existing, request)
                     or any(
                         existing.execution_options.get(name) != value
                         for name, value in audit_options.items()
@@ -172,6 +169,17 @@ class ActionService:
                 await session.commit()
                 return existing
 
+        (
+            request,
+            resolution_missing,
+            resolution_ambiguities,
+            resolution_blockers,
+            resolution_diagnostics,
+        ) = await self._resolve_target(session, user_id, request)
+        request, version_diagnostics = await self._freeze_update_version(session, user_id, request)
+        resolution_diagnostics.update(version_diagnostics)
+        request, default_diagnostics = await self._apply_user_defaults(session, user_id, request)
+        resolution_diagnostics.update(default_diagnostics)
         payload_model = parse_payload(request.action, request.payload)
         payload = payload_model.model_dump(mode="json", exclude_unset=True)
         missing = missing_required_fields(
@@ -226,6 +234,7 @@ class ActionService:
             "hard_to_undo": request.hard_to_undo,
             **audit_options,
             "target_title": request.target_title,
+            "requested_payload": requested_payload,
         }
         await session.rollback()
         async with session.begin():
@@ -251,6 +260,67 @@ class ActionService:
             session.add(action)
             await session.flush()
         return action
+
+    @staticmethod
+    def _idempotency_target_matches(
+        existing: PendingAction,
+        request: ActionPrepareRequest,
+    ) -> bool:
+        if request.action in {ActionType.CREATE_TASK, ActionType.CREATE_EVENT}:
+            return request.target_id is None and request.target_title is None
+        if request.target_id is not None:
+            return existing.target_id == request.target_id
+        if request.target_title is not None:
+            return existing.execution_options.get("target_title") == request.target_title
+        return existing.target_id is None
+
+    async def _freeze_update_version(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        request: ActionPrepareRequest,
+    ) -> tuple[ActionPrepareRequest, dict[str, Any]]:
+        if request.action not in {ActionType.UPDATE_TASK, ActionType.UPDATE_EVENT}:
+            return request, {}
+        if request.target_id is None or request.payload.get("expected_version") is not None:
+            return request, {}
+
+        target: Task | CalendarEvent | None
+        if request.action == ActionType.UPDATE_TASK:
+            target = await self.tasks.get(session, user_id, request.target_id)
+            entity_name = "task"
+        else:
+            target = await self.events.get(session, user_id, request.target_id)
+            entity_name = "event"
+        if target is None:
+            raise NotFoundError(entity_name, request.target_id)
+
+        frozen_version = target.version
+        return (
+            request.model_copy(
+                update={"payload": request.payload | {"expected_version": frozen_version}}
+            ),
+            {"frozen_expected_version": frozen_version},
+        )
+
+    @staticmethod
+    async def _apply_user_defaults(
+        session: AsyncSession,
+        user_id: str,
+        request: ActionPrepareRequest,
+    ) -> tuple[ActionPrepareRequest, dict[str, Any]]:
+        if request.action != ActionType.CREATE_EVENT or "reminder_minutes" in request.payload:
+            return request, {}
+        user_settings = await session.get(UserSettings, user_id)
+        reminder_minutes = (
+            user_settings.default_reminder_minutes if user_settings is not None else 30
+        )
+        return (
+            request.model_copy(
+                update={"payload": request.payload | {"reminder_minutes": reminder_minutes}}
+            ),
+            {"default_reminder_minutes_applied": reminder_minutes},
+        )
 
     async def _validate_voice_source(
         self,
@@ -795,7 +865,7 @@ class ActionService:
                 session, action.user_id, action.target_id or "", True
             )
             task_before = _snapshot_task(task_to_update)
-            task_update = TaskUpdate.model_validate(action.payload)
+            task_update = _task_update_from_payload(action.payload)
             self._check_version(task_to_update.version, task_update.expected_version)
             updated_task_candidate = _merge_task(
                 task_to_update, TaskDraft.model_validate(action.payload)
@@ -866,7 +936,7 @@ class ActionService:
                 session, action.user_id, action.target_id or "", True
             )
             event_before = _snapshot_event(event_to_update)
-            event_update = EventUpdate.model_validate(
+            event_update = _event_update_from_payload(
                 action.payload
                 | {"allow_conflict": bool(action.execution_options.get("overwrite_existing"))}
             )
@@ -1241,8 +1311,8 @@ class ActionService:
             raise ConflictError("undo_expired", "The undo window has expired")
 
     @staticmethod
-    def _check_version(current: int, expected: int | None) -> None:
-        if expected is not None and current != expected:
+    def _check_version(current: int, expected: int) -> None:
+        if current != expected:
             raise ConflictError(
                 "version_conflict",
                 "The record changed after it was reviewed",
@@ -1272,17 +1342,50 @@ def _event_create_from_draft(payload: EventDraft, allow_conflict: bool) -> Event
     )
 
 
+def _task_update_from_payload(payload: dict[str, Any]) -> TaskUpdate:
+    try:
+        return TaskUpdate.model_validate(payload)
+    except ValidationError as exc:
+        raise _invalid_merged_update(exc) from exc
+
+
+def _event_update_from_payload(payload: dict[str, Any]) -> EventUpdate:
+    try:
+        return EventUpdate.model_validate(payload)
+    except ValidationError as exc:
+        raise _invalid_merged_update(exc) from exc
+
+
 def _merge_task(task: Task, patch: TaskDraft) -> TaskCreate:
     current = _task_business_fields(_snapshot_task(task))
     current.update(patch.model_dump(mode="json", exclude_unset=True, exclude={"expected_version"}))
-    return TaskCreate.model_validate(current)
+    try:
+        return TaskCreate.model_validate(current)
+    except ValidationError as exc:
+        raise _invalid_merged_update(exc) from exc
 
 
 def _merge_event(event: CalendarEvent, patch: EventDraft, allow_conflict: bool) -> EventCreate:
     current = _event_business_fields(_snapshot_event(event))
     current.update(patch.model_dump(mode="json", exclude_unset=True, exclude={"expected_version"}))
     current["allow_conflict"] = allow_conflict
-    return EventCreate.model_validate(current)
+    try:
+        return EventCreate.model_validate(current)
+    except ValidationError as exc:
+        raise _invalid_merged_update(exc) from exc
+
+
+def _invalid_merged_update(exc: ValidationError) -> DomainError:
+    errors = [
+        {"type": item["type"], "loc": list(item["loc"]), "msg": item["msg"]}
+        for item in exc.errors(include_url=False)
+    ]
+    return DomainError(
+        "invalid_action_payload",
+        "The update is invalid after applying it to the current record",
+        status_code=422,
+        details={"errors": errors},
+    )
 
 
 def _task_business_fields(snapshot: dict[str, Any]) -> dict[str, Any]:

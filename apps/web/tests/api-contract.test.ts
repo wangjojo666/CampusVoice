@@ -174,8 +174,11 @@ describe("API wire contract adapters", () => {
 
     const settings = await api.settings.update({
       major: "人工智能",
+      grade: "2024级",
       current_courses: [{ code: "AI301", name: "机器学习", teacher: "张老师" }],
-      asr_device: "cuda:0",
+      teacher_names: ["张老师"],
+      default_reminder_minutes: 30,
+      timezone: "Asia/Shanghai",
     });
 
     expect(settings.major).toBe("人工智能");
@@ -191,7 +194,7 @@ describe("API wire contract adapters", () => {
       path: "/api/settings",
       body: {
         current_courses: [{ code: "AI301", name: "机器学习", teacher: "张老师" }],
-        asr_device: "cuda:0",
+        timezone: "Asia/Shanghai",
       },
     });
     const options = vi.mocked(fetch).mock.calls[1]?.[1];
@@ -201,7 +204,7 @@ describe("API wire contract adapters", () => {
     expect(new Headers(options?.headers).get("X-User-Confirmed")).toBeNull();
     expect(JSON.parse(String(options?.body))).toMatchObject({
       current_courses: [{ code: "AI301", name: "机器学习", teacher: "张老师" }],
-      asr_device: "cuda:0",
+      timezone: "Asia/Shanghai",
     });
   });
 

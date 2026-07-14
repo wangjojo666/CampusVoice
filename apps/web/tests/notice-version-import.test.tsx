@@ -24,6 +24,7 @@ vi.mock("@/lib/api-client", () => ({
 }));
 
 import { NoticeVersionImport } from "@/components/notices/notice-version-import";
+import { DEFAULT_USER_SETTINGS, setCurrentUserSettings } from "@/lib/user-settings";
 
 const series = {
   id: "series-1",
@@ -52,7 +53,10 @@ const versionOne = {
   created_at: "2026-07-10T00:00:00Z",
 };
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  setCurrentUserSettings(DEFAULT_USER_SETTINGS);
+});
 
 describe("NoticeVersionImport", () => {
   beforeEach(() => {
@@ -65,6 +69,10 @@ describe("NoticeVersionImport", () => {
 
   it("creates an explicit NoticeSeries and imports v1 with no predecessor", async () => {
     const user = userEvent.setup();
+    setCurrentUserSettings({
+      ...DEFAULT_USER_SETTINGS,
+      timezone: "America/Los_Angeles",
+    });
     render(<NoticeVersionImport />);
 
     expect(mocks.series).not.toHaveBeenCalled();
@@ -88,6 +96,7 @@ describe("NoticeVersionImport", () => {
       screen.getByLabelText("通知完整原文"),
       "考试时间为 2026-07-18 09:00 至 11:00，地点 A302。",
     );
+    await user.type(screen.getByLabelText("生效时间（可选）"), "2026-07-18T09:30");
     await user.click(screen.getByRole("checkbox", { name: /我已核对同名或相似通知/ }));
     await user.click(screen.getByRole("button", { name: "导入并提取证据 claim" }));
 
@@ -98,6 +107,7 @@ describe("NoticeVersionImport", () => {
         revision_number: 1,
         version_label: "v1",
         supersedes_document_id: null,
+        effective_at: "2026-07-18T16:30:00.000Z",
         ingest_source: "manual",
       }),
     );

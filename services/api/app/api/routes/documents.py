@@ -7,7 +7,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.dependencies import UserIdDependency
 from app.schemas.knowledge import DocumentFileType, DocumentMetadata, DocumentRecord
+from app.services.errors import DomainError
 from app.services.knowledge import (
+    DocumentLimitError,
     DocumentParseError,
     DuplicateDocumentError,
     KnowledgePersistenceError,
@@ -83,9 +85,10 @@ async def upload_document(
         ) from exc
     content = await file.read(_MAX_UPLOAD_BYTES + 1)
     if len(content) > _MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail={"code": "document_too_large", "message": "文档不能超过 20 MB。"},
+        raise DomainError(
+            "document_too_large",
+            "文档不能超过 20 MB。",
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
         )
     try:
         metadata = DocumentMetadata(
@@ -107,10 +110,17 @@ async def upload_document(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"code": "invalid_document_metadata", "message": "文档元数据格式无效。"},
         ) from exc
+    except DocumentLimitError as exc:
+        raise DomainError(
+            exc.code,
+            exc.message,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+        ) from exc
     except DocumentParseError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"code": exc.code, "message": exc.message},
+        raise DomainError(
+            exc.code,
+            exc.message,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         ) from exc
     except DuplicateDocumentError as exc:
         raise HTTPException(

@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from tests.helpers import confirm_action, confirmed_write
@@ -109,3 +110,160 @@ def test_optimistic_version_conflict_does_not_modify_task(client: TestClient) ->
     task = client.get("/api/tasks").json()["items"][0]
     assert task["title"] == "版本检查"
     assert task["version"] == 1
+
+
+def test_task_patch_requires_expected_version_without_modifying_record(
+    client: TestClient,
+) -> None:
+    task_id = confirmed_write(client, "POST", "/api/tasks", {"title": "版本必填"}).json()[
+        "record_id"
+    ]
+    before = client.get("/api/tasks").json()["items"][0]
+
+    response = confirmed_write(
+        client,
+        "PATCH",
+        f"/api/tasks/{task_id}",
+        {"title": "不应保存"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "expected_version"]
+    assert response.json()["detail"][0]["type"] == "missing"
+    after = client.get("/api/tasks").json()["items"][0]
+    assert after == before
+
+
+@pytest.mark.parametrize("field", ["title", "priority", "status", "source_type"])
+def test_task_patch_rejects_null_required_fields_without_changing_version(
+    client: TestClient,
+    field: str,
+) -> None:
+    task_id = confirmed_write(
+        client,
+        "POST",
+        "/api/tasks",
+        {
+            "title": "空值保护",
+            "description": "可清空说明",
+            "course": "数据库",
+            "due_at": "2026-07-18T10:00:00Z",
+            "reminder_at": "2026-07-18T09:00:00Z",
+        },
+    ).json()["record_id"]
+    before = client.get("/api/tasks").json()["items"][0]
+
+    response = confirmed_write(
+        client,
+        "PATCH",
+        f"/api/tasks/{task_id}",
+        {field: None, "expected_version": 1},
+    )
+
+    assert response.status_code == 422
+    assert client.get("/api/tasks").json()["items"][0] == before
+
+
+def test_task_patch_allows_nullable_fields_to_be_cleared(client: TestClient) -> None:
+    task_id = confirmed_write(
+        client,
+        "POST",
+        "/api/tasks",
+        {
+            "title": "可空字段",
+            "description": "说明",
+            "course": "数据库",
+            "due_at": "2026-07-18T10:00:00Z",
+            "reminder_at": "2026-07-18T09:00:00Z",
+        },
+    ).json()["record_id"]
+
+    response = confirmed_write(
+        client,
+        "PATCH",
+        f"/api/tasks/{task_id}",
+        {
+            "description": None,
+            "course": None,
+            "due_at": None,
+            "reminder_at": None,
+            "expected_version": 1,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    record = response.json()["record"]
+    assert record["version"] == 2
+    assert all(
+        record[field] is None for field in ("description", "course", "due_at", "reminder_at")
+    )
+
+
+def test_task_merge_validation_error_is_domain_422_and_preserves_record(
+    client: TestClient,
+) -> None:
+    task_id = confirmed_write(
+        client,
+        "POST",
+        "/api/tasks",
+        {
+            "title": "合并校验",
+            "due_at": "2026-07-18T10:00:00Z",
+            "reminder_at": "2026-07-18T09:00:00Z",
+        },
+    ).json()["record_id"]
+    before = client.get("/api/tasks").json()["items"][0]
+
+    response = confirmed_write(
+        client,
+        "PATCH",
+        f"/api/tasks/{task_id}",
+        {"due_at": "2026-07-18T08:00:00Z", "expected_version": 1},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_action_payload"
+    assert client.get("/api/tasks").json()["items"][0] == before
+
+
+def test_stale_confirmed_task_update_cannot_overwrite_newer_version(
+    client: TestClient,
+) -> None:
+    task_id = confirmed_write(client, "POST", "/api/tasks", {"title": "并发待办"}).json()[
+        "record_id"
+    ]
+    prepare_request = {
+        "action": "update_task",
+        "target_title": "并发待办",
+        "payload": {"title": "陈旧标题"},
+        "idempotency_key": "stale-task-update-key",
+    }
+    prepared = client.post("/api/actions/prepare", json=prepare_request)
+    assert prepared.status_code == 201, prepared.text
+    pending = prepared.json()
+    assert pending["target_id"] == task_id
+    assert pending["payload"]["expected_version"] == 1
+    confirm_action(client, pending["id"])
+
+    concurrent = confirmed_write(
+        client,
+        "PATCH",
+        f"/api/tasks/{task_id}",
+        {"priority": "high", "expected_version": 1},
+    )
+    assert concurrent.status_code == 200, concurrent.text
+
+    replay = client.post("/api/actions/prepare", json=prepare_request)
+    assert replay.status_code == 201, replay.text
+    assert replay.json()["id"] == pending["id"]
+    assert replay.json()["payload"]["expected_version"] == 1
+
+    stale = client.post(f"/api/actions/{pending['id']}/execute")
+    assert stale.status_code == 409
+    assert stale.json()["error"]["code"] == "version_conflict"
+    record = client.get("/api/tasks").json()["items"][0]
+    assert (record["title"], record["priority"], record["version"]) == (
+        "并发待办",
+        "high",
+        2,
+    )

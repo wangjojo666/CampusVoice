@@ -87,6 +87,8 @@ a request ID. A verification error never contains `success: true`.
 - `POST /api/tasks` and `PATCH /api/tasks/{id}` require a matching one-time write challenge. They return a
   verified mutation object containing `success`, `action`, `record_id`, per-field
   `verified_fields`, detected `side_effects`, `message`, and the re-queried `record`.
+  Every task PATCH must include the current positive `expected_version`; an omitted version or an
+  explicit null for a non-null task field is rejected with `422` before any record or version change.
 - `DELETE /api/tasks/{id}` never deletes immediately. It returns `428` with a high-risk
   `pending_action` in `error.details`; the caller must use the two-step action endpoints.
 - `GET /api/events` returns `{items: EventView[], total}` and accepts timezone-aware range filters,
@@ -95,6 +97,10 @@ a request ID. A verification error never contains `success: true`.
   contract. A normal overlap is blocked. An explicit `allow_conflict: true` becomes high risk and
   returns `428 confirmation_required` with a durable `pending_action`; callers continue that ID
   through two Action challenge/confirm interactions and then execute it.
+  Creation may omit `end_at` to use the existing one-hour default; explicitly sending
+  `end_at: null` is rejected with `422` before an event or pending action is written.
+  Every event PATCH must include the current positive `expected_version`; an omitted version or an
+  explicit null for a non-null event field is rejected with `422` before any record or version change.
 - `DELETE /api/events/{id}` returns a high-risk pending action with `428`.
 - `POST /api/events/check-conflict` accepts timezone-aware `start_at`, `end_at` and optional
   `exclude_event_id`; it returns `{has_conflict, conflicts}`.
@@ -106,6 +112,10 @@ a request ID. A verification error never contains `success: true`.
   default reminder, timezone and flat ASR provider/model/device fields. `PATCH /api/settings`
   accepts a strict partial update, requires a matching one-time write challenge, and returns
   `{success, verified_fields, message, settings}` after a post-commit re-query.
+  The timezone controls relative-date parsing and client date conversion/display. The default
+  reminder is applied only when a new event omits `reminder_minutes`; existing events are unchanged.
+  ASR provider/model/device are read-only server runtime status fields and are rejected in PATCH
+  payloads rather than being persisted as ineffective user preferences.
 
 `Idempotency-Key` is accepted on task/event direct mutations. It must contain 8–120 characters.
 Reusing it with the same canonical action returns the original pending action; using it for a
@@ -172,11 +182,19 @@ States are `needs_input`, `awaiting_confirmation`, `awaiting_second_confirmation
 `executing`, `executed`, `cancelled`, `failed`, `undone`, and `expired`. Terminal-state and retry
 violations return `409`; write and verification retries are capped at `max_attempts`.
 
+For task/event updates prepared by target ID or resolved title, the service freezes the target's
+current version when the caller omitted one. Execute re-locks the record and compares that frozen
+version before applying any field; a mismatch returns `409 version_conflict` with zero target writes.
+Validation failures after merging a patch with the current record are stable domain `422` responses.
+
 ## Evidence-grounded campus knowledge
 
 - `POST /api/documents` accepts PDF, DOCX, TXT, or Markdown plus title, department, publish date,
   applicable group, source URL, and version. Parsed chunks and optional embeddings are committed
-  transactionally and then re-read.
+  transactionally and then re-read. PDF/DOCX parsing runs outside the async event-loop thread.
+  Upload bytes, PDF pages, DOCX entry count/expanded bytes/compression ratio, extracted characters,
+  and generated chunks are bounded. Limit violations return a stable `413`; malformed supported
+  files return a redacted domain `422`, and neither response persists a document.
 - `POST /api/knowledge/search` accepts `query`, `top_k`, `min_similarity`, and optional `version`
   / `applicable_group` filters. Every result contains document/chunk IDs, original text, natural
   page number (or null), similarity, title, publication date, version, and applicable group.

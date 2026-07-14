@@ -1,5 +1,5 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import TasksPage from "@/app/tasks/page";
 
@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => ({
   prepareRemove: vi.fn(),
   confirm: vi.fn(),
   execute: vi.fn(),
+  listLogs: vi.fn(),
+  undo: vi.fn(),
 }));
 
 vi.mock("@/lib/api-client", () => ({
@@ -21,16 +23,18 @@ vi.mock("@/lib/api-client", () => ({
       update: vi.fn(),
       remove: mocks.prepareRemove,
     },
-    actionLogs: { list: vi.fn() },
+    actionLogs: { list: mocks.listLogs },
     actions: {
       confirm: mocks.confirm,
       execute: mocks.execute,
-      undo: vi.fn(),
+      undo: mocks.undo,
     },
   },
 }));
 
 describe("TasksPage destructive confirmation", () => {
+  afterEach(cleanup);
+
   beforeEach(() => {
     const task = {
       id: "task-delete",
@@ -88,6 +92,15 @@ describe("TasksPage destructive confirmation", () => {
       side_effects: [],
       message: "待办已删除并通过数据库验证",
     });
+    mocks.listLogs.mockReset().mockResolvedValue({ items: [], total: 0 });
+    mocks.undo.mockReset().mockResolvedValue({
+      success: true,
+      action: "undo_update_task",
+      record_id: "task-delete",
+      verified_fields: {},
+      side_effects: [],
+      message: "待办撤销成功",
+    });
   });
 
   it("does not execute after the first click and executes only after a second click", async () => {
@@ -115,5 +128,35 @@ describe("TasksPage destructive confirmation", () => {
     await waitFor(() => expect(mocks.confirm).toHaveBeenCalledTimes(2));
     expect(mocks.execute).toHaveBeenCalledWith("action-delete-task");
     expect(await screen.findByText("待办已删除并通过数据库验证")).toBeInTheDocument();
+  });
+
+  it("skips a newer event action and undoes the latest task action", async () => {
+    mocks.listLogs.mockResolvedValue({
+      items: [
+        {
+          id: "event-log",
+          action: "create_event",
+          action_id: "event-action",
+          undoable: true,
+          undone: false,
+        },
+        {
+          id: "task-log",
+          action: "update_task",
+          action_id: "task-action",
+          undoable: true,
+          undone: false,
+        },
+      ],
+      total: 2,
+    });
+
+    render(<TasksPage />);
+    await waitFor(() => expect(mocks.listTasks).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "撤销最近操作" }));
+
+    await waitFor(() => expect(mocks.undo).toHaveBeenCalledWith("task-action"));
+    expect(mocks.undo).not.toHaveBeenCalledWith("event-action");
+    expect(await screen.findByText("待办撤销成功")).toBeInTheDocument();
   });
 });

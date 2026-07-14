@@ -13,11 +13,14 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
+import { ErrorState } from "@/components/ui/error-state";
+import { LoadingState } from "@/components/ui/loading-state";
 import { HealthStatus } from "@/components/system/health-status";
 import { api, API_BASE_URL } from "@/lib/api-client";
 import { OIDC_ENABLED } from "@/lib/auth";
+import { setCurrentUserSettings } from "@/lib/user-settings";
 
 const navigation = [
   { href: "/", label: "首页", icon: Home },
@@ -48,6 +51,40 @@ export function AppShell({
   const authError = useSyncExternalStore(subscribeToLocation, currentAuthError, () => null);
   const [loggingOut, setLoggingOut] = useState(false);
   const [logoutError, setLogoutError] = useState(false);
+  const [settingsState, setSettingsState] = useState<"loading" | "ready" | "error">("loading");
+  const settingsRequest = useRef(0);
+
+  const retrySettings = () => {
+    const request = ++settingsRequest.current;
+    setSettingsState("loading");
+    void api.settings.get().then(
+      (settings) => {
+        if (request !== settingsRequest.current) return;
+        setCurrentUserSettings(settings);
+        setSettingsState("ready");
+      },
+      () => {
+        if (request === settingsRequest.current) setSettingsState("error");
+      },
+    );
+  };
+
+  useEffect(() => {
+    const request = ++settingsRequest.current;
+    void api.settings.get().then(
+      (settings) => {
+        if (request !== settingsRequest.current) return;
+        setCurrentUserSettings(settings);
+        setSettingsState("ready");
+      },
+      () => {
+        if (request === settingsRequest.current) setSettingsState("error");
+      },
+    );
+    return () => {
+      settingsRequest.current += 1;
+    };
+  }, []);
 
   async function logout() {
     if (loggingOut) return;
@@ -179,7 +216,15 @@ export function AppShell({
               </button>
             </div>
           ) : null}
-          {children}
+          {settingsState === "ready" ? children : null}
+          {settingsState === "loading" ? <LoadingState rows={4} label="正在加载个人设置" /> : null}
+          {settingsState === "error" ? (
+            <ErrorState
+              title="无法加载个人设置"
+              message="为避免使用错误的时区或默认提醒，数据写入入口暂不可用。"
+              onRetry={retrySettings}
+            />
+          ) : null}
         </main>
       </div>
 

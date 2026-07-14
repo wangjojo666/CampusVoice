@@ -42,9 +42,6 @@ class UserSettingsUpdate(StrictModel):
     teacher_names: list[NonBlank] | None = None
     default_reminder_minutes: int | None = Field(default=None, ge=0, le=525_600)
     timezone: NonBlank | None = None
-    asr_provider: NonBlank | None = None
-    asr_model: NonBlank | None = None
-    asr_device: NonBlank | None = None
 
     @field_validator("timezone")
     @classmethod
@@ -70,9 +67,6 @@ class UserSettingsUpdate(StrictModel):
             raise ValueError("at least one setting must be supplied")
         required_when_set = {
             "timezone",
-            "asr_provider",
-            "asr_model",
-            "asr_device",
             "default_reminder_minutes",
         }
         null_fields = {

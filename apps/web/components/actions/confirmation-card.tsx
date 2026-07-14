@@ -3,6 +3,8 @@
 import type { PendingAction } from "@campusvoice/shared-types";
 import { AlertOctagon, AlertTriangle, Check, Clock3, ShieldCheck, X } from "lucide-react";
 
+import { formatDateTime } from "@/lib/format";
+
 const riskStyle = {
   low: { label: "低风险", icon: ShieldCheck, classes: "bg-teal-50 text-teal-700 border-teal-100" },
   medium: {
@@ -113,8 +115,7 @@ export function ConfirmationCard({
 
         {action.expires_at ? (
           <p className="mt-3 flex items-center gap-1.5 text-xs text-ink-400">
-            <Clock3 size={14} /> 确认请求有效期至{" "}
-            {new Date(action.expires_at).toLocaleString("zh-CN")}
+            <Clock3 size={14} /> 确认请求有效期至 {formatDateTime(action.expires_at)}
           </p>
         ) : null}
 

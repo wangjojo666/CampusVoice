@@ -293,7 +293,12 @@ async function installApiMocks(page: Page, options: MockOptions = {}) {
       });
     if (path === "/api/settings" && method === "PATCH")
       return fulfill(route, {
-        settings: body,
+        settings: {
+          ...(body as Record<string, unknown>),
+          asr_provider: "funasr",
+          asr_model: "paraformer-zh-streaming",
+          asr_device: "cpu",
+        },
         success: true,
         verified_fields: { major: true },
         message: "设置已更新并验证",

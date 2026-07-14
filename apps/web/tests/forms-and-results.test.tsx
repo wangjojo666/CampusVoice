@@ -137,6 +137,63 @@ describe("reviewable mutation forms", () => {
     );
   });
 
+  it("uses the saved reminder only for new events and preserves an edited value", () => {
+    const { rerender } = render(
+      <EventForm
+        event={null}
+        defaultStart={new Date("2026-07-21T13:00:00.000Z")}
+        timezone="America/New_York"
+        defaultReminderMinutes={60}
+        conflicts={[]}
+        busy={false}
+        onSubmit={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByLabelText("开始时间 *")).toHaveValue("2026-07-21T09:00");
+    expect(screen.getByLabelText("提前提醒")).toHaveValue("60");
+
+    rerender(
+      <EventForm
+        key="edit"
+        event={{ ...event, reminder_minutes: 10 }}
+        timezone="America/New_York"
+        defaultReminderMinutes={60}
+        conflicts={[]}
+        busy={false}
+        onSubmit={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+    expect(screen.getByLabelText("提前提醒")).toHaveValue("10");
+  });
+
+  it("leaves an untouched create reminder to the server-side user default", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    render(
+      <EventForm
+        event={null}
+        defaultStart={new Date("2026-07-21T13:00:00.000Z")}
+        timezone="America/New_York"
+        defaultReminderMinutes={60}
+        conflicts={[]}
+        busy={false}
+        onSubmit={onSubmit}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    await user.type(screen.getByLabelText("标题 *"), "项目例会");
+    await user.click(screen.getByRole("button", { name: "检查冲突并核对" }));
+    expect(screen.getByText("使用个人默认提醒")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "确认并保存" }));
+
+    expect(onSubmit).toHaveBeenCalledOnce();
+    expect(onSubmit.mock.calls[0]?.[0]).not.toHaveProperty("reminder_minutes");
+  });
+
   it("renders the conflicting event and blocks an edited event save", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn();

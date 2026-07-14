@@ -2,6 +2,7 @@ import type { IntentResult } from "@campusvoice/shared-types";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { actionRequestFrom } from "@/lib/voice/action-request";
+import { DEFAULT_USER_SETTINGS, setCurrentUserSettings } from "@/lib/user-settings";
 import { useAssistantStore } from "@/stores/assistant-store";
 
 const intent: IntentResult = {
@@ -19,7 +20,10 @@ const intent: IntentResult = {
 };
 
 describe("notice-to-voice source document lineage", () => {
-  beforeEach(() => useAssistantStore.getState().reset());
+  beforeEach(() => {
+    useAssistantStore.getState().reset();
+    setCurrentUserSettings(DEFAULT_USER_SETTINGS);
+  });
 
   it("places the evidence document id in the action payload", () => {
     const request = actionRequestFrom(intent, "doc-1");
@@ -29,6 +33,17 @@ describe("notice-to-voice source document lineage", () => {
       source_type: "document",
       source_document_id: "doc-1",
     });
+  });
+
+  it("uses the user timezone and leaves an implicit reminder to the server setting", () => {
+    setCurrentUserSettings({
+      ...DEFAULT_USER_SETTINGS,
+      timezone: "America/New_York",
+    });
+    const request = actionRequestFrom(intent);
+
+    expect(request.payload).toMatchObject({ start_at: "2026-07-18T13:00:00.000Z" });
+    expect(request.payload).not.toHaveProperty("reminder_minutes");
   });
 
   it("clears the document source when the workflow resets", () => {

@@ -31,12 +31,17 @@ class EventService:
             chunk_id=data.source_chunk_id,
             claim_id=data.source_claim_id,
         )
+        payload = data.model_dump(mode="json", exclude={"allow_conflict"})
+        if "end_at" not in data.model_fields_set:
+            payload.pop("end_at", None)
+        if "reminder_minutes" not in data.model_fields_set:
+            payload.pop("reminder_minutes", None)
         action = await self.actions.prepare(
             session,
             user_id,
             ActionPrepareRequest(
                 action=ActionType.CREATE_EVENT,
-                payload=data.model_dump(mode="json", exclude={"allow_conflict"}),
+                payload=payload,
                 overwrite_existing=data.allow_conflict,
                 idempotency_key=idempotency_key,
             ),

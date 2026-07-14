@@ -97,6 +97,51 @@ async def test_fallback_uses_prior_context_for_a_short_clarification() -> None:
 
 
 @pytest.mark.asyncio
+async def test_per_call_timezone_controls_relative_date_and_tonight_time() -> None:
+    parser = IntentParser(timezone_name="Asia/Shanghai")
+    instant = datetime(2026, 7, 13, 1, 0, tzinfo=ZoneInfo("UTC"))
+
+    tomorrow = await parser.parse(
+        "创建日程：项目组会，明天下午三点",
+        now=instant,
+        timezone_name="America/Los_Angeles",
+    )
+    tonight = await parser.parse(
+        "创建日程：夜间复习，今晚七点",
+        now=instant,
+        timezone_name="America/Los_Angeles",
+    )
+
+    assert tomorrow.slots.date == "2026-07-13"
+    assert tomorrow.slots.start_time == "15:00"
+    assert tonight.slots.date == "2026-07-12"
+    assert tonight.slots.start_time == "19:00"
+
+
+@pytest.mark.asyncio
+async def test_user_timezone_deterministically_overrides_llm_relative_date_guess() -> None:
+    repaired = """{
+      "intent":"create_event",
+      "confidence":0.9,
+      "slots":{"title":"夜间复习","date":"2099-01-01","start_time":"07:00"},
+      "missing_fields":[],
+      "ambiguities":[],
+      "source_text":"wrong",
+      "requires_confirmation":false
+    }"""
+    instant = datetime(2026, 7, 13, 1, 0, tzinfo=ZoneInfo("UTC"))
+
+    result = await IntentParser(InvalidThenValidLlm(repaired)).parse(
+        "创建日程：夜间复习，今晚七点",
+        now=instant,
+        timezone_name="America/Los_Angeles",
+    )
+
+    assert result.slots.date == "2026-07-12"
+    assert result.slots.start_time == "19:00"
+
+
+@pytest.mark.asyncio
 async def test_llm_gets_exactly_one_structured_repair_and_policy_is_deterministic() -> None:
     repaired = """{
       "intent":"create_event",

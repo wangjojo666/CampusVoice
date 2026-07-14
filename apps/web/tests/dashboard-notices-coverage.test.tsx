@@ -13,6 +13,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import HomePage from "@/app/page";
 import NoticesPage from "@/app/notices/page";
 import { ApiError } from "@/lib/api-client";
+import { fromLocalInputValue, toLocalInputValue } from "@/lib/format";
+import { DEFAULT_USER_SETTINGS, setCurrentUserSettings } from "@/lib/user-settings";
 import { useAssistantStore } from "@/stores/assistant-store";
 
 const mocks = vi.hoisted(() => ({
@@ -73,8 +75,14 @@ vi.mock("@/lib/api-client", () => ({
 }));
 
 function localTime(dayOffset: number, hour: number) {
-  const now = new Date();
-  return new Date(now.getFullYear(), now.getMonth(), now.getDate() + dayOffset, hour).toISOString();
+  const timezone = DEFAULT_USER_SETTINGS.timezone;
+  const localToday = toLocalInputValue(new Date().toISOString(), timezone).slice(0, 10);
+  const shiftedDay = new Date(`${localToday}T00:00:00.000Z`);
+  shiftedDay.setUTCDate(shiftedDay.getUTCDate() + dayOffset);
+  const localValue = `${shiftedDay.toISOString().slice(0, 10)}T${String(hour).padStart(2, "0")}:00`;
+  const instant = fromLocalInputValue(localValue, timezone);
+  if (!instant) throw new Error(`Unable to build ${timezone} test fixture: ${localValue}`);
+  return instant;
 }
 
 function task(overrides: Partial<Task>): Task {
@@ -156,9 +164,13 @@ const scholarshipEvidence: KnowledgeEvidence = {
   applicable_group: "2026级本科生",
 };
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  setCurrentUserSettings(DEFAULT_USER_SETTINGS);
+});
 
 beforeEach(() => {
+  setCurrentUserSettings(DEFAULT_USER_SETTINGS);
   useAssistantStore.getState().reset();
   mocks.push.mockReset();
   mocks.listTasks.mockReset().mockResolvedValue({ items: [], total: 0 });

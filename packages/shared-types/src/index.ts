@@ -35,7 +35,7 @@ export type TaskCreate = Pick<Task, "title"> &
     >
   >;
 export type TaskUpdate = Partial<Omit<TaskCreate, "source_type"> & Pick<Task, "status">> & {
-  expected_version?: number;
+  expected_version: number;
 };
 
 export interface CalendarEvent {
@@ -45,9 +45,9 @@ export interface CalendarEvent {
   description: string | null;
   course: string | null;
   start_at: ISODateTime;
-  end_at: ISODateTime | null;
+  end_at: ISODateTime;
   location: string | null;
-  reminder_minutes: number | null;
+  reminder_minutes: number;
   source_type: SourceType;
   source_document_id: string | null;
   created_at: ISODateTime;
@@ -68,9 +68,12 @@ export type CalendarEventCreate = Pick<CalendarEvent, "title" | "start_at"> &
       | "source_document_id"
     >
   >;
-export type CalendarEventUpdate = Partial<Omit<CalendarEventCreate, "source_type">> & {
-  expected_version?: number;
-};
+export type CalendarEventUpdate = Partial<
+  Omit<CalendarEventCreate, "source_type" | "end_at" | "reminder_minutes"> & {
+    end_at: ISODateTime;
+    reminder_minutes: number;
+  }
+> & { expected_version: number };
 
 export interface EventConflict {
   event_id: string;
@@ -159,6 +162,18 @@ export interface UserSettings {
   asr_device: string;
   updated_at?: ISODateTime;
 }
+
+export type UserSettingsUpdate = Partial<
+  Pick<
+    UserSettings,
+    | "major"
+    | "grade"
+    | "current_courses"
+    | "teacher_names"
+    | "default_reminder_minutes"
+    | "timezone"
+  >
+>;
 
 export type IntentName =
   | "create_task"

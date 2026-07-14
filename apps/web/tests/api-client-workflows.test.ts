@@ -473,7 +473,9 @@ describe("authenticated API workflows", () => {
       }),
     );
 
-    await expect(api.tasks.update("task/unsafe", { title: "不会写入" })).rejects.toMatchObject({
+    await expect(
+      api.tasks.update("task/unsafe", { title: "不会写入", expected_version: 1 }),
+    ).rejects.toMatchObject({
       status: 409,
       message: "写入确认策略与请求不匹配，操作未执行。",
     });
@@ -522,7 +524,10 @@ describe("authenticated API workflows", () => {
       start_at: "2026-07-18T09:30:00+08:00",
       end_at: "2026-07-18T10:30:00+08:00",
     });
-    const updated = await api.events.update("event/1", { location: "A302" });
+    const updated = await api.events.update("event/1", {
+      location: "A302",
+      expected_version: 1,
+    });
 
     expect(conflict).toEqual({
       has_conflict: true,

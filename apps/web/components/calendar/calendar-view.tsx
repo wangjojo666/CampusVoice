@@ -7,6 +7,9 @@ import interactionPlugin from "@fullcalendar/interaction";
 import FullCalendar from "@fullcalendar/react";
 import timeGridPlugin from "@fullcalendar/timegrid";
 
+import { fromLocalInputValue, toLocalInputValue } from "@/lib/format";
+import { useUserSettings } from "@/lib/user-settings";
+
 export function CalendarView({
   events,
   onEventClick,
@@ -16,6 +19,7 @@ export function CalendarView({
   onEventClick: (event: CalendarEvent) => void;
   onDateClick: (date: Date) => void;
 }>) {
+  const userSettings = useUserSettings();
   const byId = new Map(events.map((event) => [event.id, event]));
   return (
     <FullCalendar
@@ -36,8 +40,8 @@ export function CalendarView({
       events={events.map((event) => ({
         id: event.id,
         title: event.title,
-        start: event.start_at,
-        end: event.end_at ?? undefined,
+        start: toLocalInputValue(event.start_at, userSettings.timezone),
+        end: toLocalInputValue(event.end_at, userSettings.timezone) || undefined,
         backgroundColor: event.course ? "#159b82" : "#52636f",
         borderColor: event.course ? "#159b82" : "#52636f",
       }))}
@@ -45,7 +49,11 @@ export function CalendarView({
         const source = byId.get(event.id);
         if (source) onEventClick(source);
       }}
-      dateClick={({ date }) => onDateClick(date)}
+      dateClick={({ dateStr }) => {
+        const localValue = dateStr.length === 10 ? `${dateStr}T00:00` : dateStr.slice(0, 16);
+        const instant = fromLocalInputValue(localValue, userSettings.timezone);
+        if (instant) onDateClick(new Date(instant));
+      }}
     />
   );
 }

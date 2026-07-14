@@ -2,6 +2,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings
 from app.models.entities import UserSettings
 from app.repositories.settings import UserSettingsRepository
 from app.schemas.settings import (
@@ -21,17 +22,19 @@ class UserSettingsService:
         self,
         session: AsyncSession,
         user_id: str,
+        runtime_settings: Settings,
     ) -> UserSettingsView:
         entity = await self.repository.get(session, user_id)
         if entity is None:
             raise NotFoundError("user_settings", user_id)
-        return _to_view(entity)
+        return _to_view(entity, runtime_settings)
 
     async def update(
         self,
         session: AsyncSession,
         user_id: str,
         data: UserSettingsUpdate,
+        runtime_settings: Settings,
         *,
         confirmed: bool,
     ) -> UserSettingsMutationResponse:
@@ -56,24 +59,12 @@ class UserSettingsService:
             if "teacher_names" in fields:
                 entity.teacher_names = list(data.teacher_names or [])
                 expected["teacher_names"] = entity.teacher_names
-            asr = dict(entity.asr_model_config)
-            for request_name, storage_name in {
-                "asr_provider": "provider",
-                "asr_model": "model",
-                "asr_device": "device",
-            }.items():
-                if request_name in fields:
-                    value = getattr(data, request_name)
-                    asr[storage_name] = value
-                    expected[request_name] = value
-            entity.asr_model_config = asr
-
         session.expire_all()
         verified_entity = await self.repository.get(session, user_id)
         if verified_entity is None:
             await session.rollback()
             raise VerificationFailedError({"reason": "settings row disappeared after commit"})
-        verified_view = _to_view(verified_entity)
+        verified_view = _to_view(verified_entity, runtime_settings)
         actual = verified_view.model_dump(mode="json")
         verified_fields = {
             name: _normalize_expected(value) == actual.get(name) for name, value in expected.items()
@@ -91,8 +82,7 @@ class UserSettingsService:
         )
 
 
-def _to_view(entity: UserSettings) -> UserSettingsView:
-    asr = entity.asr_model_config
+def _to_view(entity: UserSettings, runtime_settings: Settings) -> UserSettingsView:
     return UserSettingsView(
         major=entity.major,
         grade=entity.grade,
@@ -100,9 +90,9 @@ def _to_view(entity: UserSettings) -> UserSettingsView:
         teacher_names=entity.teacher_names,
         default_reminder_minutes=entity.default_reminder_minutes,
         timezone=entity.timezone,
-        asr_provider=str(asr.get("provider", "disabled")),
-        asr_model=str(asr.get("model", "paraformer-zh-streaming")),
-        asr_device=str(asr.get("device", "cpu")),
+        asr_provider=runtime_settings.asr_provider,
+        asr_model=runtime_settings.asr_model,
+        asr_device=runtime_settings.asr_device,
         updated_at=entity.updated_at,
     )
 

@@ -1,18 +1,24 @@
-import type { IntentResult } from "@campusvoice/shared-types";
+import type { IntentResult, UserSettings } from "@campusvoice/shared-types";
+
+import { fromLocalInputValue } from "@/lib/format";
+import { getCurrentUserSettings } from "@/lib/user-settings";
 
 function slotText(value: unknown) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-function shanghaiDateTime(dateValue: unknown, timeValue: unknown) {
+function zonedDateTime(dateValue: unknown, timeValue: unknown, timeZone: string) {
   const date = slotText(dateValue);
   const time = slotText(timeValue);
   if (!date || !time) return null;
-  const timestamp = new Date(`${date}T${time.length === 5 ? `${time}:00` : time}+08:00`);
-  return Number.isNaN(timestamp.getTime()) ? null : timestamp.toISOString();
+  return fromLocalInputValue(`${date}T${time.slice(0, 5)}`, timeZone);
 }
 
-export function actionRequestFrom(intent: IntentResult, sourceDocumentId?: string | null) {
+export function actionRequestFrom(
+  intent: IntentResult,
+  sourceDocumentId?: string | null,
+  preferences: Pick<UserSettings, "timezone"> = getCurrentUserSettings(),
+) {
   const slots = intent.slots;
   const taskAction = intent.intent.endsWith("_task");
   const deleting = intent.intent.startsWith("delete_");
@@ -52,11 +58,11 @@ export function actionRequestFrom(intent: IntentResult, sourceDocumentId?: strin
       if (newTitle) payload.title = newTitle;
     }
     if (taskAction && !payload.due_at)
-      payload.due_at = shanghaiDateTime(slots.due_date, slots.due_time);
+      payload.due_at = zonedDateTime(slots.due_date, slots.due_time, preferences.timezone);
     if (!taskAction && !payload.start_at)
-      payload.start_at = shanghaiDateTime(slots.date, slots.start_time);
+      payload.start_at = zonedDateTime(slots.date, slots.start_time, preferences.timezone);
     if (!taskAction && !payload.end_at)
-      payload.end_at = shanghaiDateTime(slots.date, slots.end_time);
+      payload.end_at = zonedDateTime(slots.date, slots.end_time, preferences.timezone);
     Object.keys(payload).forEach((key) => payload[key] === null && delete payload[key]);
     if (sourceDocumentId) payload.source_document_id = sourceDocumentId;
     if (creating) payload.source_type = sourceDocumentId ? "document" : "voice";

@@ -11,6 +11,7 @@ from app.core.metrics import InMemoryMetrics, observe_component
 from app.schemas.knowledge import (
     ApplicabilityConflict,
     DocumentChunk,
+    DocumentFileType,
     DocumentMetadata,
     DocumentRecord,
     KnowledgeAskResponse,
@@ -19,7 +20,15 @@ from app.schemas.knowledge import (
     VersionConflict,
 )
 from app.services.knowledge.answering import KnowledgeAnswerer, KnowledgeAnswererError
-from app.services.knowledge.parser import DocumentParseError, parse_document, split_sections
+from app.services.knowledge.parser import (
+    DEFAULT_DOCUMENT_LIMITS,
+    DocumentLimitError,
+    DocumentLimits,
+    DocumentParseError,
+    ParsedSection,
+    parse_document,
+    split_sections,
+)
 from app.services.knowledge.retrieval import ChunkRetriever, LexicalRetriever
 
 
@@ -49,6 +58,15 @@ class InMemoryKnowledgeRepository:
         return sorted(self._chunks.values(), key=lambda item: (item.document_id, item.ordinal))
 
 
+def _parse_and_split_document(
+    content: bytes,
+    file_type: DocumentFileType,
+    limits: DocumentLimits,
+) -> list[ParsedSection]:
+    sections = parse_document(content, file_type, limits=limits)
+    return split_sections(sections, max_chunks=limits.max_chunks)
+
+
 class KnowledgeService:
     def __init__(
         self,
@@ -57,11 +75,13 @@ class KnowledgeService:
         retriever: ChunkRetriever | None = None,
         answerer: KnowledgeAnswerer | None = None,
         metrics: InMemoryMetrics | None = None,
+        document_limits: DocumentLimits = DEFAULT_DOCUMENT_LIMITS,
     ) -> None:
         self._repository = repository
         self._retriever = retriever or LexicalRetriever()
         self._answerer = answerer
         self._metrics = metrics
+        self._document_limits = document_limits
 
     async def ingest(
         self,
@@ -70,7 +90,12 @@ class KnowledgeService:
         metadata: DocumentMetadata,
         content: bytes,
     ) -> DocumentRecord:
-        sections = split_sections(parse_document(content, metadata.file_type))
+        sections = await asyncio.to_thread(
+            _parse_and_split_document,
+            content,
+            metadata.file_type,
+            self._document_limits,
+        )
         document_id = f"doc_{uuid4().hex}"
         chunks = [
             DocumentChunk(
@@ -341,6 +366,8 @@ def _applicable_group_matches(stored: str | None, requested: str) -> bool:
 
 
 __all__ = [
+    "DocumentLimitError",
+    "DocumentLimits",
     "DocumentParseError",
     "InMemoryKnowledgeRepository",
     "KnowledgeRepository",

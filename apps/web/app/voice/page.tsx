@@ -18,6 +18,8 @@ import { AsrRecorder } from "@/components/voice/asr-recorder";
 import { ClarificationCard } from "@/components/voice/clarification-card";
 import { CorrectionDiff } from "@/components/voice/correction-diff";
 import { ApiError, api } from "@/lib/api-client";
+import { formatDateTime } from "@/lib/format";
+import { useUserSettings } from "@/lib/user-settings";
 import { actionRequestFrom } from "@/lib/voice/action-request";
 import { useAssistantStore } from "@/stores/assistant-store";
 
@@ -62,6 +64,7 @@ function targetCandidates(action: PendingAction | null) {
 
 export default function VoicePage() {
   const store = useAssistantStore();
+  const userSettings = useUserSettings();
   const [scheduleResults, setScheduleResults] = useState<CalendarEvent[] | null>(null);
   const [voiceSessionId, setVoiceSessionId] = useState<string | null>(null);
   const [transcriptionId, setTranscriptionId] = useState<string | null>(null);
@@ -128,7 +131,7 @@ export default function VoicePage() {
         store.setError("当前意图不能作为可靠操作执行。");
         return;
       }
-      const normalized = actionRequestFrom(intent, store.sourceDocumentId);
+      const normalized = actionRequestFrom(intent, store.sourceDocumentId, userSettings);
       store.setWorkflowStatus("preparing");
       try {
         const action = await api.actions.prepare({
@@ -153,7 +156,15 @@ export default function VoicePage() {
         store.setError(reason instanceof ApiError ? reason.userMessage : "无法准备操作，请重试。");
       }
     },
-    [asrConfidence, execute, originalTranscript, store, transcriptionId, voiceSessionId],
+    [
+      asrConfidence,
+      execute,
+      originalTranscript,
+      store,
+      transcriptionId,
+      userSettings,
+      voiceSessionId,
+    ],
   );
 
   const analyze = useCallback(
@@ -537,7 +548,7 @@ export default function VoicePage() {
                     <div key={event.id} className="rounded-xl bg-mist-50 p-3">
                       <p className="text-sm font-bold text-ink-800">{event.title}</p>
                       <p className="mt-1 text-xs text-ink-400">
-                        {new Date(event.start_at).toLocaleString("zh-CN")}
+                        {formatDateTime(event.start_at, { timeZone: userSettings.timezone })}
                         {event.location ? ` · ${event.location}` : ""}
                       </p>
                     </div>
