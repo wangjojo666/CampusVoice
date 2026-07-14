@@ -14,10 +14,12 @@
 **/*.egg-info
 **/*.tsbuildinfo
 **/node_modules
+**/test-results
+**/playwright-report
 **/*.db
 **/*.db-shm
 **/*.db-wal
-coverage
+**/coverage
 data/evaluation/audio
 data/evaluation/results
 services/api/data/**

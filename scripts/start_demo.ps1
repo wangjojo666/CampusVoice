@@ -16,12 +16,132 @@ $ApiStdout = Join-Path $RuntimeRoot "api.stdout.log"
 $ApiStderr = Join-Path $RuntimeRoot "api.stderr.log"
 $WebStdout = Join-Path $RuntimeRoot "web.stdout.log"
 $WebStderr = Join-Path $RuntimeRoot "web.stderr.log"
+$DemoDataRoot = [IO.Path]::GetFullPath((Join-Path $ApiRoot "data"))
+$DemoDatabasePath = [IO.Path]::GetFullPath((Join-Path $DemoDataRoot "campusvoice.db"))
+$ManagedEnvironmentVariables = @(
+    "CAMPUSVOICE_ENV",
+    "CAMPUSVOICE_DATABASE_URL",
+    "CAMPUSVOICE_DATABASE_AUTO_CREATE",
+    "CAMPUSVOICE_AUTH_MODE",
+    "CAMPUSVOICE_ASR_PROVIDER",
+    "CAMPUSVOICE_ASR_QUOTA_BACKEND",
+    "CAMPUSVOICE_ASR_WORKER_COUNT",
+    "CAMPUSVOICE_STORE_RAW_AUDIO",
+    "CAMPUSVOICE_CORS_ORIGINS",
+    "NEXT_PUBLIC_API_BASE_URL",
+    "NEXT_PUBLIC_AUTH_MODE",
+    "NEXT_PUBLIC_ASR_WS_URL"
+)
 $Started = New-Object System.Collections.ArrayList
+$OwnedLogFiles = New-Object System.Collections.ArrayList
 $OwnsStateFile = $false
 $StartupDeadline = (Get-Date).AddSeconds($TimeoutSeconds)
 
 function Write-Step([string]$Message) {
     Write-Host "[CampusVoice] $Message" -ForegroundColor Cyan
+}
+
+function Get-ProcessEnvironmentSnapshot([string[]]$VariableNames) {
+    $Snapshot = [ordered]@{}
+    foreach ($VariableName in $VariableNames) {
+        $Snapshot[$VariableName] = [pscustomobject]@{
+            exists = Test-Path -LiteralPath "Env:$VariableName"
+            value = [Environment]::GetEnvironmentVariable(
+                $VariableName,
+                [System.EnvironmentVariableTarget]::Process
+            )
+        }
+    }
+    return $Snapshot
+}
+
+function Restore-ProcessEnvironment($Snapshot) {
+    foreach ($VariableName in $Snapshot.Keys) {
+        $Saved = $Snapshot[$VariableName]
+        $Value = if ($Saved.exists) { $Saved.value } else { $null }
+        [Environment]::SetEnvironmentVariable(
+            $VariableName,
+            $Value,
+            [System.EnvironmentVariableTarget]::Process
+        )
+    }
+}
+
+function Get-IsolatedDemoConfiguration([string]$DatabasePath = $DemoDatabasePath) {
+    $AllowedDataRoot = [IO.Path]::GetFullPath($DemoDataRoot)
+    $ResolvedDatabasePath = [IO.Path]::GetFullPath($DatabasePath)
+    $DatabaseParent = [IO.Path]::GetDirectoryName($ResolvedDatabasePath)
+    $PathComparison = if ($env:OS -eq "Windows_NT") {
+        [StringComparison]::OrdinalIgnoreCase
+    }
+    else {
+        [StringComparison]::Ordinal
+    }
+    if (-not [string]::Equals(
+            $DatabaseParent,
+            $AllowedDataRoot,
+            $PathComparison
+        )) {
+        throw "The demo database must stay directly inside this worktree's services/api/data directory."
+    }
+    foreach ($PathToInspect in @($AllowedDataRoot, $ResolvedDatabasePath)) {
+        if (Test-Path -LiteralPath $PathToInspect) {
+            $PathItem = Get-Item -Force -LiteralPath $PathToInspect
+            if (($PathItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "The demo database path must not use a symbolic link or junction."
+            }
+        }
+    }
+
+    $DatabaseUrlPath = $ResolvedDatabasePath.Replace("\", "/")
+    return [pscustomobject]@{
+        DatabasePath = $ResolvedDatabasePath
+        DatabaseUrl = "sqlite+aiosqlite:///$DatabaseUrlPath"
+        Environment = "development"
+        AuthMode = "demo"
+        AsrProvider = "disabled"
+        ApiBaseUrl = "http://localhost:8000"
+        AsrWebSocketUrl = "ws://localhost:8000/ws/asr"
+    }
+}
+
+function Set-IsolatedDemoEnvironment($Configuration) {
+    $Values = [ordered]@{
+        CAMPUSVOICE_ENV = $Configuration.Environment
+        CAMPUSVOICE_DATABASE_URL = $Configuration.DatabaseUrl
+        CAMPUSVOICE_DATABASE_AUTO_CREATE = "false"
+        CAMPUSVOICE_AUTH_MODE = $Configuration.AuthMode
+        CAMPUSVOICE_ASR_PROVIDER = $Configuration.AsrProvider
+        CAMPUSVOICE_ASR_QUOTA_BACKEND = "local"
+        CAMPUSVOICE_ASR_WORKER_COUNT = "1"
+        CAMPUSVOICE_STORE_RAW_AUDIO = "false"
+        CAMPUSVOICE_CORS_ORIGINS = '["http://localhost:3000","http://127.0.0.1:3000"]'
+        NEXT_PUBLIC_API_BASE_URL = $Configuration.ApiBaseUrl
+        NEXT_PUBLIC_AUTH_MODE = $Configuration.AuthMode
+        NEXT_PUBLIC_ASR_WS_URL = $Configuration.AsrWebSocketUrl
+    }
+    foreach ($VariableName in $Values.Keys) {
+        [Environment]::SetEnvironmentVariable(
+            $VariableName,
+            [string]$Values[$VariableName],
+            [System.EnvironmentVariableTarget]::Process
+        )
+    }
+}
+
+function Invoke-WithDemoEnvironment(
+    [scriptblock]$Action,
+    [string]$DatabasePath = $DemoDatabasePath
+) {
+    $Snapshot = Get-ProcessEnvironmentSnapshot $ManagedEnvironmentVariables
+    try {
+        $Configuration = Get-IsolatedDemoConfiguration $DatabasePath
+        Set-IsolatedDemoEnvironment $Configuration
+        & $Action $Configuration
+    }
+    finally {
+        Restore-ProcessEnvironment $Snapshot
+    }
 }
 
 function Get-RecordValue($Record, [string]$Key) {
@@ -88,8 +208,8 @@ function Assert-PortFree([int]$Port) {
         Select-Object -First 1
     if ($Listener) {
         $Owner = Get-CimInstance Win32_Process -Filter "ProcessId=$($Listener.OwningProcess)" -ErrorAction SilentlyContinue
-        $Command = if ($Owner) { $Owner.CommandLine } else { "command line unavailable" }
-        throw "Port $Port is already used by PID $($Listener.OwningProcess): $Command"
+        $ProcessName = if ($Owner -and $Owner.Name) { $Owner.Name } else { "unknown process" }
+        throw "Port $Port is already used by PID $($Listener.OwningProcess) ($ProcessName)."
     }
 }
 
@@ -172,6 +292,11 @@ function Start-TrackedProcess(
     $Process = Start-Process -FilePath $FilePath -ArgumentList $Arguments `
         -WorkingDirectory $WorkingDirectory -WindowStyle Hidden `
         -RedirectStandardOutput $Stdout -RedirectStandardError $Stderr -PassThru
+    foreach ($LogPath in @($Stdout, $Stderr)) {
+        if (-not $OwnedLogFiles.Contains($LogPath)) {
+            [void]$OwnedLogFiles.Add($LogPath)
+        }
+    }
     $Record = [ordered]@{
         name = $Name
         pid = $Process.Id
@@ -305,114 +430,123 @@ function Show-LogTail([string]$Path) {
     }
 }
 
-try {
-    [IO.Directory]::CreateDirectory($RuntimeRoot) | Out-Null
-    if (Test-Path -LiteralPath $StateFile) {
-        $Existing = Get-Content -Raw -LiteralPath $StateFile | ConvertFrom-Json
-        $Running = @($Existing.processes | Where-Object { Get-Process -Id $_.pid -ErrorAction SilentlyContinue })
-        if ($Running.Count -gt 0) {
-            throw "This worktree already has recorded demo processes. Run scripts/stop_demo.ps1 first."
+function Invoke-CampusVoiceDemo {
+    $script:Started = New-Object System.Collections.ArrayList
+    $script:OwnedLogFiles = New-Object System.Collections.ArrayList
+    $script:OwnsStateFile = $false
+    $script:StartupDeadline = (Get-Date).AddSeconds($TimeoutSeconds)
+
+    try {
+        Invoke-WithDemoEnvironment -Action {
+            param($DemoConfiguration)
+
+            [IO.Directory]::CreateDirectory($RuntimeRoot) | Out-Null
+            Write-Step "Using isolated local demo configuration"
+            Write-Host "Database target: $($DemoConfiguration.DatabasePath)"
+            Write-Host "Environment: development; auth: demo; ASR: disabled (local quota)"
+
+            if (Test-Path -LiteralPath $StateFile) {
+                $Existing = Get-Content -Raw -LiteralPath $StateFile | ConvertFrom-Json
+                $Running = @($Existing.processes | Where-Object { Get-Process -Id $_.pid -ErrorAction SilentlyContinue })
+                if ($Running.Count -gt 0) {
+                    throw "This worktree already has recorded demo processes. Run scripts/stop_demo.ps1 first."
+                }
+                Remove-Item -LiteralPath $StateFile -Force
+            }
+
+            Assert-PortFree 8000
+            Assert-PortFree 3000
+            $Python = Resolve-Python311
+            $Pnpm = (Get-Command pnpm -ErrorAction Stop).Source
+            $Node = (Get-Command node -ErrorAction Stop).Source
+
+            Write-Step "Checking Python, Node, pnpm, and project dependencies"
+            Write-Host "Python: $(& $Python --version 2>&1)"
+            Write-Host "Node: $(& $Node --version 2>&1)"
+            Write-Host "pnpm: $(& $Pnpm --version 2>&1)"
+            Invoke-Checked "Checking API dependencies" $Python @(
+                "-c",
+                "import alembic, fastapi, httpx, sqlalchemy, uvicorn"
+            ) $ApiRoot
+            Invoke-Checked "Checking Next.js dependencies" $Pnpm @(
+                "--filter", "@campusvoice/web", "exec", "next", "--version"
+            ) $RepoRoot
+
+            Invoke-Checked "Applying Alembic migrations" $Python @("-m", "alembic", "upgrade", "head") $ApiRoot
+
+            Write-Step "Starting API"
+            $ApiMarker = [IO.Path]::GetFullPath($ApiRoot)
+            $Api = Start-TrackedProcess "api" $Python @(
+                "-m", "uvicorn", "app.main:app",
+                "--app-dir", $ApiMarker,
+                "--host", "127.0.0.1",
+                "--port", "8000"
+            ) $ApiRoot $ApiStdout $ApiStderr $ApiMarker
+            Wait-Http "API liveness check" "http://localhost:8000/health/live" ([int]$Api.pid)
+            Wait-Http "API readiness check" "http://localhost:8000/health/ready" ([int]$Api.pid)
+
+            Invoke-Checked "Loading idempotent synthetic demo data" $Python @(
+                (Join-Path $RepoRoot "scripts/seed_demo.py"),
+                "--base-url", "http://localhost:8000",
+                "--request-timeout-seconds", "5"
+            ) $RepoRoot
+
+            Write-Step "Starting Web"
+            $EscapedRepo = $RepoRoot.Replace("'", "''")
+            $EscapedPnpm = $Pnpm.Replace("'", "''")
+            $WebCommand = "Set-Location -LiteralPath '$EscapedRepo'; & '$EscapedPnpm' --filter '@campusvoice/web' exec next dev -H localhost -p 3000"
+            $EncodedWebCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($WebCommand))
+            $Web = Start-TrackedProcess "web" "powershell.exe" @(
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $EncodedWebCommand
+            ) $RepoRoot $WebStdout $WebStderr $EncodedWebCommand
+            Wait-Http "Web homepage check" "http://localhost:3000/" ([int]$Web.pid)
+
+            Write-Host ""
+            Write-Host "CampusVoice demo is ready" -ForegroundColor Green
+            Write-Host "Home:          http://localhost:3000/"
+            Write-Host "Voice:         http://localhost:3000/voice"
+            Write-Host "Recognition:   http://localhost:3000/settings"
+            Write-Host "API docs:      http://localhost:8000/docs"
+            Write-Host "Process state: $StateFile"
+            Write-Host "Stop command:  powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop_demo.ps1"
         }
-        Remove-Item -LiteralPath $StateFile -Force
     }
-
-    Assert-PortFree 8000
-    Assert-PortFree 3000
-    $Python = Resolve-Python311
-    $Pnpm = (Get-Command pnpm -ErrorAction Stop).Source
-    $Node = (Get-Command node -ErrorAction Stop).Source
-
-    Write-Step "Checking Python, Node, pnpm, and project dependencies"
-    Write-Host "Python: $(& $Python --version 2>&1)"
-    Write-Host "Node: $(& $Node --version 2>&1)"
-    Write-Host "pnpm: $(& $Pnpm --version 2>&1)"
-    Invoke-Checked "Checking API dependencies" $Python @(
-        "-c",
-        "import alembic, fastapi, httpx, sqlalchemy, uvicorn"
-    ) $ApiRoot
-    Invoke-Checked "Checking Next.js dependencies" $Pnpm @(
-        "--filter", "@campusvoice/web", "exec", "next", "--version"
-    ) $RepoRoot
-
-    if (-not $env:CAMPUSVOICE_DATABASE_URL) {
-        $env:CAMPUSVOICE_DATABASE_URL = "sqlite+aiosqlite:///./data/campusvoice.db"
+    catch {
+        $CleanupRecords = @($Started)
+        [array]::Reverse($CleanupRecords)
+        $CleanupComplete = $true
+        $RemainingRecords = New-Object System.Collections.ArrayList
+        foreach ($Record in $CleanupRecords) {
+            $CleanupResult = Stop-TrackedProcess $Record
+            if (-not $CleanupResult.success) {
+                $CleanupComplete = $false
+            }
+            foreach ($RemainingRecord in @($CleanupResult.records)) {
+                [void]$RemainingRecords.Add($RemainingRecord)
+            }
+        }
+        foreach ($LogPath in @($OwnedLogFiles | Where-Object { $_ -like "*.stderr.log" })) {
+            Show-LogTail $LogPath
+        }
+        if ($OwnsStateFile -and $CleanupComplete -and (Test-Path -LiteralPath $StateFile)) {
+            Remove-Item -LiteralPath $StateFile -Force
+        }
+        elseif ($OwnsStateFile -and -not $CleanupComplete) {
+            Save-State -Processes ([object[]]@($RemainingRecords))
+            Write-Warning "Cleanup was incomplete; the state file and logs were retained for review."
+        }
+        if ($CleanupComplete) {
+            foreach ($LogPath in @($OwnedLogFiles)) {
+                Remove-Item -LiteralPath $LogPath -Force -ErrorAction SilentlyContinue
+                if (Test-Path -LiteralPath $LogPath) {
+                    Write-Warning "Failed to remove owned runtime log: $LogPath"
+                }
+            }
+        }
+        throw
     }
-    if (-not $env:CAMPUSVOICE_DATABASE_AUTO_CREATE) {
-        $env:CAMPUSVOICE_DATABASE_AUTO_CREATE = "false"
-    }
-    if (-not $env:CAMPUSVOICE_AUTH_MODE) {
-        $env:CAMPUSVOICE_AUTH_MODE = "demo"
-    }
-    if (-not $env:CAMPUSVOICE_ASR_PROVIDER) {
-        $env:CAMPUSVOICE_ASR_PROVIDER = "disabled"
-    }
-    $env:CAMPUSVOICE_CORS_ORIGINS = '["http://localhost:3000","http://127.0.0.1:3000"]'
-    $env:NEXT_PUBLIC_API_BASE_URL = "http://localhost:8000"
-    $env:NEXT_PUBLIC_AUTH_MODE = "demo"
-
-    Invoke-Checked "Applying Alembic migrations" $Python @("-m", "alembic", "upgrade", "head") $ApiRoot
-
-    Write-Step "Starting API"
-    $ApiMarker = [IO.Path]::GetFullPath($ApiRoot)
-    $Api = Start-TrackedProcess "api" $Python @(
-        "-m", "uvicorn", "app.main:app",
-        "--app-dir", $ApiMarker,
-        "--host", "127.0.0.1",
-        "--port", "8000"
-    ) $ApiRoot $ApiStdout $ApiStderr $ApiMarker
-    Wait-Http "API liveness check" "http://localhost:8000/health/live" ([int]$Api.pid)
-    Wait-Http "API readiness check" "http://localhost:8000/health/ready" ([int]$Api.pid)
-
-    Invoke-Checked "Loading idempotent synthetic demo data" $Python @(
-        (Join-Path $RepoRoot "scripts/seed_demo.py"),
-        "--base-url", "http://localhost:8000",
-        "--request-timeout-seconds", "5"
-    ) $RepoRoot
-
-    Write-Step "Starting Web"
-    $EscapedRepo = $RepoRoot.Replace("'", "''")
-    $EscapedPnpm = $Pnpm.Replace("'", "''")
-    $WebCommand = "Set-Location -LiteralPath '$EscapedRepo'; & '$EscapedPnpm' --filter '@campusvoice/web' exec next dev -H localhost -p 3000"
-    $EncodedWebCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($WebCommand))
-    $Web = Start-TrackedProcess "web" "powershell.exe" @(
-        "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $EncodedWebCommand
-    ) $RepoRoot $WebStdout $WebStderr $EncodedWebCommand
-    Wait-Http "Web homepage check" "http://localhost:3000/" ([int]$Web.pid)
-
-    Write-Host ""
-    Write-Host "CampusVoice demo is ready" -ForegroundColor Green
-    Write-Host "Home:          http://localhost:3000/"
-    Write-Host "Voice:         http://localhost:3000/voice"
-    Write-Host "Recognition:   http://localhost:3000/settings"
-    Write-Host "API docs:      http://localhost:8000/docs"
-    Write-Host "Process state: $StateFile"
-    Write-Host "Stop command:  powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop_demo.ps1"
 }
-catch {
-    Write-Error $_.Exception.Message -ErrorAction Continue
-    $CleanupRecords = @($Started)
-    [array]::Reverse($CleanupRecords)
-    $CleanupComplete = $true
-    $RemainingRecords = New-Object System.Collections.ArrayList
-    foreach ($Record in $CleanupRecords) {
-        $CleanupResult = Stop-TrackedProcess $Record
-        if (-not $CleanupResult.success) {
-            $CleanupComplete = $false
-        }
-        foreach ($RemainingRecord in @($CleanupResult.records)) {
-            [void]$RemainingRecords.Add($RemainingRecord)
-        }
-    }
-    if ($Started.Count -gt 0) {
-        Show-LogTail $ApiStderr
-        Show-LogTail $WebStderr
-    }
-    if ($OwnsStateFile -and $CleanupComplete -and (Test-Path -LiteralPath $StateFile)) {
-        Remove-Item -LiteralPath $StateFile -Force
-    }
-    elseif ($OwnsStateFile -and -not $CleanupComplete) {
-        Save-State -Processes ([object[]]@($RemainingRecords))
-        Write-Warning "Cleanup was incomplete; the state file was retained for review."
-    }
-    exit 1
+
+if ($MyInvocation.InvocationName -ne ".") {
+    Invoke-CampusVoiceDemo
 }

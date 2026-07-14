@@ -39,7 +39,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start_demo.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop_demo.ps1
 ```
 
-脚本不会创建 `.env`、下载模型或终止其他 Node/Python 进程。若 Python 3.11 不在默认候选位置，可向启动脚本传入 `-PythonExecutable C:\path\to\python.exe`。
+脚本不会创建 `.env`、下载模型或终止其他 Node/Python 进程。一键启动始终使用 `development` 环境、本工作树内的本地 SQLite 演示库、`DATABASE_AUTO_CREATE=false`、API/Web 一致的 `demo` 认证、`disabled` ASR、本地 ASR 配额和 `localhost` 端点；调用终端中的同名环境变量不会改变这些默认值，脚本退出时会恢复原值。外部或自定义数据库不受一键脚本支持，请使用下方手工开发流程。若 Python 3.11 不在默认候选位置，可向启动脚本传入 `-PythonExecutable C:\path\to\python.exe`。
 
 以下手工流程保留用于开发调试：
 
