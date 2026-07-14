@@ -36,8 +36,18 @@ function Get-TrackedProcessRecordStatus($Record) {
         }
     }
 
-    $Root = Get-CimInstance Win32_Process -Filter "ProcessId=$RecordPid" -ErrorAction SilentlyContinue
-    if (-not $Root) {
+    $CimFailed = $false
+    try {
+        $Root = Get-CimInstance Win32_Process -Filter "ProcessId=$RecordPid" -ErrorAction Stop
+    }
+    catch {
+        $CimFailed = $true
+        $Root = $null
+    }
+    if ($CimFailed) {
+        $Status = "unverifiable"
+    }
+    elseif (-not $Root) {
         $Status = "exited"
     }
     elseif (-not $Root.CommandLine) {

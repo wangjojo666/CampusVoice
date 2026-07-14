@@ -91,6 +91,20 @@ def _assert_restored(
             assert state["Value"] is None
 
 
+def test_default_startup_budget_covers_a_cold_frontend_compile(tmp_path: Path) -> None:
+    repo_root, script_path = _copy_start_script(tmp_path)
+    payload = _run_powershell_json(
+        repo_root,
+        script_path,
+        r"""
+        . '__START_DEMO__'
+        [pscustomobject]@{ TimeoutSeconds = $TimeoutSeconds } | ConvertTo-Json -Compress
+        """,
+    )
+
+    assert payload["TimeoutSeconds"] == 120
+
+
 @pytest.mark.skipif(os.name != "nt", reason="start_demo.ps1 launches Windows processes")
 def test_tracked_process_preserves_windows_arguments_with_spaces_quotes_and_backslashes(
     tmp_path: Path,
@@ -162,17 +176,22 @@ def test_stale_pid_marker_state_is_removed_without_stopping_the_process(tmp_path
 
         [IO.Directory]::CreateDirectory($RuntimeRoot) | Out-Null
         $Marker = 'expected-campusvoice-marker'
-        $script:MockCommandLine = 'unrelated-process --serve'
+        $global:CampusVoiceMockCommandLine = 'unrelated-process --serve'
+        $global:CampusVoiceMockCimFailure = $false
         function Get-CimInstance {
             [CmdletBinding()]
             param(
                 [Parameter(Position = 0)][string]$ClassName,
                 [string]$Filter
             )
+            if ($global:CampusVoiceMockCimFailure) {
+                Write-Error 'forced CIM failure'
+                return $null
+            }
             return [pscustomobject]@{
                 ProcessId = 4242
                 ParentProcessId = 1
-                CommandLine = $script:MockCommandLine
+                CommandLine = $global:CampusVoiceMockCommandLine
                 Name = 'unrelated.exe'
             }
         }
@@ -201,7 +220,7 @@ def test_stale_pid_marker_state_is_removed_without_stopping_the_process(tmp_path
         }
 
         Write-TestState
-        $script:MockCommandLine = "python -m uvicorn --app-dir $Marker"
+        $global:CampusVoiceMockCommandLine = "python -m uvicorn --app-dir $Marker"
         $MatchingFailure = $null
         try {
             Assert-NoRecordedDemoProcesses
@@ -213,7 +232,20 @@ def test_stale_pid_marker_state_is_removed_without_stopping_the_process(tmp_path
         Remove-Item -LiteralPath $StateFile -Force
 
         Write-TestState
-        $script:MockCommandLine = 'unrelated-process --serve'
+        $global:CampusVoiceMockCimFailure = $true
+        $UnverifiableFailure = $null
+        try {
+            Assert-NoRecordedDemoProcesses
+        }
+        catch {
+            $UnverifiableFailure = $_.Exception.Message
+        }
+        $UnverifiableStateExists = Test-Path -LiteralPath $StateFile
+        $global:CampusVoiceMockCimFailure = $false
+        Remove-Item -LiteralPath $StateFile -Force
+
+        Write-TestState
+        $global:CampusVoiceMockCommandLine = 'unrelated-process --serve'
         Assert-NoRecordedDemoProcesses
         $StartRemovedStaleState = -not (Test-Path -LiteralPath $StateFile)
 
@@ -224,6 +256,8 @@ def test_stale_pid_marker_state_is_removed_without_stopping_the_process(tmp_path
         [pscustomobject]@{
             MatchingFailure = $MatchingFailure
             MatchingStateExists = $MatchingStateExists
+            UnverifiableFailure = $UnverifiableFailure
+            UnverifiableStateExists = $UnverifiableStateExists
             StartRemovedStaleState = $StartRemovedStaleState
             StopRemovedStaleState = $StopRemovedStaleState
         } | ConvertTo-Json -Compress
@@ -232,6 +266,8 @@ def test_stale_pid_marker_state_is_removed_without_stopping_the_process(tmp_path
 
     assert "already has recorded demo processes" in payload["MatchingFailure"]
     assert payload["MatchingStateExists"] is True
+    assert "already has recorded demo processes" in payload["UnverifiableFailure"]
+    assert payload["UnverifiableStateExists"] is True
     assert payload["StartRemovedStaleState"] is True
     assert payload["StopRemovedStaleState"] is True
 

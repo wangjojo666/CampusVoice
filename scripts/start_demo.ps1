@@ -1,8 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$PythonExecutable = $env:CAMPUSVOICE_PYTHON,
-    [ValidateRange(10, 45)]
-    [int]$TimeoutSeconds = 45
+    [ValidateRange(10, 300)]
+    [int]$TimeoutSeconds = 120
 )
 
 Set-StrictMode -Version Latest
@@ -217,8 +217,18 @@ function Get-TrackedProcessRecordStatus($Record) {
         }
     }
 
-    $Root = Get-CimInstance Win32_Process -Filter "ProcessId=$RecordPid" -ErrorAction SilentlyContinue
-    if (-not $Root) {
+    $CimFailed = $false
+    try {
+        $Root = Get-CimInstance Win32_Process -Filter "ProcessId=$RecordPid" -ErrorAction Stop
+    }
+    catch {
+        $CimFailed = $true
+        $Root = $null
+    }
+    if ($CimFailed) {
+        $Status = "unverifiable"
+    }
+    elseif (-not $Root) {
         $Status = "exited"
     }
     elseif (-not $Root.CommandLine) {
