@@ -110,7 +110,7 @@ def test_demo_main_isolates_ambient_configuration_and_restores_it(tmp_path: Path
         $OuterSnapshot = Get-ProcessEnvironmentSnapshot $ManagedEnvironmentVariables
         try {
             foreach ($VariableName in $ManagedEnvironmentVariables) {
-                [Environment]::SetEnvironmentVariable($VariableName, $null, 'Process')
+                Remove-Item -LiteralPath "Env:$VariableName" -ErrorAction SilentlyContinue
             }
             foreach ($Entry in $Sentinels.GetEnumerator()) {
                 [Environment]::SetEnvironmentVariable($Entry.Key, $Entry.Value, 'Process')
@@ -294,7 +294,7 @@ def test_demo_main_isolates_ambient_configuration_and_restores_it(tmp_path: Path
     web_command = base64.b64decode(encoded_web_command).decode("utf-16-le")
     assert f"Set-Location -LiteralPath '{repo_root}'" in web_command
     assert "--filter '@campusvoice/web' exec next dev -H localhost -p 3000" in web_command
-    assert str(Path(sys.executable).resolve()) in web_command
+    assert sys.executable in web_command
     assert Path(web_process["WorkingDirectory"]).resolve() == repo_root.resolve()
 
     http_calls = [call for call in calls if call["Kind"] == "http"]
@@ -357,7 +357,7 @@ def test_demo_failure_restores_environment_and_removes_owned_runtime_files(
         $OuterSnapshot = Get-ProcessEnvironmentSnapshot $ManagedEnvironmentVariables
         try {
             foreach ($VariableName in $ManagedEnvironmentVariables) {
-                [Environment]::SetEnvironmentVariable($VariableName, $null, 'Process')
+                Remove-Item -LiteralPath "Env:$VariableName" -ErrorAction SilentlyContinue
             }
             foreach ($Entry in $Sentinels.GetEnumerator()) {
                 [Environment]::SetEnvironmentVariable($Entry.Key, $Entry.Value, 'Process')

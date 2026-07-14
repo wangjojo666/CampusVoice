@@ -58,12 +58,16 @@ function Get-ProcessEnvironmentSnapshot([string[]]$VariableNames) {
 function Restore-ProcessEnvironment($Snapshot) {
     foreach ($VariableName in $Snapshot.Keys) {
         $Saved = $Snapshot[$VariableName]
-        $Value = if ($Saved.exists) { $Saved.value } else { $null }
-        [Environment]::SetEnvironmentVariable(
-            $VariableName,
-            $Value,
-            [System.EnvironmentVariableTarget]::Process
-        )
+        if ($Saved.exists) {
+            [Environment]::SetEnvironmentVariable(
+                $VariableName,
+                $Saved.value,
+                [System.EnvironmentVariableTarget]::Process
+            )
+        }
+        else {
+            Remove-Item -LiteralPath "Env:$VariableName" -ErrorAction SilentlyContinue
+        }
     }
 }
 
