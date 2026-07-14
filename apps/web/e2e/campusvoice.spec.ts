@@ -628,7 +628,7 @@ async function installSyntheticAudioAndWebSocket(page: Page) {
 test("01 仪表盘展示 REST 返回的今日任务、日程和已验证操作", async ({ page }) => {
   await installApiMocks(page);
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: "今天，准备从哪一步开始？" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "说一句，校园安排自动落地" })).toBeVisible();
   await expect(page.getByText("复习机器学习", { exact: true })).toBeVisible();
   await expect(page.getByText("机器学习研讨课", { exact: true })).toBeVisible();
   await expect(page.getByText("待办写入已验证", { exact: true })).toBeVisible();
