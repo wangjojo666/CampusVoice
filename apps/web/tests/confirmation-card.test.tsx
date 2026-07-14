@@ -37,4 +37,30 @@ describe("ConfirmationCard", () => {
     );
     expect(screen.getByRole("button", { name: "确认操作" })).toBeDisabled();
   });
+
+  it("presents internal source and risk codes as user-facing Chinese", () => {
+    render(
+      <ConfirmationCard
+        action={{
+          ...highRiskAction,
+          risk_level: "medium",
+          risk_reasons: ["modifies_data"],
+          status: "awaiting_confirmation",
+          payload: {
+            title: "提交人工智能作业",
+            due_at: "2026-07-16T07:00:00.000Z",
+            reminder_at: "2026-07-15T07:00:00.000Z",
+            source_type: "manual",
+          },
+        }}
+        onConfirm={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("输入来源")).toBeInTheDocument();
+    expect(screen.getByText("文本演示")).toBeInTheDocument();
+    expect(screen.getByText("将写入或修改数据")).toBeInTheDocument();
+    expect(screen.queryByText("modifies_data")).not.toBeInTheDocument();
+  });
 });

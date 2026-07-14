@@ -1,15 +1,7 @@
 "use client";
 
 import type { ActionLog, CalendarEvent, Task } from "@campusvoice/shared-types";
-import {
-  ArrowRight,
-  CalendarClock,
-  CheckCircle2,
-  Circle,
-  Clock3,
-  Mic2,
-  Sparkles,
-} from "lucide-react";
+import { CalendarClock, CheckCircle2, Circle, Clock3, Mic2, Sparkles } from "lucide-react";
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
@@ -19,10 +11,18 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { ErrorState } from "@/components/ui/error-state";
 import { LoadingState } from "@/components/ui/loading-state";
 import { AsrRecorder } from "@/components/voice/asr-recorder";
+import { WorkflowSnapshot } from "@/components/voice/workflow-snapshot";
 import { ApiError, api } from "@/lib/api-client";
-import { formatDateTime, relativeTime, sameDayInTimeZone } from "@/lib/format";
+import { formatDateTime, relativeTime } from "@/lib/format";
 import { useUserSettings } from "@/lib/user-settings";
 import { useAssistantStore } from "@/stores/assistant-store";
+
+const VOICE_EXAMPLES = [
+  "创建日历事件：明天下午三点到四点在图书馆复习，提前半小时提醒我。",
+  "新建待办：后天下午三点提交人工智能作业，提前一天提醒我。",
+  "查询人工智能考试地点有没有变化。",
+  "安排明天上午九点的机器学习考试复习日程。",
+];
 
 export default function HomePage() {
   const userSettings = useUserSettings();
@@ -32,6 +32,9 @@ export default function HomePage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const setTranscript = useAssistantStore((state) => state.setTranscript);
+  const setInputMode = useAssistantStore((state) => state.setInputMode);
+  const clearResult = useAssistantStore((state) => state.clearResult);
+  const resetAssistant = useAssistantStore((state) => state.reset);
   const transcript = useAssistantStore((state) => state.transcript);
 
   const load = useCallback(async () => {
@@ -67,25 +70,17 @@ export default function HomePage() {
     return () => window.clearTimeout(timer);
   }, [load]);
 
-  const todayTasks = useMemo(
+  const upcomingTasks = useMemo(
     () =>
       tasks
-        .filter(
-          (task) =>
-            task.status !== "completed" &&
-            (sameDayInTimeZone(task.due_at, new Date(), userSettings.timezone) ||
-              task.due_at === null),
-        )
+        .filter((task) => task.status !== "completed")
+        .sort((a, b) => (a.due_at ?? "9999").localeCompare(b.due_at ?? "9999"))
         .slice(0, 5),
-    [tasks, userSettings.timezone],
+    [tasks],
   );
-  const todayEvents = useMemo(
-    () =>
-      events
-        .filter((event) => sameDayInTimeZone(event.start_at, new Date(), userSettings.timezone))
-        .sort((a, b) => a.start_at.localeCompare(b.start_at))
-        .slice(0, 5),
-    [events, userSettings.timezone],
+  const upcomingEvents = useMemo(
+    () => events.sort((a, b) => a.start_at.localeCompare(b.start_at)).slice(0, 5),
+    [events],
   );
   const dateLabel = new Intl.DateTimeFormat("zh-CN", {
     timeZone: userSettings.timezone,
@@ -98,8 +93,8 @@ export default function HomePage() {
     <div>
       <PageHeader
         eyebrow={dateLabel}
-        title="今天，准备从哪一步开始？"
-        description="说出任务或日程，声程会在执行前补全信息、检查风险，并在写入后重新验证。"
+        title="说一句，校园安排自动落地"
+        description="实时识别校园术语，自动纠错并理解为待办或日程；你确认后才写入，写入后可验证、可撤销。"
       />
 
       {error ? (
@@ -107,6 +102,82 @@ export default function HomePage() {
           <ErrorState message={error} onRetry={() => void load()} compact />
         </div>
       ) : null}
+
+      <section
+        className="surface relative mb-6 overflow-hidden p-5 sm:p-7 lg:p-8"
+        aria-labelledby="campus-voice-title"
+      >
+        <div className="pointer-events-none absolute -top-24 -right-20 size-80 rounded-full bg-teal-100/60 blur-3xl" />
+        <div className="pointer-events-none absolute -bottom-32 -left-16 size-72 rounded-full bg-gold-100/40 blur-3xl" />
+        <div className="relative grid items-center gap-7 lg:grid-cols-[minmax(0,.9fr)_minmax(380px,1.1fr)] lg:gap-10">
+          <div>
+            <div className="mb-4 flex items-center gap-3">
+              <span className="flex size-13 items-center justify-center rounded-2xl bg-teal-600 text-white shadow-[0_12px_30px_rgba(14,127,109,.24)]">
+                <Mic2 size={26} aria-hidden="true" />
+              </span>
+              <div>
+                <p className="text-xs font-bold tracking-[0.14em] text-teal-600 uppercase">
+                  校园语音识别
+                </p>
+                <p className="mt-0.5 text-xs font-semibold text-ink-400">
+                  语音是第一入口，可验证执行是核心价值
+                </p>
+              </div>
+            </div>
+            <h2
+              id="campus-voice-title"
+              className="max-w-xl text-2xl leading-tight font-extrabold tracking-[-0.035em] text-ink-950 sm:text-3xl"
+            >
+              直接说出任务、日程或校园问题
+            </h2>
+            <p className="mt-3 max-w-xl text-sm leading-6 text-ink-600 sm:text-[0.95rem]">
+              实时转写并识别课程、地点等校园热词；完成后继续理解与风险检查，所有写入都由你确认。
+            </p>
+
+            <div className="mt-5">
+              <p className="mb-1 text-xs font-bold text-ink-400">文本指令演示</p>
+              <p className="mb-2 text-[0.68rem] leading-5 text-ink-400">
+                点击只会填入文字，不会冒充语音识别结果。
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {VOICE_EXAMPLES.map((example) => {
+                  const selected = transcript === example;
+                  return (
+                    <button
+                      key={example}
+                      type="button"
+                      onClick={() => {
+                        clearResult();
+                        setTranscript(example);
+                        setInputMode("text_demo");
+                      }}
+                      aria-pressed={selected}
+                      className={`rounded-xl border px-3 py-2 text-left text-xs leading-5 font-semibold transition-colors ${selected ? "border-teal-200 bg-teal-50 text-teal-800" : "border-mist-200 bg-white/80 text-ink-600 hover:border-teal-100 hover:bg-teal-50/60"}`}
+                    >
+                      {example}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-[1.75rem] border border-white/80 bg-white/85 p-5 shadow-[0_18px_45px_rgba(34,56,68,.09)] backdrop-blur sm:p-6">
+            <AsrRecorder
+              compact
+              onTranscriptChange={(text) => {
+                clearResult();
+                setTranscript(text);
+                setInputMode("voice");
+              }}
+              onReset={() => {
+                resetAssistant();
+              }}
+            />
+            <WorkflowSnapshot />
+          </div>
+        </div>
+      </section>
 
       <CampusRadar />
 
@@ -117,9 +188,9 @@ export default function HomePage() {
           </span>
           <div>
             <p className="text-2xl font-extrabold text-ink-950">
-              {loading ? "—" : todayTasks.length}
+              {loading ? "—" : tasks.filter((task) => task.status !== "completed").length}
             </p>
-            <p className="text-xs font-semibold text-ink-400">今日待处理</p>
+            <p className="text-xs font-semibold text-ink-400">待处理事项</p>
           </div>
         </div>
         <div className="surface flex items-center gap-4 p-4">
@@ -127,10 +198,8 @@ export default function HomePage() {
             <CalendarClock size={20} />
           </span>
           <div>
-            <p className="text-2xl font-extrabold text-ink-950">
-              {loading ? "—" : todayEvents.length}
-            </p>
-            <p className="text-xs font-semibold text-ink-400">今日日程</p>
+            <p className="text-2xl font-extrabold text-ink-950">{loading ? "—" : events.length}</p>
+            <p className="text-xs font-semibold text-ink-400">日程记录</p>
           </div>
         </div>
         <div className="surface flex items-center gap-4 p-4">
@@ -146,98 +215,64 @@ export default function HomePage() {
         </div>
       </section>
 
-      <div className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(340px,.8fr)]">
-        <section className="surface relative overflow-hidden p-5 sm:p-7">
-          <div className="pointer-events-none absolute -top-20 -right-20 size-64 rounded-full bg-teal-100/50 blur-3xl" />
-          <div className="relative mb-4 flex items-start justify-between gap-3">
-            <div>
-              <p className="text-xs font-bold tracking-wider text-teal-600 uppercase">
-                Quick voice
-              </p>
-              <h2 className="mt-1 text-xl font-extrabold text-ink-950">直接说出你的安排</h2>
-              <p className="mt-1 text-sm text-ink-500">
-                例如：“周五上午九点有机器学习考试，提前一天提醒我。”
-              </p>
-            </div>
-            <span className="hidden size-11 items-center justify-center rounded-2xl bg-white text-teal-600 shadow-sm sm:flex">
-              <Mic2 size={21} />
-            </span>
+      <section className="surface p-5 sm:p-6">
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <div>
+            <p className="text-xs font-bold tracking-wider text-ink-400 uppercase">Today</p>
+            <h2 className="mt-1 text-lg font-extrabold text-ink-950">近期安排</h2>
           </div>
-          <div className="relative">
-            <AsrRecorder
-              compact
-              onTranscriptChange={setTranscript}
-              onReset={() => setTranscript("")}
-            />
-          </div>
-          {transcript ? (
-            <div className="relative mt-4 flex justify-end">
-              <Link href="/voice" className="btn-primary">
-                继续理解并检查 <ArrowRight size={16} />
+          <Sparkles className="text-gold-500" size={19} />
+        </div>
+        {loading ? (
+          <LoadingState rows={3} />
+        ) : upcomingTasks.length === 0 && upcomingEvents.length === 0 ? (
+          <EmptyState
+            title="还没有近期安排"
+            description="用语音添加一项待办或日历事件，确认并验证后会显示在这里。"
+          />
+        ) : (
+          <div className="space-y-2.5">
+            {upcomingEvents.map((event) => (
+              <Link
+                key={`event-${event.id}`}
+                href="/calendar"
+                className="flex items-center gap-3 rounded-2xl border border-mist-100 p-3.5 transition-colors hover:bg-mist-50"
+              >
+                <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-teal-50 text-teal-700">
+                  <Clock3 size={17} />
+                </span>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-bold text-ink-800">{event.title}</p>
+                  <p className="mt-0.5 truncate text-xs text-ink-400">
+                    {formatDateTime(event.start_at, { timeZone: userSettings.timezone })}
+                    {event.location ? ` · ${event.location}` : ""}
+                  </p>
+                </div>
               </Link>
-            </div>
-          ) : null}
-        </section>
-
-        <section className="surface p-5 sm:p-6">
-          <div className="mb-4 flex items-center justify-between gap-3">
-            <div>
-              <p className="text-xs font-bold tracking-wider text-ink-400 uppercase">Today</p>
-              <h2 className="mt-1 text-lg font-extrabold text-ink-950">今天的节奏</h2>
-            </div>
-            <Sparkles className="text-gold-500" size={19} />
+            ))}
+            {upcomingTasks.map((task) => (
+              <Link
+                key={`task-${task.id}`}
+                href="/tasks"
+                className="flex items-center gap-3 rounded-2xl border border-mist-100 p-3.5 transition-colors hover:bg-mist-50"
+              >
+                <span
+                  className={`size-3 shrink-0 rounded-full ${task.priority === "high" ? "bg-coral-500" : task.priority === "medium" ? "bg-gold-500" : "bg-teal-500"}`}
+                />
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-bold text-ink-800">{task.title}</p>
+                  <p className="mt-0.5 truncate text-xs text-ink-400">
+                    {task.course ?? "未分类"} ·{" "}
+                    {task.due_at
+                      ? formatDateTime(task.due_at, { timeZone: userSettings.timezone })
+                      : "无截止时间"}
+                  </p>
+                </div>
+              </Link>
+            ))}
           </div>
-          {loading ? (
-            <LoadingState rows={3} />
-          ) : todayTasks.length === 0 && todayEvents.length === 0 ? (
-            <EmptyState
-              title="今天还没有安排"
-              description="用语音添加一项待办或日历事件，确认并验证后会显示在这里。"
-            />
-          ) : (
-            <div className="space-y-2.5">
-              {todayEvents.map((event) => (
-                <Link
-                  key={`event-${event.id}`}
-                  href="/calendar"
-                  className="flex items-center gap-3 rounded-2xl border border-mist-100 p-3.5 transition-colors hover:bg-mist-50"
-                >
-                  <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-teal-50 text-teal-700">
-                    <Clock3 size={17} />
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-bold text-ink-800">{event.title}</p>
-                    <p className="mt-0.5 truncate text-xs text-ink-400">
-                      {formatDateTime(event.start_at, { timeZone: userSettings.timezone })}
-                      {event.location ? ` · ${event.location}` : ""}
-                    </p>
-                  </div>
-                </Link>
-              ))}
-              {todayTasks.map((task) => (
-                <Link
-                  key={`task-${task.id}`}
-                  href="/tasks"
-                  className="flex items-center gap-3 rounded-2xl border border-mist-100 p-3.5 transition-colors hover:bg-mist-50"
-                >
-                  <span
-                    className={`size-3 shrink-0 rounded-full ${task.priority === "high" ? "bg-coral-500" : task.priority === "medium" ? "bg-gold-500" : "bg-teal-500"}`}
-                  />
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-bold text-ink-800">{task.title}</p>
-                    <p className="mt-0.5 truncate text-xs text-ink-400">
-                      {task.course ?? "未分类"} ·{" "}
-                      {task.due_at
-                        ? formatDateTime(task.due_at, { timeZone: userSettings.timezone })
-                        : "无截止时间"}
-                    </p>
-                  </div>
-                </Link>
-              ))}
-            </div>
-          )}
-        </section>
-      </div>
+        )}
+      </section>
 
       <section className="surface mt-6 p-5 sm:p-6">
         <div className="mb-4 flex items-center justify-between gap-3">

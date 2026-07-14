@@ -10,7 +10,7 @@ export function CorrectionDiff({
   correction: CorrectionResult;
   onChoose?: (changeIndex: number, value: string) => void;
 }>) {
-  if (correction.changes.length === 0 || correction.original_text === correction.corrected_text) {
+  if (correction.changes.length === 0) {
     return (
       <div className="flex items-center gap-2 rounded-2xl border border-teal-100 bg-teal-50 p-4 text-sm text-teal-700">
         <CheckCircle2 size={18} />

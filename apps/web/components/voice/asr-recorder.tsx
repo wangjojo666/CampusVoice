@@ -81,7 +81,7 @@ export function AsrRecorder({
           {state.speechActive ? (
             <p className="text-xs font-semibold text-teal-600">检测到说话</p>
           ) : null}
-          <div className={`w-full ${compact ? "max-w-sm" : "max-w-xl"}`}>
+          <div className={`w-full ${compact ? "max-w-lg" : "max-w-xl"}`}>
             <Waveform level={state.level} active={active} />
           </div>
 
@@ -90,10 +90,10 @@ export function AsrRecorder({
               <button
                 type="button"
                 onClick={() => void start()}
-                className="flex size-16 items-center justify-center rounded-full border-[5px] border-teal-100 bg-teal-600 text-white shadow-[0_12px_30px_rgba(14,127,109,.28)] transition-transform hover:scale-105"
+                className={`flex items-center justify-center rounded-full border-teal-100 bg-teal-600 text-white shadow-[0_12px_30px_rgba(14,127,109,.28)] transition-transform hover:scale-105 ${compact ? "size-20 border-[6px]" : "size-16 border-[5px]"}`}
                 aria-label={state.phase === "completed" ? "重新开始录音" : "开始录音"}
               >
-                <Mic size={26} />
+                <Mic size={compact ? 30 : 26} />
               </button>
             ) : null}
             {state.phase === "recording" ? (
@@ -186,7 +186,7 @@ export function AsrRecorder({
                   {state.confidence === null ? "—" : `${Math.round(state.confidence * 100)}%`}
                 </span>
                 <span>
-                  识别耗时：{state.latencyMs === null ? "—" : `${Math.round(state.latencyMs)} ms`}
+                  识别延迟：{state.latencyMs === null ? "—" : `${Math.round(state.latencyMs)} ms`}
                 </span>
               </div>
               <button
@@ -201,12 +201,45 @@ export function AsrRecorder({
           </div>
         ) : null}
 
-        {compact && state.editableTranscript ? (
-          <div className="mt-4 rounded-2xl bg-mist-50 p-4 text-left">
-            <p className="mb-1 text-xs font-bold text-ink-400">实时转写</p>
-            <p className="line-clamp-3 min-h-6 text-sm leading-6 text-ink-800">
-              {state.editableTranscript}
+        {compact &&
+        (state.editableTranscript ||
+          ["recording", "paused", "finalizing"].includes(state.phase)) ? (
+          <div className="mt-5 rounded-2xl border border-mist-100 bg-mist-50/80 p-4 text-left">
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <p className="text-xs font-bold text-ink-500">
+                {state.phase === "completed" ? "最终转写" : "实时转写"}
+              </p>
+              {state.phase === "completed" ? (
+                <span className="inline-flex items-center gap-1 rounded-full bg-teal-50 px-2.5 py-1 text-[0.7rem] font-bold text-teal-700">
+                  <Check size={12} /> 已完成
+                </span>
+              ) : null}
+            </div>
+            <p className="line-clamp-3 min-h-6 text-sm leading-6 text-ink-800" aria-live="polite">
+              {state.editableTranscript || "正在聆听，识别结果会实时显示在这里…"}
             </p>
+            {state.phase === "completed" ? (
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-mist-200 pt-3">
+                <div className="flex flex-wrap gap-2 text-xs font-semibold text-ink-500">
+                  <span className="rounded-lg bg-white px-2.5 py-1.5">
+                    置信度：
+                    {state.confidence === null ? "—" : `${Math.round(state.confidence * 100)}%`}
+                  </span>
+                  <span className="rounded-lg bg-white px-2.5 py-1.5">
+                    识别延迟：
+                    {state.latencyMs === null ? "—" : `${Math.round(state.latencyMs)} ms`}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void resetAll()}
+                  className="inline-flex items-center gap-1.5 text-xs font-bold text-ink-500 hover:text-ink-800"
+                >
+                  <RotateCcw size={13} />
+                  清空重录
+                </button>
+              </div>
+            ) : null}
           </div>
         ) : null}
       </div>

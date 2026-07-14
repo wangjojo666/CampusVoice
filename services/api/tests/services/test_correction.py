@@ -85,6 +85,24 @@ def test_course_term_requires_confirmation_even_with_high_score() -> None:
     assert response.record.corrected_text == request.text
 
 
+def test_exact_context_terms_do_not_create_overlapping_false_corrections() -> None:
+    request = CorrectionRequest(
+        text="周五上午九点有机器学习考试，提前一天提醒我。",
+        asr_confidence=1.0,
+        terms=[
+            CorrectionTerm(term="机器学习", source=HotwordSource.COURSE),
+            CorrectionTerm(term="周明澜", source=HotwordSource.TEACHER),
+        ],
+        current_courses=["机器学习"],
+    )
+
+    response = CorrectionEngine().correct(request)
+
+    assert response.record.corrected_text == request.text
+    assert response.record.modifications == []
+    assert response.requires_user_input is False
+
+
 def test_settings_courses_and_teachers_are_merged_into_correction_context() -> None:
     settings = UserSettings(
         user_id="user_demo",

@@ -53,6 +53,10 @@ def _automatic_critical_spans(text: str) -> list[CriticalSpan]:
 def _candidate_windows(text: str, term: CorrectionTerm) -> list[tuple[int, int, str, float]]:
     aliases = [alias for alias in term.aliases if alias and alias != term.term]
     windows: dict[tuple[int, int], tuple[str, float]] = {}
+    exact_spans = [
+        (match.start(), match.end())
+        for match in re.finditer(re.escape(term.term), text, flags=re.IGNORECASE)
+    ]
     for alias in aliases:
         for match in re.finditer(re.escape(alias), text, flags=re.IGNORECASE):
             windows[(match.start(), match.end())] = (match.group(), 1.0)
@@ -65,6 +69,10 @@ def _candidate_windows(text: str, term: CorrectionTerm) -> list[tuple[int, int, 
             end = start + length
             original = text[start:end]
             if original == term.term or original.isspace():
+                continue
+            if any(
+                start < exact_end and end > exact_start for exact_start, exact_end in exact_spans
+            ):
                 continue
             score = _similarity(original, term.term)
             if score >= 0.5:
@@ -79,6 +87,7 @@ def _candidate_windows(text: str, term: CorrectionTerm) -> list[tuple[int, int, 
 class CorrectionEngine:
     high_threshold = 0.80
     medium_threshold = 0.60
+    minimum_threshold = 0.45
 
     def correct(self, request: CorrectionRequest) -> CorrectionResponse:
         critical_spans = [*request.critical_spans, *_automatic_critical_spans(request.text)]
@@ -119,6 +128,8 @@ class CorrectionEngine:
                     + 0.06 * semantic_relevance
                 )
                 total = round(min(1.0, max(0.0, total)), 6)
+                if total < self.minimum_threshold:
+                    continue
 
                 matched_critical = next(
                     (span for span in critical_spans if _overlap(start, end, span)),

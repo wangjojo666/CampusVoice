@@ -67,6 +67,7 @@ describe("assistant workflow state", () => {
     store.setCorrection(correction);
     store.setPendingAction(pendingAction);
     store.setExecution(execution);
+    store.setLastExecutedActionId("action-1");
     store.setKnowledgeAnswer(knowledgeAnswer);
     store.setSourceDocumentId("document-1");
     store.setError("等待用户确认");
@@ -78,6 +79,7 @@ describe("assistant workflow state", () => {
       correction,
       pendingAction,
       execution,
+      lastExecutedActionId: "action-1",
       knowledgeAnswer,
       sourceDocumentId: "document-1",
       error: "等待用户确认",

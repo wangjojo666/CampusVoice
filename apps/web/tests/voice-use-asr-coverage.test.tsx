@@ -417,9 +417,40 @@ describe("useAsr orchestration", () => {
 });
 
 describe("VoicePage ASR lineage", () => {
+  it("marks a text demonstration action as manual input", async () => {
+    mocks.previewCorrection.mockResolvedValueOnce({
+      record_id: "correction-manual-1",
+      original_text: "创建复习机器学习待办",
+      corrected_text: "创建复习机器学习待办",
+      changes: [],
+      requires_user_input: false,
+    });
+    useAssistantStore.getState().setTranscript("创建复习机器学习待办");
+    useAssistantStore.getState().setInputMode("text_demo");
+    const { unmount } = render(<VoicePage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "解析并检查" }));
+
+    await waitFor(() => expect(mocks.prepareAction).toHaveBeenCalledOnce());
+    expect(mocks.prepareAction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          title: "复习机器学习",
+          source_type: "manual",
+        }),
+        voice_session_id: undefined,
+        transcription_id: undefined,
+      }),
+    );
+    unmount();
+  });
+
   it("prepares an action with the real voice lineage and clears the recording workflow", async () => {
     useAssistantStore.getState().setSourceDocumentId("stale-document-1");
     render(<VoicePage />);
+
+    expect(screen.getByRole("heading", { name: "说出安排，确认后再执行" })).toBeInTheDocument();
+    expect(screen.getByText("转写 → 理解 → 风险 → 确认 → 验证")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "提交语音转写" }));
     expect(useAssistantStore.getState()).toMatchObject({
