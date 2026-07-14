@@ -93,6 +93,22 @@ test("mock contract: v1 to v2 impact preview execute verify and group undo", asy
     const request = route.request();
     const url = new URL(request.url());
     const path = url.pathname;
+    if (path === "/api/settings" && request.method() === "GET") {
+      await route.fulfill({
+        json: {
+          major: null,
+          grade: null,
+          current_courses: [],
+          teacher_names: [],
+          default_reminder_minutes: 30,
+          timezone: "Asia/Shanghai",
+          asr_provider: "disabled",
+          asr_model: "",
+          asr_device: "",
+        },
+      });
+      return;
+    }
     if (path === "/api/tasks" || path === "/api/events" || path === "/api/action-logs") {
       await route.fulfill({ json: { items: [], total: 0 } });
       return;

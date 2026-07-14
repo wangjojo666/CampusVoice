@@ -20,6 +20,7 @@ import type {
   TaskCreate,
   TaskUpdate,
   UserSettings,
+  UserSettingsUpdate,
   VerificationResult,
 } from "@campusvoice/shared-types";
 
@@ -1004,7 +1005,7 @@ export const api = {
 
   settings: {
     get: () => request<UserSettings>("/api/settings"),
-    update: (data: Partial<UserSettings>) =>
+    update: (data: UserSettingsUpdate) =>
       confirmedJsonRequest<{ settings: UserSettings }>(
         "PATCH",
         "/api/settings",

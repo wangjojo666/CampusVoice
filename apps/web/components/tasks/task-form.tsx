@@ -10,7 +10,8 @@ import type {
 import { ArrowLeft, Check, ShieldCheck } from "lucide-react";
 import { useState } from "react";
 
-import { fromLocalInputValue, toLocalInputValue } from "@/lib/format";
+import { formatDateTime, fromLocalInputValue, toLocalInputValue } from "@/lib/format";
+import { useUserSettings } from "@/lib/user-settings";
 
 interface TaskDraft {
   title: string;
@@ -24,21 +25,25 @@ interface TaskDraft {
 
 export function TaskForm({
   task,
+  timezone,
   busy,
   onSubmit,
   onCancel,
 }: Readonly<{
   task: Task | null;
+  timezone?: string;
   busy: boolean;
-  onSubmit: (data: TaskCreate | TaskUpdate) => void | Promise<void>;
+  onSubmit: (data: TaskCreate | Omit<TaskUpdate, "expected_version">) => void | Promise<void>;
   onCancel: () => void;
 }>) {
+  const currentSettings = useUserSettings();
+  const effectiveTimezone = timezone ?? currentSettings.timezone;
   const [draft, setDraft] = useState<TaskDraft>({
     title: task?.title ?? "",
     description: task?.description ?? "",
     course: task?.course ?? "",
-    due_at: toLocalInputValue(task?.due_at),
-    reminder_at: toLocalInputValue(task?.reminder_at),
+    due_at: toLocalInputValue(task?.due_at, effectiveTimezone),
+    reminder_at: toLocalInputValue(task?.reminder_at, effectiveTimezone),
     priority: task?.priority ?? "medium",
     status: task?.status ?? "pending",
   });
@@ -48,8 +53,8 @@ export function TaskForm({
     title: draft.title.trim(),
     description: draft.description.trim() || null,
     course: draft.course.trim() || null,
-    due_at: fromLocalInputValue(draft.due_at),
-    reminder_at: fromLocalInputValue(draft.reminder_at),
+    due_at: fromLocalInputValue(draft.due_at, effectiveTimezone),
+    reminder_at: fromLocalInputValue(draft.reminder_at, effectiveTimezone),
     priority: draft.priority,
     ...(task ? { status: draft.status } : { source_type: "manual" as const }),
   };
@@ -78,7 +83,9 @@ export function TaskForm({
           <div>
             <dt className="text-xs font-bold text-ink-400">截止时间</dt>
             <dd className="mt-1 font-semibold text-ink-800">
-              {draft.due_at ? new Date(payload.due_at ?? "").toLocaleString("zh-CN") : "未设置"}
+              {draft.due_at
+                ? formatDateTime(payload.due_at, { timeZone: effectiveTimezone })
+                : "未设置"}
             </dd>
           </div>
           <div>

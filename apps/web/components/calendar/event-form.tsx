@@ -10,6 +10,7 @@ import { AlertTriangle, ArrowLeft, Check, MapPin, ShieldCheck } from "lucide-rea
 import { useState } from "react";
 
 import { formatDateTime, fromLocalInputValue, toLocalInputValue } from "@/lib/format";
+import { useUserSettings } from "@/lib/user-settings";
 
 interface EventDraft {
   title: string;
@@ -24,6 +25,8 @@ interface EventDraft {
 export function EventForm({
   event,
   defaultStart,
+  timezone,
+  defaultReminderMinutes,
   conflicts,
   busy,
   onSubmit,
@@ -31,11 +34,19 @@ export function EventForm({
 }: Readonly<{
   event: CalendarEvent | null;
   defaultStart?: Date | null;
+  timezone?: string;
+  defaultReminderMinutes?: number;
   conflicts: EventConflict[];
   busy: boolean;
-  onSubmit: (data: CalendarEventCreate | CalendarEventUpdate) => void | Promise<void>;
+  onSubmit: (
+    data: CalendarEventCreate | Omit<CalendarEventUpdate, "expected_version">,
+  ) => void | Promise<void>;
   onCancel: () => void;
 }>) {
+  const currentSettings = useUserSettings();
+  const effectiveTimezone = timezone ?? currentSettings.timezone;
+  const effectiveDefaultReminder =
+    defaultReminderMinutes ?? currentSettings.default_reminder_minutes;
   const initialStart = event?.start_at ?? defaultStart?.toISOString();
   const initialEnd =
     event?.end_at ??
@@ -46,21 +57,22 @@ export function EventForm({
     title: event?.title ?? "",
     description: event?.description ?? "",
     course: event?.course ?? "",
-    start_at: toLocalInputValue(initialStart),
-    end_at: toLocalInputValue(initialEnd),
+    start_at: toLocalInputValue(initialStart, effectiveTimezone),
+    end_at: toLocalInputValue(initialEnd, effectiveTimezone),
     location: event?.location ?? "",
-    reminder_minutes: String(event?.reminder_minutes ?? 30),
+    reminder_minutes: String(event?.reminder_minutes ?? effectiveDefaultReminder),
   });
   const [reviewing, setReviewing] = useState(false);
+  const [reminderTouched, setReminderTouched] = useState(false);
 
   const payload = {
     title: draft.title.trim(),
     description: draft.description.trim() || null,
     course: draft.course.trim() || null,
-    start_at: fromLocalInputValue(draft.start_at) ?? "",
-    end_at: fromLocalInputValue(draft.end_at),
+    start_at: fromLocalInputValue(draft.start_at, effectiveTimezone) ?? "",
+    end_at: fromLocalInputValue(draft.end_at, effectiveTimezone) ?? "",
     location: draft.location.trim() || null,
-    reminder_minutes: draft.reminder_minutes ? Number(draft.reminder_minutes) : null,
+    ...(event || reminderTouched ? { reminder_minutes: Number(draft.reminder_minutes) } : {}),
     ...(event ? {} : { source_type: "manual" as const }),
   };
 
@@ -83,7 +95,8 @@ export function EventForm({
                 <li key={conflict.event_id} className="rounded-xl bg-white/75 p-3 text-sm">
                   <strong>{conflict.title}</strong>
                   <span className="ml-2 text-ink-500">
-                    {formatDateTime(conflict.start_at)} – {formatDateTime(conflict.end_at)}
+                    {formatDateTime(conflict.start_at, { timeZone: effectiveTimezone })} –{" "}
+                    {formatDateTime(conflict.end_at, { timeZone: effectiveTimezone })}
                   </span>
                 </li>
               ))}
@@ -113,11 +126,15 @@ export function EventForm({
           </div>
           <div>
             <dt className="text-xs font-bold text-ink-400">开始</dt>
-            <dd className="mt-1 font-semibold text-ink-800">{formatDateTime(payload.start_at)}</dd>
+            <dd className="mt-1 font-semibold text-ink-800">
+              {formatDateTime(payload.start_at, { timeZone: effectiveTimezone })}
+            </dd>
           </div>
           <div>
             <dt className="text-xs font-bold text-ink-400">结束</dt>
-            <dd className="mt-1 font-semibold text-ink-800">{formatDateTime(payload.end_at)}</dd>
+            <dd className="mt-1 font-semibold text-ink-800">
+              {formatDateTime(payload.end_at, { timeZone: effectiveTimezone })}
+            </dd>
           </div>
           <div>
             <dt className="text-xs font-bold text-ink-400">地点</dt>
@@ -128,7 +145,9 @@ export function EventForm({
           <div>
             <dt className="text-xs font-bold text-ink-400">提醒</dt>
             <dd className="mt-1 font-semibold text-ink-800">
-              提前 {payload.reminder_minutes ?? 0} 分钟
+              {payload.reminder_minutes === undefined
+                ? "使用个人默认提醒"
+                : `提前 ${payload.reminder_minutes} 分钟`}
             </dd>
           </div>
         </dl>
@@ -234,7 +253,10 @@ export function EventForm({
         <span className="mb-1.5 block text-sm font-bold text-ink-700">提前提醒</span>
         <select
           value={draft.reminder_minutes}
-          onChange={(input) => setDraft({ ...draft, reminder_minutes: input.target.value })}
+          onChange={(input) => {
+            setReminderTouched(true);
+            setDraft({ ...draft, reminder_minutes: input.target.value });
+          }}
           className="field"
         >
           <option value="0">不提醒</option>

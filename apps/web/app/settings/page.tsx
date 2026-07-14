@@ -1,6 +1,6 @@
 "use client";
 
-import type { Hotword, UserSettings } from "@campusvoice/shared-types";
+import type { Hotword, UserSettings, UserSettingsUpdate } from "@campusvoice/shared-types";
 import {
   Check,
   Cpu,
@@ -19,17 +19,13 @@ import { ErrorState } from "@/components/ui/error-state";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Modal } from "@/components/ui/modal";
 import { ApiError, api } from "@/lib/api-client";
+import { formatDateTime } from "@/lib/format";
+import { DEFAULT_USER_SETTINGS, setCurrentUserSettings } from "@/lib/user-settings";
 
 const blankSettings: UserSettings = {
+  ...DEFAULT_USER_SETTINGS,
   major: "",
   grade: "",
-  current_courses: [],
-  teacher_names: [],
-  default_reminder_minutes: 30,
-  timezone: "Asia/Shanghai",
-  asr_provider: "funasr",
-  asr_model: "paraformer-zh-streaming",
-  asr_device: "cpu",
 };
 
 const categoryLabel = {
@@ -63,8 +59,10 @@ export default function SettingsPage() {
       api.hotwords.list(),
     ]);
     const failures: string[] = [];
-    if (settingsResult.status === "fulfilled") setSettings(settingsResult.value);
-    else
+    if (settingsResult.status === "fulfilled") {
+      setSettings(settingsResult.value);
+      setCurrentUserSettings(settingsResult.value);
+    } else
       failures.push(
         settingsResult.reason instanceof ApiError
           ? settingsResult.reason.userMessage
@@ -90,8 +88,18 @@ export default function SettingsPage() {
     setError(null);
     setNotice(null);
     try {
-      setSettings(await api.settings.update(settings));
-      setNotice("设置已保存，后续识别会使用最新配置。");
+      const update: UserSettingsUpdate = {
+        major: settings.major,
+        grade: settings.grade,
+        current_courses: settings.current_courses,
+        teacher_names: settings.teacher_names,
+        default_reminder_minutes: settings.default_reminder_minutes,
+        timezone: settings.timezone,
+      };
+      const saved = await api.settings.update(update);
+      setSettings(saved);
+      setCurrentUserSettings(saved);
+      setNotice("设置已保存，后续日期解析、显示和新建日程会使用最新配置。");
     } catch (reason) {
       setError(reason instanceof ApiError ? reason.userMessage : "设置保存失败。");
     } finally {
@@ -280,8 +288,10 @@ export default function SettingsPage() {
                   <Cpu size={20} />
                 </span>
                 <div>
-                  <h2 className="font-extrabold text-ink-950">ASR 配置</h2>
-                  <p className="text-xs text-ink-400">前端始终通过 WebSocket 连接服务端模型</p>
+                  <h2 className="font-extrabold text-ink-950">ASR 运行状态</h2>
+                  <p className="text-xs text-ink-400">
+                    由服务器部署配置决定，仅供查看；个人设置不会动态加载模型
+                  </p>
                 </div>
               </div>
               <div className="grid gap-4 sm:grid-cols-2">
@@ -289,9 +299,8 @@ export default function SettingsPage() {
                   <span className="mb-1.5 block text-sm font-bold text-ink-700">识别提供方</span>
                   <select
                     value={settings.asr_provider}
-                    onChange={(input) =>
-                      setSettings({ ...settings, asr_provider: input.target.value })
-                    }
+                    disabled
+                    aria-readonly="true"
                     className="field"
                   >
                     <option value="funasr">FunASR（实时中文）</option>
@@ -303,9 +312,8 @@ export default function SettingsPage() {
                   <span className="mb-1.5 block text-sm font-bold text-ink-700">模型</span>
                   <input
                     value={settings.asr_model}
-                    onChange={(input) =>
-                      setSettings({ ...settings, asr_model: input.target.value })
-                    }
+                    readOnly
+                    aria-readonly="true"
                     className="field"
                   />
                 </label>
@@ -313,9 +321,8 @@ export default function SettingsPage() {
                   <span className="mb-1.5 block text-sm font-bold text-ink-700">运行设备</span>
                   <input
                     value={settings.asr_device}
-                    onChange={(input) =>
-                      setSettings({ ...settings, asr_device: input.target.value })
-                    }
+                    readOnly
+                    aria-readonly="true"
                     className="field"
                     placeholder="cpu 或 cuda:0"
                   />
@@ -463,7 +470,7 @@ export default function SettingsPage() {
             </div>
             <p className="mt-3 text-xs text-ink-400">
               第二阶段确认有效期至
-              {new Date(pendingHotwordRemoval.expiresAt).toLocaleString("zh-CN")}
+              {formatDateTime(pendingHotwordRemoval.expiresAt, { timeZone: settings.timezone })}
             </p>
             <div className="mt-5 flex justify-end gap-2">
               <button

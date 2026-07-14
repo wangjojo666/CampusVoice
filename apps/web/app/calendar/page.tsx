@@ -20,6 +20,7 @@ import { Modal } from "@/components/ui/modal";
 import { ApiError, api } from "@/lib/api-client";
 import { latestUndoableEventAction } from "@/lib/calendar/undo";
 import { formatDateTime } from "@/lib/format";
+import { useUserSettings } from "@/lib/user-settings";
 
 const CalendarView = dynamic(
   () => import("@/components/calendar/calendar-view").then((module) => module.CalendarView),
@@ -30,6 +31,7 @@ const CalendarView = dynamic(
 );
 
 export default function CalendarPage() {
+  const userSettings = useUserSettings();
   const [events, setEvents] = useState<CalendarEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -75,7 +77,9 @@ export default function CalendarPage() {
     setNotice(null);
   };
 
-  const save = async (data: CalendarEventCreate | CalendarEventUpdate) => {
+  const save = async (
+    data: CalendarEventCreate | Omit<CalendarEventUpdate, "expected_version">,
+  ) => {
     if (!data.start_at || !data.end_at) {
       setError("请同时填写开始与结束时间，以便检查冲突。");
       return;
@@ -95,7 +99,7 @@ export default function CalendarPage() {
       }
       const result = editing
         ? await api.events.update(editing.id, {
-            ...(data as CalendarEventUpdate),
+            ...(data as Omit<CalendarEventUpdate, "expected_version">),
             expected_version: editing.version,
           })
         : await api.events.create(data as CalendarEventCreate);
@@ -242,9 +246,11 @@ export default function CalendarPage() {
         wide
       >
         <EventForm
-          key={`${editing?.id ?? "new"}-${defaultStart?.toISOString() ?? ""}`}
+          key={`${editing?.id ?? "new"}-${defaultStart?.toISOString() ?? ""}-${userSettings.timezone}-${userSettings.default_reminder_minutes}`}
           event={editing}
           defaultStart={defaultStart}
+          timezone={userSettings.timezone}
+          defaultReminderMinutes={userSettings.default_reminder_minutes}
           conflicts={conflicts}
           busy={busy}
           onSubmit={save}
@@ -275,7 +281,7 @@ export default function CalendarPage() {
               <div className="mt-2 flex flex-wrap gap-3 text-sm text-ink-600">
                 <span className="inline-flex items-center gap-1">
                   <Clock3 size={14} />
-                  {formatDateTime(deleting.start_at)}
+                  {formatDateTime(deleting.start_at, { timeZone: userSettings.timezone })}
                 </span>
                 {deleting.location ? (
                   <span className="inline-flex items-center gap-1">
@@ -348,7 +354,9 @@ export default function CalendarPage() {
                   <div className="flex items-start justify-between gap-2">
                     <div>
                       <h3 className="font-bold text-ink-800">{event.title}</h3>
-                      <p className="mt-1 text-xs text-ink-400">{formatDateTime(event.start_at)}</p>
+                      <p className="mt-1 text-xs text-ink-400">
+                        {formatDateTime(event.start_at, { timeZone: userSettings.timezone })}
+                      </p>
                     </div>
                     <div className="flex">
                       <button

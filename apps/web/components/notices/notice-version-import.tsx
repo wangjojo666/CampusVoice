@@ -4,6 +4,8 @@ import { AlertTriangle, CheckCircle2, GitBranchPlus, RefreshCcw } from "lucide-r
 import { type FormEvent, useMemo, useState } from "react";
 
 import { ApiError, api, type NoticeSeries, type NoticeTimeline } from "@/lib/api-client";
+import { fromLocalInputValue } from "@/lib/format";
+import { useUserSettings } from "@/lib/user-settings";
 
 function optional(value: string) {
   const normalized = value.trim();
@@ -11,6 +13,7 @@ function optional(value: string) {
 }
 
 export function NoticeVersionImport() {
+  const userSettings = useUserSettings();
   const [series, setSeries] = useState<NoticeSeries[]>([]);
   const [timeline, setTimeline] = useState<NoticeTimeline | null>(null);
   const [selectedSeriesId, setSelectedSeriesId] = useState("");
@@ -126,7 +129,7 @@ export function NoticeVersionImport() {
         supersedes_document_id: revision === 1 ? null : predecessorId,
         department: selectedSeries.department,
         publish_date: optional(publishDate),
-        effective_at: effectiveAt ? new Date(effectiveAt).toISOString() : null,
+        effective_at: fromLocalInputValue(effectiveAt, userSettings.timezone),
         applicable_group: optional(applicableGroup),
         source_url: optional(sourceUrl),
         ingest_source: "manual",

@@ -11,7 +11,9 @@ import { ErrorState } from "@/components/ui/error-state";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Modal } from "@/components/ui/modal";
 import { ApiError, api } from "@/lib/api-client";
+import { latestUndoableTaskAction } from "@/lib/calendar/undo";
 import { formatDateTime } from "@/lib/format";
+import { useUserSettings } from "@/lib/user-settings";
 
 const statusLabel = {
   pending: "待处理",
@@ -22,6 +24,7 @@ const statusLabel = {
 const priorityLabel = { low: "低", medium: "中", high: "高" } as const;
 
 export default function TasksPage() {
+  const userSettings = useUserSettings();
   const [tasks, setTasks] = useState<Task[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -92,13 +95,13 @@ export default function TasksPage() {
     setNotice(null);
   };
 
-  const save = async (data: TaskCreate | TaskUpdate) => {
+  const save = async (data: TaskCreate | Omit<TaskUpdate, "expected_version">) => {
     setBusy(true);
     setError(null);
     try {
       const result = editing
         ? await api.tasks.update(editing.id, {
-            ...(data as TaskUpdate),
+            ...(data as Omit<TaskUpdate, "expected_version">),
             expected_version: editing.version,
           })
         : await api.tasks.create(data as TaskCreate);
@@ -186,12 +189,12 @@ export default function TasksPage() {
     setError(null);
     try {
       const logs = await api.actionLogs.list(30);
-      const target = logs.items.find((log) => log.undoable && !log.undone);
-      if (!target) {
+      const target = latestUndoableTaskAction(logs.items);
+      if (!target?.action_id) {
         setNotice("没有可撤销的最近操作。");
         return;
       }
-      const result = await api.actions.undo(target.action_id ?? target.id);
+      const result = await api.actions.undo(target.action_id);
       if (!result.success) throw new ApiError(result.message, { status: 409, details: result });
       setNotice(result.message);
       await load();
@@ -348,7 +351,10 @@ export default function TasksPage() {
                 <div className="mt-2 flex flex-wrap gap-3 text-xs text-ink-400">
                   {task.course ? <span>{task.course}</span> : null}
                   <span className="inline-flex items-center gap-1">
-                    <Clock3 size={13} /> {task.due_at ? formatDateTime(task.due_at) : "无截止时间"}
+                    <Clock3 size={13} />{" "}
+                    {task.due_at
+                      ? formatDateTime(task.due_at, { timeZone: userSettings.timezone })
+                      : "无截止时间"}
                   </span>
                 </div>
               </div>
@@ -386,8 +392,9 @@ export default function TasksPage() {
         onClose={() => !busy && setEditorOpen(false)}
       >
         <TaskForm
-          key={editing?.id ?? "new"}
+          key={`${editing?.id ?? "new"}-${userSettings.timezone}`}
           task={editing}
+          timezone={userSettings.timezone}
           busy={busy}
           onSubmit={save}
           onCancel={() => setEditorOpen(false)}

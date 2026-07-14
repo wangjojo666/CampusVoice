@@ -1,7 +1,7 @@
 import type { ActionLog } from "@campusvoice/shared-types";
 import { describe, expect, it } from "vitest";
 
-import { latestUndoableEventAction } from "@/lib/calendar/undo";
+import { latestUndoableEventAction, latestUndoableTaskAction } from "@/lib/calendar/undo";
 
 function log(overrides: Partial<ActionLog>): ActionLog {
   return {
@@ -25,5 +25,14 @@ describe("calendar undo selection", () => {
     ]);
 
     expect(result?.action_id).toBe("event-new");
+  });
+
+  it("selects an older task action when the latest global action is an event", () => {
+    const result = latestUndoableTaskAction([
+      log({ id: "event", action: "create_event", action_id: "event-new", undoable: true }),
+      log({ id: "task", action: "update_task", action_id: "task-older", undoable: true }),
+    ]);
+
+    expect(result?.action_id).toBe("task-older");
   });
 });

@@ -20,20 +20,12 @@ import { ErrorState } from "@/components/ui/error-state";
 import { LoadingState } from "@/components/ui/loading-state";
 import { AsrRecorder } from "@/components/voice/asr-recorder";
 import { ApiError, api } from "@/lib/api-client";
-import { formatDateTime, relativeTime } from "@/lib/format";
+import { formatDateTime, relativeTime, sameDayInTimeZone } from "@/lib/format";
+import { useUserSettings } from "@/lib/user-settings";
 import { useAssistantStore } from "@/stores/assistant-store";
 
-function sameLocalDay(value: string | null | undefined, day = new Date()) {
-  if (!value) return false;
-  const date = new Date(value);
-  return (
-    date.getFullYear() === day.getFullYear() &&
-    date.getMonth() === day.getMonth() &&
-    date.getDate() === day.getDate()
-  );
-}
-
 export default function HomePage() {
+  const userSettings = useUserSettings();
   const [tasks, setTasks] = useState<Task[]>([]);
   const [events, setEvents] = useState<CalendarEvent[]>([]);
   const [logs, setLogs] = useState<ActionLog[]>([]);
@@ -80,20 +72,23 @@ export default function HomePage() {
       tasks
         .filter(
           (task) =>
-            task.status !== "completed" && (sameLocalDay(task.due_at) || task.due_at === null),
+            task.status !== "completed" &&
+            (sameDayInTimeZone(task.due_at, new Date(), userSettings.timezone) ||
+              task.due_at === null),
         )
         .slice(0, 5),
-    [tasks],
+    [tasks, userSettings.timezone],
   );
   const todayEvents = useMemo(
     () =>
       events
-        .filter((event) => sameLocalDay(event.start_at))
+        .filter((event) => sameDayInTimeZone(event.start_at, new Date(), userSettings.timezone))
         .sort((a, b) => a.start_at.localeCompare(b.start_at))
         .slice(0, 5),
-    [events],
+    [events, userSettings.timezone],
   );
   const dateLabel = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: userSettings.timezone,
     month: "long",
     day: "numeric",
     weekday: "long",
@@ -213,7 +208,7 @@ export default function HomePage() {
                   <div className="min-w-0 flex-1">
                     <p className="truncate text-sm font-bold text-ink-800">{event.title}</p>
                     <p className="mt-0.5 truncate text-xs text-ink-400">
-                      {formatDateTime(event.start_at)}
+                      {formatDateTime(event.start_at, { timeZone: userSettings.timezone })}
                       {event.location ? ` · ${event.location}` : ""}
                     </p>
                   </div>
@@ -232,7 +227,9 @@ export default function HomePage() {
                     <p className="truncate text-sm font-bold text-ink-800">{task.title}</p>
                     <p className="mt-0.5 truncate text-xs text-ink-400">
                       {task.course ?? "未分类"} ·{" "}
-                      {task.due_at ? formatDateTime(task.due_at) : "无截止时间"}
+                      {task.due_at
+                        ? formatDateTime(task.due_at, { timeZone: userSettings.timezone })
+                        : "无截止时间"}
                     </p>
                   </div>
                 </Link>

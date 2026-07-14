@@ -26,6 +26,7 @@ import type {
   NoticeChangeItem,
   NoticeChangeSet,
 } from "@/lib/api-client";
+import { formatDateTime, formatTime, toLocalInputValue } from "@/lib/format";
 
 const FIELD_LABELS: Record<string, string> = {
   "event.start_at": "开始时间",
@@ -47,7 +48,7 @@ const IMPACT_ACTION_LABELS: Record<string, string> = {
 
 function displayValue(value: Record<string, unknown> | undefined | null) {
   if (!value) return "—";
-  if (typeof value.iso === "string") return new Date(value.iso).toLocaleString("zh-CN");
+  if (typeof value.iso === "string") return formatDateTime(value.iso);
   if (typeof value.text === "string") return value.text;
   if (typeof value.minutes === "number") return `提前 ${value.minutes} 分钟`;
   return Object.values(value)
@@ -57,7 +58,7 @@ function displayValue(value: Record<string, unknown> | undefined | null) {
 
 function snapshotValue(snapshot: Record<string, unknown>, key: string) {
   const value = snapshot[key];
-  if (typeof value === "string" && /_at$/.test(key)) return new Date(value).toLocaleString("zh-CN");
+  if (typeof value === "string" && /_at$/.test(key)) return formatDateTime(value);
   if (Array.isArray(value)) return `${value.length} 条来源历史`;
   if (value === null || value === undefined || value === "") return "—";
   return String(value);
@@ -943,11 +944,15 @@ function ScheduleTimeline({
   const afterEnd = dateValue(item.after, ["end_at"]);
   const starts = [beforeStart, afterStart].filter((value): value is Date => Boolean(value));
   const ends = [beforeEnd, afterEnd, ...starts].filter((value): value is Date => Boolean(value));
+  const localClock = (value: Date) => {
+    const local = toLocalInputValue(value.toISOString());
+    return { hour: Number(local.slice(11, 13)), minute: Number(local.slice(14, 16)) };
+  };
   const startHour = starts.length
-    ? Math.max(0, Math.min(...starts.map((value) => value.getHours())) - 1)
+    ? Math.max(0, Math.min(...starts.map((value) => localClock(value).hour)) - 1)
     : 8;
   const endHour = ends.length
-    ? Math.min(24, Math.max(...ends.map((value) => value.getHours() + 1)) + 1)
+    ? Math.min(24, Math.max(...ends.map((value) => localClock(value).hour + 1)) + 1)
     : 18;
   const totalMinutes = Math.max(120, (endHour - startHour) * 60);
   const ticks = Array.from({ length: endHour - startHour + 1 }, (_, index) => startHour + index);
@@ -961,9 +966,10 @@ function ScheduleTimeline({
     .slice(0, 6);
   const blockStyle = (start: Date | null, end: Date | null) => {
     if (!start) return { top: "8%", height: "22%" };
-    const startMinutes = start.getHours() * 60 + start.getMinutes() - startHour * 60;
+    const startClock = localClock(start);
+    const startMinutes = startClock.hour * 60 + startClock.minute - startHour * 60;
     const endMinutes = end
-      ? end.getHours() * 60 + end.getMinutes() - startHour * 60
+      ? localClock(end).hour * 60 + localClock(end).minute - startHour * 60
       : startMinutes + 45;
     const top = Math.max(0, Math.min(92, (startMinutes / totalMinutes) * 100));
     const height = Math.max(12, Math.min(50, ((endMinutes - startMinutes) / totalMinutes) * 100));
@@ -971,8 +977,8 @@ function ScheduleTimeline({
   };
   const timeLabel = (start: Date | null, end: Date | null) => {
     if (!start) return "未提供时间";
-    const startText = start.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
-    const endText = end?.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+    const startText = formatTime(start.toISOString());
+    const endText = end ? formatTime(end.toISOString()) : undefined;
     return endText ? `${startText}–${endText}` : startText;
   };
 

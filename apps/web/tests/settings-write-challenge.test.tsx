@@ -1,13 +1,15 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import SettingsPage from "@/app/settings/page";
+import { getCurrentUserSettings } from "@/lib/user-settings";
 
 const mocks = vi.hoisted(() => ({
   getSettings: vi.fn(),
   listHotwords: vi.fn(),
   beginRemove: vi.fn(),
   finishRemove: vi.fn(),
+  updateSettings: vi.fn(),
 }));
 
 vi.mock("@/lib/api-client", () => ({
@@ -17,7 +19,7 @@ vi.mock("@/lib/api-client", () => ({
   api: {
     settings: {
       get: mocks.getSettings,
-      update: vi.fn(),
+      update: mocks.updateSettings,
     },
     hotwords: {
       list: mocks.listHotwords,
@@ -27,6 +29,8 @@ vi.mock("@/lib/api-client", () => ({
     },
   },
 }));
+
+afterEach(cleanup);
 
 describe("SettingsPage write challenges", () => {
   beforeEach(() => {
@@ -68,6 +72,12 @@ describe("SettingsPage write challenges", () => {
       side_effects: [],
       message: "热词已删除",
     });
+    mocks.updateSettings.mockReset().mockImplementation(async (settings) => ({
+      ...settings,
+      asr_provider: "funasr",
+      asr_model: "paraformer-zh-streaming",
+      asr_device: "cpu",
+    }));
   });
 
   it("does not delete on the first click and requires a second independent click", async () => {
@@ -88,5 +98,27 @@ describe("SettingsPage write challenges", () => {
     );
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "删除热词机器学习" })).not.toBeInTheDocument();
+  });
+
+  it("shows ASR deployment fields as read-only and excludes them from save payloads", async () => {
+    render(<SettingsPage />);
+    await waitFor(() => expect(mocks.getSettings).toHaveBeenCalledTimes(1));
+
+    expect(screen.getByRole("combobox", { name: "识别提供方" })).toBeDisabled();
+    expect(screen.getByLabelText("模型")).toHaveAttribute("readonly");
+    expect(screen.getByLabelText("运行设备")).toHaveAttribute("readonly");
+    expect(screen.getByText(/由服务器部署配置决定，仅供查看/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
+    await waitFor(() => expect(mocks.updateSettings).toHaveBeenCalledTimes(1));
+    expect(mocks.updateSettings).toHaveBeenCalledWith({
+      major: "人工智能",
+      grade: "2024",
+      current_courses: [],
+      teacher_names: [],
+      default_reminder_minutes: 30,
+      timezone: "Asia/Shanghai",
+    });
+    expect(getCurrentUserSettings().timezone).toBe("Asia/Shanghai");
   });
 });

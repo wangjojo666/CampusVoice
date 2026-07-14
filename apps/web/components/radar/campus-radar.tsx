@@ -12,6 +12,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 
 import { ApiError, api, type RadarCard } from "@/lib/api-client";
+import { formatDateTime } from "@/lib/format";
 
 export function CampusRadar() {
   const [items, setItems] = useState<RadarCard[]>([]);
@@ -127,7 +128,7 @@ export function CampusRadar() {
                     ) : null}
                     {item.deadline_at ? (
                       <p className="mt-2 text-xs font-semibold text-coral-600">
-                        截止：{new Date(item.deadline_at).toLocaleString("zh-CN")}
+                        截止：{formatDateTime(item.deadline_at)}
                       </p>
                     ) : null}
                     {item.affected_events > 0 || item.affected_tasks > 0 ? (
