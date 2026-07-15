@@ -3,8 +3,14 @@ import { websocketProtocols } from "@/lib/auth";
 
 export interface AsrClientHandlers {
   onMessage: (message: AsrServerMessage) => void;
-  onClose: (expected: boolean) => void;
+  onClose: (info: AsrCloseInfo) => void;
   onError: (message: string) => void;
+}
+
+export interface AsrCloseInfo {
+  stopRequested: boolean;
+  code: number;
+  wasClean: boolean;
 }
 
 function defaultAsrUrl() {
@@ -47,7 +53,7 @@ function normalizeMessage(value: unknown): AsrServerMessage | null {
         typeof message.transcription_id === "string" ? message.transcription_id : undefined,
     };
   }
-  if (type === "completed") {
+  if (type === "pong") {
     return {
       ...metadata,
       type,
@@ -59,12 +65,7 @@ function normalizeMessage(value: unknown): AsrServerMessage | null {
       type,
       code: typeof message.code === "string" ? message.code : undefined,
       message: typeof message.message === "string" ? message.message : "语音识别失败",
-      retryable:
-        typeof message.retryable === "boolean"
-          ? message.retryable
-          : typeof message.recoverable === "boolean"
-            ? message.recoverable
-            : undefined,
+      recoverable: typeof message.recoverable === "boolean" ? message.recoverable : undefined,
     };
   }
   return null;
@@ -72,7 +73,7 @@ function normalizeMessage(value: unknown): AsrServerMessage | null {
 
 export class AsrWebSocketClient {
   private socket: WebSocket | null = null;
-  private expectedClose = false;
+  private stopRequested = false;
   private readonly handlers: AsrClientHandlers;
   private readonly url: string;
   private readonly hotwords: string[];
@@ -126,9 +127,13 @@ export class AsrWebSocketClient {
           reject(new Error("WebSocket connection failed"));
         }
       };
-      socket.onclose = () => {
-        this.handlers.onClose(this.expectedClose);
-        this.socket = null;
+      socket.onclose = (event) => {
+        if (this.socket === socket) this.socket = null;
+        this.handlers.onClose({
+          stopRequested: this.stopRequested,
+          code: event.code,
+          wasClean: event.wasClean,
+        });
         if (!settled) {
           settled = true;
           reject(new Error("WebSocket closed before ready"));
@@ -148,14 +153,14 @@ export class AsrWebSocketClient {
   resume() {}
 
   stop() {
-    this.expectedClose = true;
+    this.stopRequested = true;
     this.sendControl({ type: "stop" });
   }
 
   close() {
-    this.expectedClose = true;
-    this.socket?.close(1000, "client closed");
+    const socket = this.socket;
     this.socket = null;
+    socket?.close(1000, "client closed");
   }
 
   private sendControl(message: AsrClientMessage) {

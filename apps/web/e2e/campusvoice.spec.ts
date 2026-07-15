@@ -536,7 +536,7 @@ async function installSyntheticAudioAndWebSocket(page: Page) {
       onopen: (() => void) | null = null;
       onmessage: ((event: { data: string }) => void) | null = null;
       onerror: (() => void) | null = null;
-      onclose: (() => void) | null = null;
+      onclose: ((event: { code: number; wasClean: boolean }) => void) | null = null;
 
       constructor(url: string, protocols?: string | string[]) {
         this.url = url;
@@ -594,17 +594,20 @@ async function installSyntheticAudioAndWebSocket(page: Page) {
               }),
             5,
           );
-          window.setTimeout(() => this.emit({ type: "completed", session_id: "voice-e2e-1" }), 10);
+          window.setTimeout(() => {
+            this.readyState = MockWebSocket.CLOSED;
+            telemetry.events.push("ws:close:1000");
+            this.onclose?.({ code: 1000, wasClean: true });
+          }, 10);
         }
       }
 
-      close(code?: number, reason?: string) {
-        void code;
+      close(code = 1000, reason?: string) {
         void reason;
         if (this.readyState === MockWebSocket.CLOSED) return;
         this.readyState = MockWebSocket.CLOSED;
-        telemetry.events.push("ws:close");
-        this.onclose?.();
+        telemetry.events.push(`ws:close:${code}`);
+        this.onclose?.({ code, wasClean: code === 1000 });
       }
     }
 

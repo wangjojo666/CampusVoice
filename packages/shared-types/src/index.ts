@@ -364,6 +364,6 @@ export type AsrServerMessage = AsrServerMetadata &
         transcription_id?: string;
       }
     | { type: "speech_end"; timestamp_ms?: number }
-    | { type: "completed" }
-    | { type: "error"; code?: string; message: string; retryable?: boolean }
+    | { type: "pong" }
+    | { type: "error"; code?: string; message: string; recoverable?: boolean }
   );

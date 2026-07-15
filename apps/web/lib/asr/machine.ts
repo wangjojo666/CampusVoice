@@ -41,10 +41,15 @@ export type AsrMachineEvent =
   | { type: "PAUSE" }
   | { type: "RESUME" }
   | { type: "STOP" }
-  | { type: "COMPLETED" }
   | { type: "EDIT"; text: string }
-  | { type: "FAIL"; code?: string; message: string; retryable?: boolean }
-  | { type: "SOCKET_CLOSED"; expected: boolean }
+  | {
+      type: "FAIL";
+      code?: string;
+      message: string;
+      retryable?: boolean;
+      recoverable?: boolean;
+    }
+  | { type: "SOCKET_CLOSED"; stopRequested: boolean; code: number; wasClean: boolean }
   | { type: "RESET" };
 
 export const initialAsrState: AsrMachineState = {
@@ -94,6 +99,7 @@ export function asrReducer(state: AsrMachineState, event: AsrMachineEvent): AsrM
         editableTranscript: transcriptFrom(state.finalSegments, event.text),
         confidence: event.confidence ?? state.confidence,
         latencyMs: event.latencyMs ?? state.latencyMs,
+        error: null,
       };
     case "FINAL": {
       if (!["recording", "paused", "finalizing"].includes(state.phase)) return state;
@@ -106,6 +112,7 @@ export function asrReducer(state: AsrMachineState, event: AsrMachineEvent): AsrM
         confidence: event.confidence ?? state.confidence,
         latencyMs: event.latencyMs ?? state.latencyMs,
         transcriptionId: event.transcriptionId ?? state.transcriptionId,
+        error: null,
       };
     }
     case "LEVEL":
@@ -120,21 +127,20 @@ export function asrReducer(state: AsrMachineState, event: AsrMachineEvent): AsrM
       return ["recording", "paused"].includes(state.phase)
         ? { ...state, phase: "finalizing", speechActive: false, level: 0 }
         : state;
-    case "COMPLETED":
-      return state.phase === "finalizing"
-        ? {
-            ...state,
-            phase: "completed",
-            interimTranscript: "",
-            editableTranscript: transcriptFrom(state.finalSegments, state.interimTranscript),
-            level: 0,
-          }
-        : state;
     case "EDIT":
       return ["idle", "completed", "error"].includes(state.phase)
         ? { ...state, editableTranscript: event.text }
         : state;
     case "FAIL":
+      if (
+        event.recoverable === true &&
+        ["connecting", "recording", "paused", "finalizing"].includes(state.phase)
+      ) {
+        return {
+          ...state,
+          error: { code: event.code, message: event.message, retryable: true },
+        };
+      }
       return {
         ...state,
         phase: "error",
@@ -143,15 +149,34 @@ export function asrReducer(state: AsrMachineState, event: AsrMachineEvent): AsrM
         error: { code: event.code, message: event.message, retryable: event.retryable ?? true },
       };
     case "SOCKET_CLOSED":
-      if (event.expected && state.phase === "finalizing")
-        return { ...state, phase: "completed", level: 0 };
+      if (
+        event.stopRequested &&
+        event.code === 1000 &&
+        event.wasClean &&
+        state.phase === "finalizing"
+      ) {
+        return {
+          ...state,
+          phase: "completed",
+          interimTranscript: "",
+          editableTranscript: transcriptFrom(state.finalSegments),
+          level: 0,
+          error: null,
+        };
+      }
       if (["idle", "completed", "error"].includes(state.phase)) return state;
       return {
         ...state,
         phase: "error",
         level: 0,
         speechActive: false,
-        error: { code: "socket_closed", message: "语音连接意外断开，请重试。", retryable: true },
+        error: {
+          code: event.stopRequested ? "socket_closed_during_finalize" : "socket_closed",
+          message: event.stopRequested
+            ? "语音连接在最终转写完成前断开，请重试。"
+            : "语音连接意外断开，请重试。",
+          retryable: true,
+        },
       };
     case "RESET":
       return initialAsrState;

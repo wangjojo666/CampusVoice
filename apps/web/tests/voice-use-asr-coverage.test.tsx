@@ -14,7 +14,7 @@ interface RecorderHandlers {
 
 interface ClientHandlers {
   onMessage: (message: AsrServerMessage) => void;
-  onClose: (expected: boolean) => void;
+  onClose: (info: { stopRequested: boolean; code: number; wasClean: boolean }) => void;
   onError: (message: string) => void;
 }
 
@@ -373,9 +373,11 @@ describe("useAsr orchestration", () => {
     expect(mocks.recorderStop).toHaveBeenCalledOnce();
     expect(mocks.clientStop).toHaveBeenCalledOnce();
 
-    act(() => mocks.clientHandlers?.onMessage({ type: "completed" }));
+    await act(async () => {
+      mocks.clientHandlers?.onClose({ stopRequested: true, code: 1000, wasClean: true });
+    });
     expect(result.current.state.phase).toBe("completed");
-    expect(mocks.clientClose).toHaveBeenCalledOnce();
+    expect(mocks.clientClose).not.toHaveBeenCalled();
     unmount();
   });
 
@@ -454,9 +456,8 @@ describe("useAsr orchestration", () => {
       firstRecorderHandlers?.onChunk(new ArrayBuffer(8));
       firstRecorderHandlers?.onLevel(0.91);
       firstClientHandlers?.onMessage({ type: "final", text: "过期转写" });
-      firstClientHandlers?.onMessage({ type: "completed" });
       firstClientHandlers?.onError("过期错误");
-      firstClientHandlers?.onClose(false);
+      firstClientHandlers?.onClose({ stopRequested: false, code: 1006, wasClean: false });
     });
 
     expect(mocks.clientSendAudio).not.toHaveBeenCalled();
@@ -470,22 +471,114 @@ describe("useAsr orchestration", () => {
     unmount();
   });
 
-  it("marks an unexpected socket close as an error and releases both resources on unmount", async () => {
+  it("marks an unexpected socket close as an error and releases the recorder immediately", async () => {
     const { result, unmount } = renderHook(() => useAsr());
     await act(async () => result.current.start());
     expect(result.current.state.phase).toBe("recording");
 
-    act(() => mocks.clientHandlers?.onClose(false));
+    await act(async () => {
+      mocks.clientHandlers?.onClose({ stopRequested: false, code: 1006, wasClean: false });
+    });
     expect(result.current.state).toMatchObject({
       phase: "error",
       error: { code: "socket_closed", retryable: true },
     });
 
+    expect(mocks.clientClose).not.toHaveBeenCalled();
+    expect(mocks.recorderStop).toHaveBeenCalledOnce();
     unmount();
-    await waitFor(() => {
-      expect(mocks.clientClose).not.toHaveBeenCalled();
-      expect(mocks.recorderStop).toHaveBeenCalledOnce();
+  });
+
+  it("keeps recoverable server errors active and accepts the following final transcript", async () => {
+    const { result, unmount } = renderHook(() => useAsr());
+    await act(async () => result.current.start());
+
+    act(() => {
+      mocks.clientHandlers?.onMessage({
+        type: "error",
+        code: "vad_fallback",
+        message: "已切换到能量 VAD",
+        recoverable: true,
+      });
     });
+    expect(result.current.state).toMatchObject({
+      phase: "recording",
+      error: { code: "vad_fallback", retryable: true },
+    });
+    expect(mocks.recorderStop).not.toHaveBeenCalled();
+    expect(mocks.clientClose).not.toHaveBeenCalled();
+
+    act(() => {
+      mocks.clientHandlers?.onMessage({
+        type: "final",
+        text: "降级后仍可转写",
+        transcription_id: "transcription-recovered",
+      });
+    });
+    expect(result.current.state).toMatchObject({
+      phase: "recording",
+      editableTranscript: "降级后仍可转写",
+      transcriptionId: "transcription-recovered",
+      error: null,
+    });
+    unmount();
+  });
+
+  it("stops both resources immediately for a fatal server error", async () => {
+    const { result, unmount } = renderHook(() => useAsr());
+    await act(async () => result.current.start());
+
+    await act(async () => {
+      mocks.clientHandlers?.onMessage({
+        type: "error",
+        code: "provider_disabled",
+        message: "识别服务未启用",
+        recoverable: false,
+      });
+    });
+
+    expect(result.current.state).toMatchObject({
+      phase: "error",
+      error: { code: "provider_disabled", retryable: false },
+    });
+    expect(mocks.clientClose).toHaveBeenCalledOnce();
+    expect(mocks.recorderStop).toHaveBeenCalledOnce();
+    unmount();
+  });
+
+  it("stops both resources immediately for a transport error", async () => {
+    const { result, unmount } = renderHook(() => useAsr());
+    await act(async () => result.current.start());
+
+    await act(async () => {
+      mocks.clientHandlers?.onError("网络连接失败");
+    });
+
+    expect(result.current.state.phase).toBe("error");
+    expect(mocks.clientClose).toHaveBeenCalledOnce();
+    expect(mocks.recorderStop).toHaveBeenCalledOnce();
+    unmount();
+  });
+
+  it("does not complete when a requested stop ends with an abnormal close", async () => {
+    const { result, unmount } = renderHook(() => useAsr());
+    await act(async () => result.current.start());
+    act(() => {
+      mocks.clientHandlers?.onMessage({ type: "interim", text: "尚未最终确认" });
+    });
+    await act(async () => result.current.stop());
+
+    await act(async () => {
+      mocks.clientHandlers?.onClose({ stopRequested: true, code: 1006, wasClean: false });
+    });
+
+    expect(result.current.state).toMatchObject({
+      phase: "error",
+      editableTranscript: "尚未最终确认",
+      error: { code: "socket_closed_during_finalize", retryable: true },
+    });
+    expect(mocks.recorderStop).toHaveBeenCalledOnce();
+    unmount();
   });
 });
 

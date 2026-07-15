@@ -145,9 +145,11 @@ export function AsrRecorder({
         {state.error ? (
           <div className="mt-5">
             <ErrorState
-              title="语音识别未完成"
+              title={state.phase === "error" ? "语音识别未完成" : "识别已自动恢复"}
               message={state.error.message}
-              onRetry={state.error.retryable ? () => void start() : undefined}
+              onRetry={
+                state.phase === "error" && state.error.retryable ? () => void start() : undefined
+              }
               compact
             />
           </div>

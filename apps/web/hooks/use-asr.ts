@@ -49,18 +49,29 @@ export function useAsr() {
         transcriptionId: message.transcription_id,
       });
     }
-    if (message.type === "completed") {
-      dispatch({ type: "COMPLETED" });
-    }
     if (message.type === "error") {
       dispatch({
         type: "FAIL",
         code: message.code,
         message: message.message,
-        retryable: message.retryable,
+        retryable: message.recoverable ?? true,
+        recoverable: message.recoverable === true,
       });
     }
   }, []);
+
+  const terminateCurrent = useCallback(
+    async (client: AsrWebSocketClient, { closeClient }: { closeClient: boolean }) => {
+      if (clientRef.current !== client) return;
+      lifecycleRef.current += 1;
+      clientRef.current = null;
+      if (closeClient) client.close();
+      const recorder = recorderRef.current;
+      recorderRef.current = null;
+      await recorder?.stop();
+    },
+    [],
+  );
 
   const cleanup = useCallback(async () => {
     lifecycleRef.current += 1;
@@ -130,19 +141,19 @@ export function useAsr() {
           onMessage: (message) => {
             if (startWasCancelled() || clientRef.current !== client) return;
             handleMessage(message);
-            if (message.type === "completed") {
-              client.close();
-              if (clientRef.current === client) clientRef.current = null;
+            if (message.type === "error" && message.recoverable !== true) {
+              void terminateCurrent(client, { closeClient: true });
             }
           },
-          onClose: (expected) => {
+          onClose: (info) => {
             if (startWasCancelled() || clientRef.current !== client) return;
-            clientRef.current = null;
-            dispatch({ type: "SOCKET_CLOSED", expected });
+            dispatch({ type: "SOCKET_CLOSED", ...info });
+            void terminateCurrent(client, { closeClient: false });
           },
           onError: (message) => {
             if (startWasCancelled() || clientRef.current !== client) return;
             dispatch({ type: "FAIL", message, retryable: true });
+            void terminateCurrent(client, { closeClient: true });
           },
         },
         { hotwords, ticket: ticket.ticket },
@@ -167,7 +178,7 @@ export function useAsr() {
           });
       }
     }
-  }, [cleanup, handleMessage, state.phase]);
+  }, [cleanup, handleMessage, state.phase, terminateCurrent]);
 
   const pause = useCallback(async () => {
     if (state.phase !== "recording") return;
