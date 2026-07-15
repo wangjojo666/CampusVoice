@@ -1,4 +1,7 @@
-from sqlalchemy import func, select
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.entities import ActionLog, PendingAction, UndoRecord
@@ -6,6 +9,130 @@ from app.models.enums import PendingActionState
 
 
 class ActionRepository:
+    async def finalize_execution(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        action_id: str,
+        *,
+        expected_attempt_count: int,
+        success: bool,
+        result: dict[str, Any],
+        last_error: str | None,
+        executed_at: datetime | None,
+    ) -> PendingAction | None:
+        allowed_states = (
+            [PendingActionState.EXECUTING, PendingActionState.FAILED]
+            if success
+            else [PendingActionState.EXECUTING]
+        )
+        values: dict[str, Any] = {
+            "state": PendingActionState.EXECUTED if success else PendingActionState.FAILED,
+            "last_error": last_error,
+            "result": result,
+        }
+        if success:
+            values["executed_at"] = executed_at
+        finalized: PendingAction | None = await session.scalar(
+            update(PendingAction)
+            .where(
+                PendingAction.id == action_id,
+                PendingAction.user_id == user_id,
+                PendingAction.attempt_count == expected_attempt_count,
+                PendingAction.state.in_(allowed_states),
+            )
+            .values(**values)
+            .returning(PendingAction)
+            .execution_options(populate_existing=True)
+        )
+        return finalized
+
+    async def cancel_pending(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        action_id: str,
+        *,
+        cancelled_at: datetime,
+        reason: str,
+    ) -> PendingAction | None:
+        cancelled: PendingAction | None = await session.scalar(
+            update(PendingAction)
+            .where(
+                PendingAction.id == action_id,
+                PendingAction.user_id == user_id,
+                or_(
+                    PendingAction.state.in_(
+                        [
+                            PendingActionState.NEEDS_INPUT,
+                            PendingActionState.AWAITING_CONFIRMATION,
+                            PendingActionState.AWAITING_SECOND_CONFIRMATION,
+                            PendingActionState.READY,
+                        ]
+                    ),
+                    and_(
+                        PendingAction.state == PendingActionState.FAILED,
+                        PendingAction.result["applied"].as_boolean().is_not(True),
+                    ),
+                ),
+            )
+            .values(
+                state=PendingActionState.CANCELLED,
+                cancelled_at=cancelled_at,
+                last_error=reason,
+            )
+            .returning(PendingAction)
+            .execution_options(populate_existing=True)
+        )
+        return cancelled
+
+    async def claim_execution(
+        self, session: AsyncSession, user_id: str, action_id: str
+    ) -> PendingAction | None:
+        claimed: PendingAction | None = await session.scalar(
+            update(PendingAction)
+            .where(
+                PendingAction.id == action_id,
+                PendingAction.user_id == user_id,
+                PendingAction.state.in_([PendingActionState.READY, PendingActionState.FAILED]),
+                PendingAction.attempt_count < PendingAction.max_attempts,
+            )
+            .values(
+                state=PendingActionState.EXECUTING,
+                attempt_count=PendingAction.attempt_count + 1,
+            )
+            .returning(PendingAction)
+            .execution_options(populate_existing=True)
+        )
+        return claimed
+
+    async def record_failed_execution_attempt(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        action_id: str,
+        *,
+        prior_attempt_count: int,
+        error: str,
+    ) -> PendingAction | None:
+        failed: PendingAction | None = await session.scalar(
+            update(PendingAction)
+            .where(
+                PendingAction.id == action_id,
+                PendingAction.user_id == user_id,
+                PendingAction.state.in_([PendingActionState.READY, PendingActionState.FAILED]),
+                PendingAction.attempt_count == prior_attempt_count,
+            )
+            .values(
+                state=PendingActionState.FAILED,
+                attempt_count=prior_attempt_count + 1,
+                last_error=error[:1_000],
+            )
+            .returning(PendingAction)
+            .execution_options(populate_existing=True)
+        )
+        return failed
+
     async def get_pending(
         self, session: AsyncSession, user_id: str, action_id: str, *, lock: bool = False
     ) -> PendingAction | None:
