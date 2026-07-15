@@ -53,16 +53,23 @@ export class PcmAudioRecorder {
   }
 
   async stop() {
-    this.worklet?.port.postMessage({ type: "flush" });
-    this.stream?.getTracks().forEach((track) => track.stop());
-    this.source?.disconnect();
-    this.worklet?.disconnect();
-    this.mutedOutput?.disconnect();
-    if (this.context && this.context.state !== "closed") await this.context.close();
+    const context = this.context;
+    const stream = this.stream;
+    const source = this.source;
+    const worklet = this.worklet;
+    const mutedOutput = this.mutedOutput;
+
     this.context = null;
     this.stream = null;
     this.source = null;
     this.worklet = null;
     this.mutedOutput = null;
+
+    worklet?.port.postMessage({ type: "flush" });
+    stream?.getTracks().forEach((track) => track.stop());
+    source?.disconnect();
+    worklet?.disconnect();
+    mutedOutput?.disconnect();
+    if (context && context.state !== "closed") await context.close();
   }
 }

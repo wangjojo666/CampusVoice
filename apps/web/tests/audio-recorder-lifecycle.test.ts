@@ -118,7 +118,7 @@ describe("PCM recorder lifecycle", () => {
     expect(FakeAudioContext.instance?.suspend).toHaveBeenCalledOnce();
     expect(FakeAudioContext.instance?.resume).toHaveBeenCalledTimes(2);
 
-    await recorder.stop();
+    await Promise.all([recorder.stop(), recorder.stop()]);
 
     expect(FakeWorkletNode.instance?.port.postMessage).toHaveBeenCalledWith({ type: "flush" });
     expect(stopTrack).toHaveBeenCalledOnce();

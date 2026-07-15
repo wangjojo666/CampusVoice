@@ -379,6 +379,25 @@ describe("useAsr orchestration", () => {
     unmount();
   });
 
+  it("keeps only the latest start when two attempts race during cleanup", async () => {
+    const { result, unmount } = renderHook(() => useAsr());
+
+    let firstStart: Promise<void> | undefined;
+    let secondStart: Promise<void> | undefined;
+    act(() => {
+      firstStart = result.current.start();
+      secondStart = result.current.start();
+    });
+
+    await act(async () => Promise.all([firstStart, secondStart]));
+
+    expect(mocks.recorderStart).toHaveBeenCalledOnce();
+    expect(mocks.websocketTicket).toHaveBeenCalledOnce();
+    expect(mocks.clientConstructed).toHaveBeenCalledOnce();
+    expect(result.current.state.phase).toBe("recording");
+    unmount();
+  });
+
   it("surfaces a denied microphone permission without consuming a WebSocket ticket", async () => {
     mocks.recorderStart.mockRejectedValue(new DOMException("Permission denied", "NotAllowedError"));
     const { result, unmount } = renderHook(() => useAsr());
@@ -397,6 +416,60 @@ describe("useAsr orchestration", () => {
     unmount();
   });
 
+  it("releases a recorder that finishes starting after the component unmounts", async () => {
+    const permission = deferred();
+    mocks.recorderStart.mockImplementation(async () => permission.promise);
+    const { result, unmount } = renderHook(() => useAsr());
+
+    let startPromise: Promise<void> | undefined;
+    act(() => {
+      startPromise = result.current.start();
+    });
+
+    await waitFor(() => expect(result.current.state.phase).toBe("requesting_permission"));
+    unmount();
+    await waitFor(() => expect(mocks.recorderStop).toHaveBeenCalledOnce());
+
+    await act(async () => {
+      permission.resolve();
+      await startPromise;
+    });
+
+    expect(mocks.recorderStop).toHaveBeenCalledTimes(2);
+    expect(mocks.websocketTicket).not.toHaveBeenCalled();
+    expect(mocks.clientConstructed).not.toHaveBeenCalled();
+  });
+
+  it("ignores recorder and socket callbacks from an earlier lifecycle", async () => {
+    const { result, unmount } = renderHook(() => useAsr());
+    await act(async () => result.current.start());
+    const firstRecorderHandlers = mocks.recorderHandlers;
+    const firstClientHandlers = mocks.clientHandlers;
+
+    await act(async () => result.current.reset());
+    await act(async () => result.current.start());
+    const closeCountBeforeStaleCallbacks = mocks.clientClose.mock.calls.length;
+
+    act(() => {
+      firstRecorderHandlers?.onChunk(new ArrayBuffer(8));
+      firstRecorderHandlers?.onLevel(0.91);
+      firstClientHandlers?.onMessage({ type: "final", text: "过期转写" });
+      firstClientHandlers?.onMessage({ type: "completed" });
+      firstClientHandlers?.onError("过期错误");
+      firstClientHandlers?.onClose(false);
+    });
+
+    expect(mocks.clientSendAudio).not.toHaveBeenCalled();
+    expect(mocks.clientClose).toHaveBeenCalledTimes(closeCountBeforeStaleCallbacks);
+    expect(result.current.state).toMatchObject({
+      phase: "recording",
+      editableTranscript: "",
+      level: 0,
+      error: null,
+    });
+    unmount();
+  });
+
   it("marks an unexpected socket close as an error and releases both resources on unmount", async () => {
     const { result, unmount } = renderHook(() => useAsr());
     await act(async () => result.current.start());
@@ -410,7 +483,7 @@ describe("useAsr orchestration", () => {
 
     unmount();
     await waitFor(() => {
-      expect(mocks.clientClose).toHaveBeenCalledOnce();
+      expect(mocks.clientClose).not.toHaveBeenCalled();
       expect(mocks.recorderStop).toHaveBeenCalledOnce();
     });
   });
