@@ -7,8 +7,9 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 from app.models.entities import ActionLog, PendingAction, Task, UndoRecord
+from app.models.enums import PendingActionState
 from app.repositories.tasks import TaskRepository
-from app.schemas.actions import CancelActionRequest, ExecutionResult
+from app.schemas.actions import CancelActionRequest, ExecutionResult, UndoResult
 from app.services.actions.service import ActionService, AppliedOperation
 from app.services.errors import ConflictError
 from app.services.verification.service import VerificationReport, VerificationService
@@ -36,6 +37,26 @@ def _action_side_effect_counts(client: TestClient) -> tuple[int, int, int]:
             )
 
     return asyncio.run(count())
+
+
+def _undo_persistence(
+    client: TestClient, action_id: str
+) -> tuple[str, str, dict[str, object] | None]:
+    async def read() -> tuple[str, str, dict[str, object] | None]:
+        factory = client.app.state.session_factory
+        async with factory() as session:
+            row = (
+                await session.execute(
+                    select(PendingAction.state, UndoRecord.state, PendingAction.result)
+                    .join(ActionLog, ActionLog.pending_action_id == PendingAction.id)
+                    .join(UndoRecord, UndoRecord.action_log_id == ActionLog.id)
+                    .where(PendingAction.id == action_id)
+                )
+            ).one()
+            result = dict(row[2]) if row[2] is not None else None
+            return row[0].value, row[1].value, result
+
+    return asyncio.run(read())
 
 
 def test_completeness_and_low_confidence_risk_are_deterministic(client: TestClient) -> None:
@@ -305,6 +326,401 @@ def test_task_update_undo_restores_confirmed_snapshot(client: TestClient) -> Non
     assert undone.json()["success"] is True
     restored = client.get("/api/tasks").json()["items"][0]
     assert (restored["title"], restored["priority"]) == ("撤销前", "low")
+
+
+def test_create_undo_succeeds_only_while_created_record_is_unchanged(
+    client: TestClient,
+) -> None:
+    prepared = client.post(
+        "/api/actions/prepare",
+        json={"action": "create_task", "payload": {"title": "立即撤销创建"}},
+    ).json()
+    action_id = prepared["id"]
+    confirm_action(client, action_id)
+    executed = client.post(f"/api/actions/{action_id}/execute")
+    assert executed.status_code == 200
+    assert executed.json()["success"] is True
+
+    undone = client.post(f"/api/actions/{action_id}/undo")
+    repeated = client.post(f"/api/actions/{action_id}/undo")
+
+    assert undone.status_code == 200
+    assert undone.json()["success"] is True
+    assert repeated.json() == undone.json()
+    assert client.get("/api/tasks").json()["total"] == 0
+    assert _undo_persistence(client, action_id)[:2] == ("undone", "undone")
+
+
+def test_stale_update_undo_does_not_overwrite_later_task_edit(client: TestClient) -> None:
+    task_id = confirmed_write(
+        client,
+        "POST",
+        "/api/tasks",
+        {"title": "初始版本", "priority": "low"},
+    ).json()["record_id"]
+
+    first = client.post(
+        "/api/actions/prepare",
+        json={
+            "action": "update_task",
+            "target_id": task_id,
+            "payload": {"title": "第一轮编辑", "priority": "medium"},
+        },
+    ).json()
+    confirm_action(client, first["id"])
+    assert client.post(f"/api/actions/{first['id']}/execute").json()["success"] is True
+
+    second = client.post(
+        "/api/actions/prepare",
+        json={
+            "action": "update_task",
+            "target_id": task_id,
+            "payload": {"title": "后续编辑", "priority": "high"},
+        },
+    ).json()
+    confirm_action(client, second["id"])
+    assert client.post(f"/api/actions/{second['id']}/execute").json()["success"] is True
+
+    rejected = client.post(f"/api/actions/{first['id']}/undo")
+
+    assert rejected.status_code == 409
+    assert rejected.json()["error"]["code"] == "undo_version_conflict"
+    current = client.get("/api/tasks").json()["items"][0]
+    assert (current["title"], current["priority"], current["version"]) == (
+        "后续编辑",
+        "high",
+        3,
+    )
+    assert _undo_persistence(client, first["id"])[:2] == ("executed", "available")
+
+
+def test_undo_verifier_exception_retries_without_reapplying(client: TestClient) -> None:
+    task_id = confirmed_write(
+        client,
+        "POST",
+        "/api/tasks",
+        {"title": "撤销恢复原值", "priority": "low"},
+    ).json()["record_id"]
+    prepared = client.post(
+        "/api/actions/prepare",
+        json={
+            "action": "update_task",
+            "target_id": task_id,
+            "payload": {"title": "撤销恢复新值", "priority": "high"},
+        },
+    ).json()
+    action_id = prepared["id"]
+    confirm_action(client, action_id)
+    assert client.post(f"/api/actions/{action_id}/execute").json()["success"] is True
+
+    original_verify = VerificationService.verify_task
+    calls = 0
+
+    async def fail_once(self: object, *args: object, **kwargs: object) -> VerificationReport:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transient undo verifier failure")
+        return await original_verify(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    with patch.object(VerificationService, "verify_task", new=fail_once):
+        first = client.post(f"/api/actions/{action_id}/undo")
+        after_failure = client.get("/api/tasks").json()["items"][0]
+        persisted_after_failure = _undo_persistence(client, action_id)
+        second = client.post(f"/api/actions/{action_id}/undo")
+        third = client.post(f"/api/actions/{action_id}/undo")
+
+    assert first.status_code == 200
+    assert first.json()["success"] is False
+    assert first.json()["retryable"] is True
+    assert first.json()["error"] == "undo_verification_exception: RuntimeError"
+    assert (after_failure["title"], after_failure["priority"], after_failure["version"]) == (
+        "撤销恢复原值",
+        "low",
+        3,
+    )
+    assert persisted_after_failure[:2] == ("undone", "failed")
+    assert persisted_after_failure[2] is not None
+    assert persisted_after_failure[2]["_undo_phase"] == "applied"
+    assert second.status_code == 200
+    assert second.json()["success"] is True
+    assert third.json() == second.json()
+    current = client.get("/api/tasks").json()["items"][0]
+    assert current["version"] == 3
+    assert _undo_persistence(client, action_id)[:2] == ("undone", "undone")
+
+
+def test_legacy_failed_undo_is_verified_without_reapplying(client: TestClient) -> None:
+    task_id = confirmed_write(
+        client,
+        "POST",
+        "/api/tasks",
+        {"title": "旧撤销原值", "priority": "low"},
+    ).json()["record_id"]
+    prepared = client.post(
+        "/api/actions/prepare",
+        json={
+            "action": "update_task",
+            "target_id": task_id,
+            "payload": {"title": "旧撤销新值", "priority": "high"},
+        },
+    ).json()
+    action_id = prepared["id"]
+    confirm_action(client, action_id)
+    assert client.post(f"/api/actions/{action_id}/execute").json()["success"] is True
+
+    async def fail_verification(*_args: object, **_kwargs: object) -> VerificationReport:
+        return VerificationReport(False, {"title": False}, ("forced_failure",), None)
+
+    with patch.object(VerificationService, "verify_task", new=fail_verification):
+        failed = client.post(f"/api/actions/{action_id}/undo")
+    assert failed.json()["success"] is False
+
+    async def convert_to_legacy_shape() -> None:
+        factory = client.app.state.session_factory
+        async with factory() as session, session.begin():
+            action = await session.get(PendingAction, action_id)
+            assert action is not None
+            action.state = PendingActionState.EXECUTED
+            action.result = {
+                key: value
+                for key, value in failed.json().items()
+                if key in ExecutionResult.model_fields
+            }
+
+    asyncio.run(convert_to_legacy_shape())
+    before_retry = client.get("/api/tasks").json()["items"][0]
+
+    recovered = client.post(f"/api/actions/{action_id}/undo")
+
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["success"] is True
+    after_retry = client.get("/api/tasks").json()["items"][0]
+    assert before_retry["version"] == after_retry["version"] == 3
+    assert after_retry["title"] == "旧撤销原值"
+    assert _undo_persistence(client, action_id)[:2] == ("undone", "undone")
+
+
+def test_damaged_undo_recovery_envelope_returns_conflict(client: TestClient) -> None:
+    task_id = confirmed_write(
+        client,
+        "POST",
+        "/api/tasks",
+        {"title": "损坏恢复原值", "priority": "low"},
+    ).json()["record_id"]
+    prepared = client.post(
+        "/api/actions/prepare",
+        json={
+            "action": "update_task",
+            "target_id": task_id,
+            "payload": {"title": "损坏恢复新值", "priority": "high"},
+        },
+    ).json()
+    action_id = prepared["id"]
+    confirm_action(client, action_id)
+    assert client.post(f"/api/actions/{action_id}/execute").json()["success"] is True
+
+    async def fail_verification(*_args: object, **_kwargs: object) -> VerificationReport:
+        return VerificationReport(False, {"title": False}, ("forced_failure",), None)
+
+    with patch.object(VerificationService, "verify_task", new=fail_verification):
+        assert client.post(f"/api/actions/{action_id}/undo").json()["success"] is False
+
+    async def corrupt_envelope() -> None:
+        factory = client.app.state.session_factory
+        async with factory() as session, session.begin():
+            action = await session.get(PendingAction, action_id)
+            assert action is not None and action.result is not None
+            result = dict(action.result)
+            operation = dict(result["_operation"])
+            operation["expected_fields"] = None
+            result["_operation"] = operation
+            action.result = result
+
+    asyncio.run(corrupt_envelope())
+
+    rejected = client.post(f"/api/actions/{action_id}/undo")
+
+    assert rejected.status_code == 409
+    assert rejected.json()["error"]["code"] == "undo_recovery_state_invalid"
+    current = client.get("/api/tasks").json()["items"][0]
+    assert current["version"] == 3
+    assert _undo_persistence(client, action_id)[:2] == ("undone", "failed")
+
+
+def test_stale_undo_verifier_token_cannot_overwrite_newer_attempt(
+    client: TestClient,
+) -> None:
+    task_id = confirmed_write(
+        client,
+        "POST",
+        "/api/tasks",
+        {"title": "验证代际原值", "priority": "low"},
+    ).json()["record_id"]
+    prepared = client.post(
+        "/api/actions/prepare",
+        json={
+            "action": "update_task",
+            "target_id": task_id,
+            "payload": {"title": "验证代际新值", "priority": "high"},
+        },
+    ).json()
+    action_id = prepared["id"]
+    confirm_action(client, action_id)
+    assert client.post(f"/api/actions/{action_id}/execute").json()["success"] is True
+
+    async def fail_verification(*_args: object, **_kwargs: object) -> VerificationReport:
+        return VerificationReport(False, {"title": False}, ("forced_failure",), None)
+
+    with patch.object(VerificationService, "verify_task", new=fail_verification):
+        failed = client.post(f"/api/actions/{action_id}/undo")
+    assert failed.json()["success"] is False
+
+    async def finalize_out_of_order() -> ExecutionResult:
+        factory = client.app.state.session_factory
+        service = ActionService()
+        async with factory() as session, session.begin():
+            action = await session.get(PendingAction, action_id)
+            assert action is not None and action.result is not None
+            action_type = action.action_type
+            prior_result = dict(action.result)
+            prior_token = str(prior_result["_undo_verify_token"])
+            operation = AppliedOperation(**prior_result["_operation"])
+            newer_token = "newer-undo-verification-token"
+            claimed = await service.actions.claim_undo_verification(
+                session,
+                "user_demo",
+                action_id,
+                expected_token=prior_token,
+                result=prior_result | {"_undo_verify_token": newer_token},
+            )
+            assert claimed is not None
+
+        stale_report = VerificationReport(
+            True,
+            {field: True for field in operation.expected_fields},
+            (),
+            None,
+        )
+        stale_result = ExecutionResult(
+            success=True,
+            action="undo_update_task",
+            record_id=operation.record_id,
+            verified_fields=stale_report.verified_fields,
+            side_effects=[],
+            message="stale success",
+            action_id=action_id,
+        )
+        async with factory() as session:
+            with pytest.raises(ConflictError) as superseded:
+                await service._finalize_undo_verification(
+                    session,
+                    "user_demo",
+                    action_id,
+                    action_type,
+                    operation,
+                    stale_report,
+                    stale_result,
+                    verify_token=prior_token,
+                    last_error=None,
+                )
+        assert superseded.value.code == "undo_verification_in_progress"
+
+        newer_report = VerificationReport(
+            False,
+            {field: False for field in operation.expected_fields},
+            ("newer_failure",),
+            None,
+        )
+        newer_result = ExecutionResult.model_validate(
+            {
+                key: value
+                for key, value in failed.json().items()
+                if key in ExecutionResult.model_fields
+            }
+        )
+        async with factory() as session:
+            finalized = await service._finalize_undo_verification(
+                session,
+                "user_demo",
+                action_id,
+                action_type,
+                operation,
+                newer_report,
+                newer_result,
+                verify_token=newer_token,
+                last_error="undo_verification_failed",
+            )
+        return finalized
+
+    latest = asyncio.run(finalize_out_of_order())
+
+    assert latest.success is False
+    state = _undo_persistence(client, action_id)
+    assert state[:2] == ("undone", "failed")
+    assert state[2] is not None
+    assert state[2]["success"] is False
+    assert state[2]["_undo_verify_token"] == "newer-undo-verification-token"
+
+
+def test_concurrent_undo_applies_business_reversal_once(client: TestClient) -> None:
+    task_id = confirmed_write(
+        client,
+        "POST",
+        "/api/tasks",
+        {"title": "并发撤销原值", "priority": "low"},
+    ).json()["record_id"]
+    prepared = client.post(
+        "/api/actions/prepare",
+        json={
+            "action": "update_task",
+            "target_id": task_id,
+            "payload": {"title": "并发撤销新值", "priority": "high"},
+        },
+    ).json()
+    action_id = prepared["id"]
+    confirm_action(client, action_id)
+    assert client.post(f"/api/actions/{action_id}/execute").json()["success"] is True
+
+    async def undo_both() -> list[UndoResult | BaseException]:
+        factory = client.app.state.session_factory
+        service = ActionService()
+        original_claim = service.actions.claim_undo_application
+        gate = asyncio.Event()
+        lock = asyncio.Lock()
+        arrivals = 0
+
+        async def synchronized_claim(*args: object, **kwargs: object) -> object:
+            nonlocal arrivals
+            async with lock:
+                arrivals += 1
+                if arrivals == 2:
+                    gate.set()
+            await asyncio.wait_for(gate.wait(), timeout=5)
+            return await original_claim(*args, **kwargs)  # type: ignore[arg-type]
+
+        async def undo_once() -> UndoResult:
+            async with factory() as session:
+                return await service.undo(session, "user_demo", action_id)
+
+        with patch.object(service.actions, "claim_undo_application", new=synchronized_claim):
+            return list(await asyncio.gather(undo_once(), undo_once(), return_exceptions=True))
+
+    results = asyncio.run(undo_both())
+
+    successful = [result for result in results if isinstance(result, UndoResult)]
+    superseded = [result for result in results if isinstance(result, ConflictError)]
+    assert successful
+    assert all(result.success is True for result in successful)
+    assert all(result.code == "undo_verification_in_progress" for result in superseded)
+    assert len(successful) + len(superseded) == 2
+    current = client.get("/api/tasks").json()["items"][0]
+    assert (current["title"], current["priority"], current["version"]) == (
+        "并发撤销原值",
+        "low",
+        3,
+    )
+    assert _undo_persistence(client, action_id)[:2] == ("undone", "undone")
 
 
 def test_post_commit_verification_failure_never_reports_success(

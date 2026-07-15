@@ -2,8 +2,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
+from uuid import uuid4
 
-from pydantic import ValidationError
+from pydantic import ConfigDict, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -39,6 +40,7 @@ from app.schemas.actions import (
     ExecutionResult,
     UndoResult,
 )
+from app.schemas.common import StrictModel
 from app.schemas.domain import (
     EventCreate,
     EventDraft,
@@ -77,6 +79,19 @@ class AppliedOperation:
     undo_action: str
     undo_snapshot: dict[str, Any] | None
     allow_conflict: bool = False
+
+
+class _AppliedOperationEnvelope(StrictModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    record_id: str = Field(min_length=1)
+    before_snapshot: dict[str, Any] | None
+    after_snapshot: dict[str, Any] | None
+    expected_fields: dict[str, Any]
+    should_exist: bool
+    undo_action: str
+    undo_snapshot: dict[str, Any] | None
+    allow_conflict: bool
 
 
 def _snapshot_task(task: Task) -> dict[str, Any]:
@@ -1184,55 +1199,201 @@ class ActionService:
 
     async def undo(self, session: AsyncSession, user_id: str, action_id: str) -> UndoResult:
         await self._reject_if_undo_expired(session, user_id, action_id)
+        operation: AppliedOperation | None = None
+        action: PendingAction | None = None
+        verify_token: str | None = None
         async with session.begin():
-            action = await self._pending_or_404(session, user_id, action_id, lock=True)
-            if action.state == PendingActionState.UNDONE and action.result:
-                previous = _public_result(action.result)
-                return UndoResult(**previous.model_dump(), original_action=action.action_type)
-            if action.state != PendingActionState.EXECUTED:
+            action = await self.actions.claim_undo_application(session, user_id, action_id)
+            if action is None:
+                action = await self._pending_or_404(session, user_id, action_id)
+                if action.state == PendingActionState.UNDONE and action.result:
+                    if action.result.get("success") is True:
+                        return _cached_undo_result(action.result, action.action_type)
+                    operation = _undo_operation_from_result(action.result)
+                    previous_token = _undo_verify_token_from_result(action.result)
+                    verify_token = _new_undo_verify_token()
+                    rotated_result = dict(action.result) | {"_undo_verify_token": verify_token}
+                    claimed = await self.actions.claim_undo_verification(
+                        session,
+                        user_id,
+                        action_id,
+                        expected_token=previous_token,
+                        result=rotated_result,
+                    )
+                    if claimed is None:
+                        current = await self._pending_or_404(session, user_id, action_id)
+                        if current.state == PendingActionState.UNDONE and current.result:
+                            if current.result.get("success") is True:
+                                return _cached_undo_result(current.result, current.action_type)
+                            if _is_recoverable_undo_result(current.result):
+                                raise ConflictError(
+                                    "undo_verification_in_progress",
+                                    "A newer undo verification is in progress",
+                                )
+                        raise ConflictError(
+                            "undo_recovery_state_invalid",
+                            "The prior undo cannot be recovered safely",
+                        )
+                    action = claimed
+                elif action.state == PendingActionState.EXECUTED:
+                    raise ConflictError("undo_in_progress", "The action is already being undone")
+                else:
+                    raise ConflictError(
+                        "invalid_action_state", "Only a successfully executed action can be undone"
+                    )
+            log = await self.actions.log_for_action(session, user_id, action_id)
+            if log is None:
                 raise ConflictError(
-                    "invalid_action_state", "Only a successfully executed action can be undone"
+                    "undo_recovery_state_invalid"
+                    if operation is not None or _looks_like_legacy_undo_result(action.result)
+                    else "undo_unavailable",
+                    "No operation log is available for undo",
+                )
+            undo = await self.actions.undo_for_log(session, user_id, log.id)
+            if undo is None:
+                raise ConflictError(
+                    "undo_recovery_state_invalid"
+                    if operation is not None or _looks_like_legacy_undo_result(action.result)
+                    else "undo_unavailable",
+                    "This operation cannot be undone safely",
+                )
+            if operation is not None:
+                if undo.state != UndoState.FAILED:
+                    raise ConflictError(
+                        "undo_recovery_state_invalid",
+                        "This undo recovery record is inconsistent",
+                    )
+            elif undo.state == UndoState.AVAILABLE:
+                operation = await self._apply_undo(session, action, undo, log)
+                verify_token = _new_undo_verify_token()
+                action.result = _undo_provisional_result(action, operation, verify_token)
+                undo.state = UndoState.FAILED
+                undo.error_message = "undo_verification_pending"
+            elif undo.state == UndoState.FAILED and _is_legacy_failed_undo_result(action, undo):
+                operation = _legacy_undo_operation(action, undo)
+                verify_token = _new_undo_verify_token()
+                action.result = _undo_provisional_result(action, operation, verify_token)
+                undo.error_message = "undo_verification_pending"
+            else:
+                raise ConflictError(
+                    "undo_recovery_state_invalid"
+                    if undo.state == UndoState.FAILED
+                    else "undo_unavailable",
+                    "This operation cannot be undone safely",
+                )
+
+        assert action is not None and operation is not None and verify_token is not None
+        action_type = action.action_type
+        last_error: str | None = None
+        try:
+            report = await self._verify_undo(session, user_id, action, operation)
+        except Exception as exc:
+            report = VerificationReport(
+                False,
+                {field: False for field in operation.expected_fields},
+                ("verification_exception",),
+                None,
+            )
+            last_error = f"undo_verification_exception: {type(exc).__name__}"
+        if not report.success and last_error is None:
+            last_error = "undo_verification_failed"
+        result = _undo_verification_result(
+            action_id,
+            action_type,
+            operation,
+            report,
+            last_error=last_error,
+        )
+        await session.rollback()
+        return await self._finalize_undo_verification(
+            session,
+            user_id,
+            action_id,
+            action_type,
+            operation,
+            report,
+            result,
+            verify_token=verify_token,
+            last_error=last_error,
+        )
+
+    async def _finalize_undo_verification(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        action_id: str,
+        action_type: ActionType,
+        operation: AppliedOperation,
+        report: VerificationReport,
+        result: ExecutionResult,
+        *,
+        verify_token: str,
+        last_error: str | None,
+    ) -> UndoResult:
+        persisted_result = result.model_dump(mode="json") | {
+            "applied": True,
+            "_undo_phase": "verified" if report.success else "applied",
+            "_undo_verify_token": verify_token,
+            "_operation": _operation_to_dict(operation),
+        }
+        async with session.begin():
+            action = await self.actions.finalize_undo_result(
+                session,
+                user_id,
+                action_id,
+                expected_token=verify_token,
+                result=persisted_result,
+            )
+            if action is None:
+                action = await self._pending_or_404(session, user_id, action_id)
+                if action.state == PendingActionState.UNDONE and action.result:
+                    if action.result.get("success") is True:
+                        return _cached_undo_result(action.result, action_type)
+                    if _is_recoverable_undo_result(action.result):
+                        raise ConflictError(
+                            "undo_verification_in_progress",
+                            "A newer undo verification superseded this result",
+                        )
+                raise ConflictError(
+                    "undo_recovery_state_invalid",
+                    "The undo state changed while finalizing verification",
                 )
             log = await self.actions.log_for_action(session, user_id, action_id)
             if log is None:
-                raise ConflictError("undo_unavailable", "No operation log is available for undo")
-            undo = await self.actions.undo_for_log(session, user_id, log.id)
-            if undo is None or undo.state != UndoState.AVAILABLE:
-                raise ConflictError("undo_unavailable", "This operation cannot be undone")
-            operation = await self._apply_undo(session, action, undo)
-
-        report = await self._verify_undo(session, user_id, action, operation)
-        action = await self._pending_or_404(session, user_id, action_id)
-        log = await self.actions.log_for_action(session, user_id, action_id)
-        assert log is not None
-        undo = await self.actions.undo_for_log(session, user_id, log.id)
-        assert undo is not None
-        base = _execution_result(
-            action, operation, report, action_name=f"undo_{action.action_type.value}"
-        )
-        if report.success:
-            action.state = PendingActionState.UNDONE
-            undo.state = UndoState.UNDONE
-            undo.undone_at = utc_now()
-            log.verification_result = dict(log.verification_result) | {
-                "undone": True,
-                "undo_result": base.model_dump(mode="json"),
-            }
-        else:
-            undo.state = UndoState.FAILED
-            undo.error_message = "undo_verification_failed"
-        action.result = base.model_dump(mode="json")
-        await session.commit()
-        return UndoResult(**base.model_dump(), original_action=action.action_type)
+                raise ConflictError(
+                    "undo_recovery_state_invalid", "The undo operation log is unavailable"
+                )
+            undo = await self.actions.finalize_undo_record(
+                session,
+                user_id,
+                log.id,
+                success=report.success,
+                error_message=last_error,
+                undone_at=utc_now() if report.success else None,
+            )
+            if undo is None:
+                raise ConflictError(
+                    "undo_recovery_state_invalid", "The undo record changed unexpectedly"
+                )
+            if report.success:
+                log.verification_result = dict(log.verification_result) | {
+                    "undone": True,
+                    "undo_result": result.model_dump(mode="json"),
+                }
+        return UndoResult(**result.model_dump(), original_action=action_type)
 
     async def _apply_undo(
-        self, session: AsyncSession, action: PendingAction, undo: UndoRecord
+        self,
+        session: AsyncSession,
+        action: PendingAction,
+        undo: UndoRecord,
+        log: ActionLog,
     ) -> AppliedOperation:
         if action.entity_type == EntityType.TASK:
             current = await self.tasks.get_for_update(session, action.user_id, undo.target_id)
+            self._guard_undo_version(action, log, current)
             if undo.undo_action == "delete":
-                if current is None:
-                    raise ConflictError("undo_target_missing", "The created task no longer exists")
+                assert current is not None
                 await self.tasks.delete(session, current)
                 return AppliedOperation(
                     current.id, _snapshot_task(current), None, {}, False, "", None
@@ -1246,9 +1407,9 @@ class ActionService:
             )
 
         current_event = await self.events.get_for_update(session, action.user_id, undo.target_id)
+        self._guard_undo_version(action, log, current_event)
         if undo.undo_action == "delete":
-            if current_event is None:
-                raise ConflictError("undo_target_missing", "The created event no longer exists")
+            assert current_event is not None
             await self.events.delete(session, current_event)
             return AppliedOperation(
                 current_event.id, _snapshot_event(current_event), None, {}, False, "", None
@@ -1268,6 +1429,43 @@ class ActionService:
             None,
             True,
         )
+
+    @staticmethod
+    def _guard_undo_version(
+        action: PendingAction,
+        log: ActionLog,
+        current: Task | CalendarEvent | None,
+    ) -> None:
+        expects_existing = action.action_type in {
+            ActionType.CREATE_TASK,
+            ActionType.UPDATE_TASK,
+            ActionType.CREATE_EVENT,
+            ActionType.UPDATE_EVENT,
+        }
+        if not expects_existing:
+            if current is not None:
+                raise _undo_version_conflict(
+                    action.target_id,
+                    expected_exists=False,
+                    current=current,
+                    expected_version=None,
+                )
+            return
+
+        snapshot = log.after_snapshot
+        expected_version = snapshot.get("version") if isinstance(snapshot, dict) else None
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int):
+            raise ConflictError(
+                "undo_recovery_state_invalid",
+                "The action history does not contain a valid post-action version",
+            )
+        if current is None or current.version != expected_version:
+            raise _undo_version_conflict(
+                action.target_id,
+                expected_exists=True,
+                current=current,
+                expected_version=expected_version,
+            )
 
     async def _restore_task(
         self,
@@ -1559,17 +1757,149 @@ def _operation_to_dict(operation: AppliedOperation) -> dict[str, Any]:
 
 def _operation_from_result(result: dict[str, Any]) -> AppliedOperation:
     try:
-        data = result["_operation"]
-        return AppliedOperation(**data)
+        return _validated_operation_from_result(result)
     except (KeyError, TypeError, ValidationError) as exc:
         raise ConflictError(
             "retry_state_invalid", "The prior execution cannot be retried safely"
         ) from exc
 
 
+def _undo_operation_from_result(result: dict[str, Any]) -> AppliedOperation:
+    try:
+        if (
+            result.get("success") is not False
+            or result.get("applied") is not True
+            or result.get("_undo_phase") != "applied"
+        ):
+            raise TypeError("undo recovery markers are invalid")
+        _undo_verify_token_from_result(result)
+        return _validated_operation_from_result(result)
+    except (KeyError, TypeError, ValidationError) as exc:
+        raise ConflictError(
+            "undo_recovery_state_invalid", "The prior undo cannot be recovered safely"
+        ) from exc
+
+
+def _is_recoverable_undo_result(result: dict[str, Any]) -> bool:
+    try:
+        _undo_operation_from_result(result)
+    except ConflictError:
+        return False
+    return True
+
+
+def _validated_operation_from_result(result: dict[str, Any]) -> AppliedOperation:
+    envelope = _AppliedOperationEnvelope.model_validate(result["_operation"])
+    return AppliedOperation(
+        record_id=envelope.record_id,
+        before_snapshot=envelope.before_snapshot,
+        after_snapshot=envelope.after_snapshot,
+        expected_fields=envelope.expected_fields,
+        should_exist=envelope.should_exist,
+        undo_action=envelope.undo_action,
+        undo_snapshot=envelope.undo_snapshot,
+        allow_conflict=envelope.allow_conflict,
+    )
+
+
+def _undo_verify_token_from_result(result: dict[str, Any]) -> str:
+    token = result.get("_undo_verify_token")
+    if not isinstance(token, str) or not token:
+        raise TypeError("undo verification token is invalid")
+    return token
+
+
+def _new_undo_verify_token() -> str:
+    return uuid4().hex
+
+
+def _cached_undo_result(result: dict[str, Any], action_type: ActionType) -> UndoResult:
+    try:
+        current = _public_result(result)
+    except ValidationError as exc:
+        raise ConflictError(
+            "undo_recovery_state_invalid", "The cached undo result is invalid"
+        ) from exc
+    return UndoResult(**current.model_dump(), original_action=action_type)
+
+
+def _looks_like_legacy_undo_result(result: dict[str, Any] | None) -> bool:
+    return bool(
+        result
+        and result.get("success") is False
+        and isinstance(result.get("action"), str)
+        and str(result["action"]).startswith("undo_")
+        and "_undo_phase" not in result
+    )
+
+
+def _is_legacy_failed_undo_result(action: PendingAction, undo: UndoRecord) -> bool:
+    result = action.result
+    return bool(
+        _looks_like_legacy_undo_result(result)
+        and result is not None
+        and result.get("action") == f"undo_{action.action_type.value}"
+        and result.get("action_id") == action.id
+        and result.get("record_id") == undo.target_id
+        and undo.error_message == "undo_verification_failed"
+    )
+
+
+def _legacy_undo_operation(action: PendingAction, undo: UndoRecord) -> AppliedOperation:
+    if undo.undo_action == "delete":
+        if action.action_type not in {ActionType.CREATE_TASK, ActionType.CREATE_EVENT}:
+            raise ConflictError(
+                "undo_recovery_state_invalid", "The legacy undo action is inconsistent"
+            )
+        return AppliedOperation(undo.target_id, None, None, {}, False, "", None)
+    if action.action_type not in {
+        ActionType.UPDATE_TASK,
+        ActionType.DELETE_TASK,
+        ActionType.UPDATE_EVENT,
+        ActionType.DELETE_EVENT,
+    } or not isinstance(undo.snapshot, dict):
+        raise ConflictError("undo_recovery_state_invalid", "The legacy undo snapshot is invalid")
+    expected = (
+        _task_business_fields(undo.snapshot)
+        if action.entity_type == EntityType.TASK
+        else _event_business_fields(undo.snapshot)
+    )
+    return AppliedOperation(
+        undo.target_id,
+        None,
+        None,
+        expected,
+        True,
+        "",
+        None,
+        action.entity_type == EntityType.EVENT,
+    )
+
+
 def _public_result(result: dict[str, Any]) -> ExecutionResult:
     public = {key: value for key, value in result.items() if key in ExecutionResult.model_fields}
     return ExecutionResult.model_validate(public)
+
+
+def _undo_provisional_result(
+    action: PendingAction, operation: AppliedOperation, verify_token: str
+) -> dict[str, Any]:
+    return {
+        "success": False,
+        "action": f"undo_{action.action_type.value}",
+        "record_id": operation.record_id,
+        "verified_fields": {},
+        "side_effects": [],
+        "message": "撤销写入已提交，正在验证",
+        "error": "undo_verification_pending",
+        "retryable": True,
+        "action_id": action.id,
+        "record": None,
+        "applied": True,
+        "_undo_phase": "applied",
+        "_undo_verify_token": verify_token,
+        "_operation": _operation_to_dict(operation),
+    }
 
 
 def _provisional_result(
@@ -1589,6 +1919,37 @@ def _provisional_result(
         "applied": True,
         "_operation": _operation_to_dict(operation),
     }
+
+
+def _undo_verification_result(
+    action_id: str,
+    action_type: ActionType,
+    operation: AppliedOperation,
+    report: VerificationReport,
+    *,
+    last_error: str | None,
+) -> ExecutionResult:
+    record: TaskView | EventView | None = None
+    if isinstance(report.record, Task):
+        record = TaskView.model_validate(report.record)
+    elif isinstance(report.record, CalendarEvent):
+        record = EventView.model_validate(report.record)
+    return ExecutionResult(
+        success=report.success,
+        action=f"undo_{action_type.value}",
+        record_id=operation.record_id,
+        verified_fields=report.verified_fields,
+        side_effects=list(report.side_effects),
+        message=(
+            "撤销已完成并通过数据库验证"
+            if report.success
+            else "数据库最终状态验证失败，未报告为成功"
+        ),
+        error=None if report.success else last_error,
+        retryable=not report.success,
+        action_id=action_id,
+        record=record,
+    )
 
 
 def _execution_verification_result(
@@ -1617,6 +1978,26 @@ def _execution_verification_result(
         retryable=not report.success and attempt_count < max_attempts,
         action_id=action_id,
         record=record,
+    )
+
+
+def _undo_version_conflict(
+    target_id: str | None,
+    *,
+    expected_exists: bool,
+    current: Task | CalendarEvent | None,
+    expected_version: int | None,
+) -> ConflictError:
+    return ConflictError(
+        "undo_version_conflict",
+        "The record changed after this action and can no longer be undone safely",
+        {
+            "target_id": target_id,
+            "expected_exists": expected_exists,
+            "current_exists": current is not None,
+            "expected_version": expected_version,
+            "current_version": current.version if current is not None else None,
+        },
     )
 
 
