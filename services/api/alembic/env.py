@@ -10,7 +10,12 @@ from app.db.base import Base
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
-config.set_main_option("sqlalchemy.url", get_settings().database_url)
+# Alembic delegates this value to ConfigParser, where literal percent signs
+# must be doubled at the write boundary.
+config.set_main_option(
+    "sqlalchemy.url",
+    get_settings().database_url.replace("%", "%%"),
+)
 target_metadata = Base.metadata
 
 
