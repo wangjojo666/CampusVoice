@@ -366,6 +366,8 @@ async def _seed_retention_records(
     recent: datetime,
 ) -> None:
     async with factory() as session, session.begin():
+        session.add(User(id="retention_other", display_name="Retention Other", is_active=True))
+        await session.flush()
         session.add(
             VoiceSession(
                 id="voi_retention",
@@ -449,6 +451,45 @@ async def _seed_retention_records(
                     created_at=old,
                     updated_at=old,
                 ),
+                PendingAction(
+                    id="act_expired_unvisited",
+                    user_id=user_id,
+                    action_type=ActionType.CREATE_TASK,
+                    entity_type=EntityType.TASK,
+                    payload={"title": "retention-private-sentinel"},
+                    state=PendingActionState.AWAITING_CONFIRMATION,
+                    risk_level=RiskLevel.MEDIUM,
+                    required_confirmations=1,
+                    expires_at=old,
+                    created_at=old,
+                    updated_at=old,
+                ),
+                PendingAction(
+                    id="act_recently_expired",
+                    user_id=user_id,
+                    action_type=ActionType.CREATE_TASK,
+                    entity_type=EntityType.TASK,
+                    payload={"title": "recent-expired-retention-sentinel"},
+                    state=PendingActionState.AWAITING_CONFIRMATION,
+                    risk_level=RiskLevel.MEDIUM,
+                    required_confirmations=1,
+                    expires_at=recent - timedelta(seconds=1),
+                    created_at=recent,
+                    updated_at=recent,
+                ),
+                PendingAction(
+                    id="act_other_expired_unvisited",
+                    user_id="retention_other",
+                    action_type=ActionType.CREATE_TASK,
+                    entity_type=EntityType.TASK,
+                    payload={"title": "other-user-retention-sentinel"},
+                    state=PendingActionState.AWAITING_CONFIRMATION,
+                    risk_level=RiskLevel.MEDIUM,
+                    required_confirmations=1,
+                    expires_at=old,
+                    created_at=old,
+                    updated_at=old,
+                ),
                 ActionLog(
                     id="log_old",
                     user_id=user_id,
@@ -468,6 +509,18 @@ async def _seed_retention_records(
                     created_at=recent,
                 ),
             ]
+        )
+
+
+async def _pending_action_row(
+    factory: async_sessionmaker[AsyncSession], user_id: str, action_id: str
+) -> PendingAction | None:
+    async with factory() as session:
+        return await session.scalar(
+            select(PendingAction).where(
+                PendingAction.id == action_id,
+                PendingAction.user_id == user_id,
+            )
         )
 
 
@@ -798,7 +851,7 @@ def test_retention_deletes_only_expired_current_user_records(client: TestClient)
     assert counts["transcriptions"] == 1
     assert counts["correction_records"] == 1
     assert counts["conversations"] == 1
-    assert counts["terminal_pending_actions"] == 1
+    assert counts["terminal_pending_actions"] == 2
     assert counts["action_logs"] == 1
     assert counts["expired_websocket_tickets"] == 1
     assert counts["expired_write_challenges"] == 1
@@ -806,8 +859,57 @@ def test_retention_deletes_only_expired_current_user_records(client: TestClient)
     assert {item["id"] for item in exported["transcriptions"]} == {"trn_recent"}
     assert {item["id"] for item in exported["correction_records"]} == {"cor_recent"}
     assert {item["id"] for item in exported["conversations"]} == {"cnv_recent"}
-    assert {item["id"] for item in exported["pending_actions"]} == {"act_old_active"}
+    assert {item["id"] for item in exported["pending_actions"]} == {
+        "act_old_active",
+        "act_recently_expired",
+    }
+    assert "retention-private-sentinel" not in json.dumps(exported, ensure_ascii=False)
     assert {item["id"] for item in exported["action_logs"]} == {"log_recent"}
+    assert (
+        _portal_call(
+            client,
+            _pending_action_row,
+            _factory(client),
+            "user_demo",
+            "act_expired_unvisited",
+        )
+        is None
+    )
+    recent_action = _portal_call(
+        client,
+        _pending_action_row,
+        _factory(client),
+        "user_demo",
+        "act_recently_expired",
+    )
+    assert recent_action is not None
+    assert recent_action.state == PendingActionState.EXPIRED
+    assert recent_action.payload == {"title": "recent-expired-retention-sentinel"}
+    active_action = _portal_call(
+        client,
+        _pending_action_row,
+        _factory(client),
+        "user_demo",
+        "act_old_active",
+    )
+    assert active_action is not None
+    assert active_action.state == PendingActionState.READY
+    assert active_action.payload == {"title": "old but active"}
+    other_action = _portal_call(
+        client,
+        _pending_action_row,
+        _factory(client),
+        "retention_other",
+        "act_other_expired_unvisited",
+    )
+    assert other_action is not None
+    assert other_action.state == PendingActionState.AWAITING_CONFIRMATION
+    assert other_action.payload == {"title": "other-user-retention-sentinel"}
+
+    repeated = client.post("/api/privacy/retention/run")
+
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["deleted_counts"]["terminal_pending_actions"] == 0
 
 
 def test_clear_data_consumes_one_time_challenge_and_preserves_user(client: TestClient) -> None:
