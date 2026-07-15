@@ -151,6 +151,24 @@ def test_core_defaults_are_dependency_safe_and_partial_llm_config_is_rejected() 
         Settings(env="test", llm_base_url="https://llm.example/v1")
 
 
+def test_settings_ignore_dotenv_from_runtime_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    untrusted_prefix = f"/untrusted-{tmp_path.name}"
+    (tmp_path / ".env").write_text(
+        f"CAMPUSVOICE_API_PREFIX={untrusted_prefix}\nCAMPUSVOICE_ACTION_TTL_MINUTES=2147483647\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("CAMPUSVOICE_API_PREFIX", raising=False)
+    monkeypatch.delenv("CAMPUSVOICE_ACTION_TTL_MINUTES", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    settings = Settings(env="test")
+
+    assert settings.api_prefix != untrusted_prefix
+    assert settings.action_ttl_minutes != 2_147_483_647
+
+
 def test_disabled_ai_components_need_no_optional_modules(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("app.core.startup.find_spec", lambda _name: None)
 

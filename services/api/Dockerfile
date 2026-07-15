@@ -7,8 +7,11 @@ ARG PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cu130
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    PYTHONSAFEPATH=1 \
+    PYTHONPATH=/app/services/api \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     HOME=/home/campusvoice \
+    CAMPUSVOICE_DATABASE_URL=sqlite+aiosqlite:////data/campusvoice.db \
     MODELSCOPE_CACHE=/models/modelscope \
     HF_HOME=/models/huggingface
 
@@ -49,4 +52,6 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=5 \
 
 USER campusvoice
 
-ENTRYPOINT ["./docker-entrypoint.sh"]
+WORKDIR /data
+
+ENTRYPOINT ["/app/services/api/docker-entrypoint.sh"]
