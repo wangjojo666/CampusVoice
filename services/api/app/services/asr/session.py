@@ -210,7 +210,9 @@ async def handle_asr_websocket(
         failures = await close_resources()
         if failures:
             await report_cleanup_failure()
-            raise failures[0]
+            if len(failures) == 1:
+                raise failures[0]
+            raise ExceptionGroup("ASR session cleanup failed", failures)
 
     async def process_pcm_frame(pcm_frame: bytes) -> bool:
         """Process at most one 60 ms VAD frame; return True for a fatal provider error."""
