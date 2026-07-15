@@ -69,7 +69,7 @@ services:
       CAMPUSVOICE_EMBEDDING_MODEL: ${CAMPUSVOICE_EMBEDDING_MODEL:-BAAI/bge-small-zh-v1.5}
       CAMPUSVOICE_EMBEDDING_DEVICE: ${CAMPUSVOICE_EMBEDDING_DEVICE:-cpu}
     ports:
-      - "8000:8000"
+      - "${CAMPUSVOICE_BIND_HOST:-127.0.0.1}:8000:8000"
     volumes:
       - campusvoice_data:/data
       - campusvoice_models:/models
@@ -86,7 +86,7 @@ services:
       api:
         condition: service_healthy
     ports:
-      - "3000:3000"
+      - "${CAMPUSVOICE_BIND_HOST:-127.0.0.1}:3000:3000"
     restart: unless-stopped
 
   redis:
