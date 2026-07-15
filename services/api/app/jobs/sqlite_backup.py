@@ -15,8 +15,13 @@ def verify_database(path: Path) -> dict[str, Any]:
     uri = f"file:{resolved.as_posix()}?mode=ro"
     with closing(sqlite3.connect(uri, uri=True)) as connection:
         result = connection.execute("PRAGMA integrity_check").fetchone()
+        foreign_key_violation = None
+        if result == ("ok",):
+            foreign_key_violation = connection.execute("PRAGMA foreign_key_check").fetchone()
     if result != ("ok",):
         raise RuntimeError(f"SQLite integrity check failed: {result!r}")
+    if foreign_key_violation is not None:
+        raise RuntimeError("SQLite foreign key check failed")
     digest = hashlib.sha256()
     with resolved.open("rb") as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):

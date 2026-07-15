@@ -34,6 +34,29 @@ def test_online_sqlite_backup_is_consistent_and_refuses_overwrite(tmp_path: Path
         create_backup(source, backup)
 
 
+def test_verify_database_rejects_foreign_key_violations(tmp_path: Path) -> None:
+    database = tmp_path / "orphaned.db"
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
+        connection.execute(
+            "CREATE TABLE children (parent_id INTEGER NOT NULL REFERENCES parents(id))"
+        )
+        connection.execute("INSERT INTO children VALUES (1)")
+
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert connection.execute("PRAGMA foreign_key_check").fetchone() is not None
+
+    with pytest.raises(RuntimeError, match="foreign key check failed"):
+        verify_database(database)
+
+    backup = tmp_path / "orphaned-backup.db"
+    with pytest.raises(RuntimeError, match="foreign key check failed"):
+        create_backup(database, backup)
+    assert not backup.exists()
+
+
 def test_failed_backup_removes_only_its_reservation_and_can_retry(tmp_path: Path) -> None:
     source = tmp_path / "corrupt.db"
     destination = tmp_path / "retry.db"
@@ -92,19 +115,28 @@ def test_verify_database_closes_connection_on_success_and_failure(
     path.write_bytes(b"digest input")
 
     class Result:
-        def __init__(self, value: tuple[str] | tuple[str, int]) -> None:
+        def __init__(self, value: tuple[Any, ...] | None) -> None:
             self._value = value
 
-        def fetchone(self) -> tuple[str] | tuple[str, int]:
+        def fetchone(self) -> tuple[Any, ...] | None:
             return self._value
 
     class Connection:
-        def __init__(self, value: tuple[str] | tuple[str, int]) -> None:
-            self.value = value
+        def __init__(
+            self,
+            integrity_result: tuple[Any, ...],
+            foreign_key_result: tuple[Any, ...] | None = None,
+        ) -> None:
+            self.results = {
+                "PRAGMA integrity_check": integrity_result,
+                "PRAGMA foreign_key_check": foreign_key_result,
+            }
+            self.statements: list[str] = []
             self.closed = False
 
-        def execute(self, _statement: str) -> Result:
-            return Result(self.value)
+        def execute(self, statement: str) -> Result:
+            self.statements.append(statement)
+            return Result(self.results[statement])
 
         def close(self) -> None:
             self.closed = True
@@ -112,13 +144,29 @@ def test_verify_database_closes_connection_on_success_and_failure(
     successful = Connection(("ok",))
     monkeypatch.setattr(sqlite_backup.sqlite3, "connect", lambda *_args, **_kwargs: successful)
     assert verify_database(path)["integrity_check"] == "ok"
+    assert successful.statements == [
+        "PRAGMA integrity_check",
+        "PRAGMA foreign_key_check",
+    ]
     assert successful.closed is True
 
     failed = Connection(("not ok", 1))
     monkeypatch.setattr(sqlite_backup.sqlite3, "connect", lambda *_args, **_kwargs: failed)
     with pytest.raises(RuntimeError, match="integrity check failed"):
         verify_database(path)
+    assert failed.statements == ["PRAGMA integrity_check"]
     assert failed.closed is True
+
+    foreign_key_failed = Connection(("ok",), ("children", 1, "parents", 0))
+    monkeypatch.setattr(
+        sqlite_backup.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: foreign_key_failed,
+    )
+    with pytest.raises(RuntimeError, match="foreign key check failed") as caught:
+        verify_database(path)
+    assert "children" not in str(caught.value)
+    assert foreign_key_failed.closed is True
 
 
 def test_cleanup_error_does_not_replace_original_backup_error(
