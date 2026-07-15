@@ -7,6 +7,9 @@ class CampusVoicePcmProcessor extends AudioWorkletProcessor {
     this.chunkSize = 1600;
     this.samples = [];
     this.levelTick = 0;
+    this.resampleBuffer = new Float32Array(0);
+    this.inputSampleCount = 0;
+    this.outputSampleCount = 0;
     this.port.onmessage = (event) => {
       if (event.data?.type === "flush") this.flush();
     };
@@ -14,16 +17,37 @@ class CampusVoicePcmProcessor extends AudioWorkletProcessor {
 
   downsample(input) {
     if (sampleRate === this.targetRate) return input;
-    const ratio = sampleRate / this.targetRate;
-    const outputLength = Math.max(1, Math.floor(input.length / ratio));
+
+    const bufferStart = this.inputSampleCount - this.resampleBuffer.length;
+    const combined = new Float32Array(this.resampleBuffer.length + input.length);
+    combined.set(this.resampleBuffer);
+    combined.set(input, this.resampleBuffer.length);
+    this.inputSampleCount += input.length;
+
+    const availableOutputCount = Math.floor((this.inputSampleCount * this.targetRate) / sampleRate);
+    const outputLength = availableOutputCount - this.outputSampleCount;
     const output = new Float32Array(outputLength);
     for (let index = 0; index < outputLength; index += 1) {
-      const start = Math.floor(index * ratio);
-      const end = Math.min(input.length, Math.floor((index + 1) * ratio));
+      const outputIndex = this.outputSampleCount + index;
+      const start = outputIndex * sampleRate - bufferStart * this.targetRate;
+      const end = (outputIndex + 1) * sampleRate - bufferStart * this.targetRate;
       let sum = 0;
-      for (let cursor = start; cursor < end; cursor += 1) sum += input[cursor] ?? 0;
-      output[index] = sum / Math.max(1, end - start);
+      for (
+        let cursor = Math.floor(start / this.targetRate);
+        cursor < Math.ceil(end / this.targetRate);
+        cursor += 1
+      ) {
+        const overlap =
+          Math.min(end, (cursor + 1) * this.targetRate) - Math.max(start, cursor * this.targetRate);
+        if (overlap > 0) sum += (combined[cursor] ?? 0) * overlap;
+      }
+      output[index] = sum / sampleRate;
     }
+
+    this.outputSampleCount = availableOutputCount;
+    const nextInputPosition = (this.outputSampleCount * sampleRate) / this.targetRate;
+    const discardCount = Math.max(0, Math.floor(nextInputPosition) - bufferStart);
+    this.resampleBuffer = combined.slice(Math.min(discardCount, combined.length));
     return output;
   }
 
@@ -41,6 +65,10 @@ class CampusVoicePcmProcessor extends AudioWorkletProcessor {
       this.emitChunk(new Float32Array(this.samples));
       this.samples = [];
     }
+    this.resampleBuffer = new Float32Array(0);
+    this.inputSampleCount = 0;
+    this.outputSampleCount = 0;
+    this.levelTick = 0;
   }
 
   process(inputs) {
