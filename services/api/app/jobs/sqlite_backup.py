@@ -1,7 +1,9 @@
 import argparse
 import hashlib
 import json
+import os
 import sqlite3
+from contextlib import closing, suppress
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +13,7 @@ def verify_database(path: Path) -> dict[str, Any]:
     if not resolved.is_file():
         raise FileNotFoundError(f"SQLite database does not exist: {resolved}")
     uri = f"file:{resolved.as_posix()}?mode=ro"
-    with sqlite3.connect(uri, uri=True) as connection:
+    with closing(sqlite3.connect(uri, uri=True)) as connection:
         result = connection.execute("PRAGMA integrity_check").fetchone()
     if result != ("ok",):
         raise RuntimeError(f"SQLite integrity check failed: {result!r}")
@@ -34,21 +36,45 @@ def create_backup(source: Path, destination: Path) -> dict[str, Any]:
         raise ValueError("backup source and destination must differ")
     if not source_path.is_file():
         raise FileNotFoundError(f"SQLite source does not exist: {source_path}")
-    if destination_path.exists():
-        raise FileExistsError(f"backup destination already exists: {destination_path}")
     if not destination_path.parent.is_dir():
         raise FileNotFoundError(
             f"backup destination directory does not exist: {destination_path.parent}"
         )
 
     source_uri = f"file:{source_path.as_posix()}?mode=ro"
-    with (
-        sqlite3.connect(source_uri, uri=True) as source_connection,
-        sqlite3.connect(destination_path) as destination_connection,
-    ):
-        source_connection.backup(destination_connection)
-        destination_connection.commit()
-    return verify_database(destination_path)
+    destination_created = False
+    reservation: int | None = None
+    try:
+        try:
+            reservation = os.open(
+                destination_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            destination_created = True
+        except FileExistsError as error:
+            raise FileExistsError(
+                f"backup destination already exists: {destination_path}"
+            ) from error
+        os.close(reservation)
+        reservation = None
+
+        with (
+            closing(sqlite3.connect(source_uri, uri=True)) as source_connection,
+            closing(sqlite3.connect(destination_path)) as destination_connection,
+        ):
+            source_connection.backup(destination_connection)
+            destination_connection.commit()
+        return verify_database(destination_path)
+    except Exception:
+        if reservation is not None:
+            with suppress(OSError):
+                os.close(reservation)
+        if destination_created:
+            # Cleanup must never replace the original backup/verification error.
+            with suppress(OSError):
+                destination_path.unlink(missing_ok=True)
+        raise
 
 
 def _parser() -> argparse.ArgumentParser:

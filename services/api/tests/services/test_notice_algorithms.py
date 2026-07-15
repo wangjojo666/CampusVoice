@@ -26,6 +26,7 @@ from app.services.notices.service import (
     _impact_view,
     _migration_item_view,
     _normalize_title,
+    _operation_receipt,
     _patched_snapshot,
     _plan_signature,
     _plan_view,
@@ -38,6 +39,35 @@ from app.services.notices.service import (
 )
 
 NOW = datetime(2026, 7, 13, tzinfo=UTC)
+
+
+def test_legacy_receipt_fallback_requires_an_exact_operation_match() -> None:
+    separated = {"operation": "execute", "marker": "separated"}
+    legacy_execute = {
+        "operation": "execute",
+        "verified": True,
+        "verified_count": 1,
+        "total_count": 1,
+        "status": "verified",
+        "verified_at": NOW.isoformat(),
+    }
+    legacy_undo = legacy_execute | {"operation": "undo", "status": "undone"}
+
+    assert _operation_receipt(separated, legacy_undo, "execute", receipt_type="plan") is separated
+    assert _operation_receipt({}, legacy_execute, "execute", receipt_type="plan") is legacy_execute
+    assert _operation_receipt({}, legacy_undo, "execute", receipt_type="plan") == {}
+    assert _operation_receipt({}, {"operation": "Execute"}, "execute", receipt_type="plan") == {}
+    assert _operation_receipt({}, {"operation": "execute"}, "execute", receipt_type="plan") == {}
+    assert _operation_receipt({}, {"verified": True}, "execute", receipt_type="plan") == {}
+    legacy_item = {
+        "operation": "execute",
+        "verified": True,
+        "verified_at": NOW.isoformat(),
+        "expected_snapshot": {"version": 1},
+        "database_snapshot": {"version": 2},
+    }
+    assert _operation_receipt({}, legacy_item, "execute", receipt_type="item") is legacy_item
+    assert _operation_receipt({}, {"operation": "execute"}, "execute", receipt_type="item") == {}
 
 
 def _claim(key: str, value: dict[str, object], normalized: dict[str, object]) -> NoticeClaim:
