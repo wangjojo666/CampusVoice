@@ -11,7 +11,7 @@ class FakeWebSocket {
   onopen: (() => void) | null = null;
   onmessage: ((event: { data: string }) => void) | null = null;
   onerror: (() => void) | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((event: { code: number; wasClean: boolean }) => void) | null = null;
 
   constructor(
     readonly url: string,
@@ -24,8 +24,8 @@ class FakeWebSocket {
     this.sent.push(value);
   }
 
-  close() {
-    this.onclose?.();
+  close(code = 1000) {
+    this.onclose?.({ code, wasClean: code === 1000 });
   }
 }
 
@@ -53,5 +53,28 @@ describe("ASR WebSocket protocol", () => {
     await connected;
     client.pause();
     expect(JSON.parse(String(socket?.sent[1]))).toEqual({ type: "flush" });
+  });
+
+  it("reports stop intent together with the actual WebSocket close result", async () => {
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const onClose = vi.fn();
+    const client = new AsrWebSocketClient(
+      { onMessage: vi.fn(), onClose, onError: vi.fn() },
+      { url: "ws://localhost/ws/asr", ticket: "short-lived-ticket" },
+    );
+    const connected = client.connect();
+    const socket = FakeWebSocket.instance;
+    socket?.onopen?.();
+    socket?.onmessage?.({ data: JSON.stringify({ type: "ready", session_id: "voice-1" }) });
+    await connected;
+
+    client.stop();
+    socket?.onclose?.({ code: 1006, wasClean: false });
+
+    expect(onClose).toHaveBeenCalledWith({
+      stopRequested: true,
+      code: 1006,
+      wasClean: false,
+    });
   });
 });
