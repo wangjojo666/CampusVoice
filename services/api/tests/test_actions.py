@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 
 from app.models.entities import ActionLog, PendingAction, Task, UndoRecord
 from app.models.enums import PendingActionState
+from app.repositories.actions import ActionRepository
 from app.repositories.tasks import TaskRepository
 from app.schemas.actions import CancelActionRequest, ExecutionResult, UndoResult
 from app.services.actions.service import ActionService, AppliedOperation
@@ -969,6 +970,116 @@ def test_verifier_exception_recovers_without_reapplying_business_write(
     assert _action_side_effect_counts(client) == (1, 1, 1)
 
 
+def test_executing_action_recovers_after_prepare_ttl_without_reapplying(
+    client: TestClient,
+) -> None:
+    prepared = client.post(
+        "/api/actions/prepare",
+        json={"action": "create_task", "payload": {"title": "Recover after process exit"}},
+    ).json()
+    action_id = prepared["id"]
+    confirm_action(client, action_id)
+
+    async def interrupt_verification(*_args: object, **_kwargs: object) -> VerificationReport:
+        raise KeyboardInterrupt("simulated process exit after commit")
+
+    async def crash_after_commit() -> None:
+        factory = client.app.state.session_factory
+        service = ActionService()
+        async with factory() as session:
+            with (
+                patch.object(service, "_verify", new=interrupt_verification),
+                pytest.raises(KeyboardInterrupt, match="simulated process exit"),
+            ):
+                await service.execute(session, "user_demo", action_id)
+
+    asyncio.run(crash_after_commit())
+
+    interrupted = client.get(f"/api/actions/{action_id}").json()
+    assert interrupted["state"] == "executing"
+    assert interrupted["result"]["applied"] is True
+    assert _action_side_effect_counts(client) == (1, 1, 1)
+
+    future = datetime.now(UTC) + timedelta(days=1)
+    with patch("app.services.actions.service.utc_now", return_value=future):
+        recovered = client.post(f"/api/actions/{action_id}/execute")
+
+    assert recovered.status_code == 200
+    assert recovered.json()["success"] is True
+    state = client.get(f"/api/actions/{action_id}").json()
+    assert state["state"] == "executed"
+    assert state["attempt_count"] == 1
+    assert _action_side_effect_counts(client) == (1, 1, 1)
+
+
+def test_failed_applied_action_recovers_after_prepare_ttl_without_reapplying(
+    client: TestClient,
+) -> None:
+    prepared = client.post(
+        "/api/actions/prepare",
+        json={"action": "create_task", "payload": {"title": "Recover failed verification"}},
+    ).json()
+    action_id = prepared["id"]
+    confirm_action(client, action_id)
+
+    original_verify = VerificationService.verify_task
+    calls = 0
+
+    async def fail_once(self: object, *args: object, **kwargs: object) -> VerificationReport:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return VerificationReport(False, {"title": False}, ("forced_test_failure",), None)
+        return await original_verify(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    with patch.object(VerificationService, "verify_task", new=fail_once):
+        first = client.post(f"/api/actions/{action_id}/execute")
+        failed = client.get(f"/api/actions/{action_id}").json()
+        assert failed["state"] == "failed"
+        assert failed["result"]["applied"] is True
+        future = datetime.now(UTC) + timedelta(days=1)
+        with patch("app.services.actions.service.utc_now", return_value=future):
+            recovered = client.post(f"/api/actions/{action_id}/execute")
+
+    assert first.status_code == 200
+    assert first.json()["success"] is False
+    assert recovered.status_code == 200
+    assert recovered.json()["success"] is True
+    assert client.get(f"/api/actions/{action_id}").json()["state"] == "executed"
+    assert _action_side_effect_counts(client) == (1, 1, 1)
+
+
+def test_failed_unapplied_action_still_expires_after_prepare_ttl(
+    client: TestClient,
+) -> None:
+    prepared = client.post(
+        "/api/actions/prepare",
+        json={"action": "create_task", "payload": {"title": "Expire failed write"}},
+    ).json()
+    action_id = prepared["id"]
+    confirm_action(client, action_id)
+
+    async def fail_write(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("forced database failure")
+
+    with patch("app.repositories.tasks.TaskRepository.create", new=fail_write):
+        first = client.post(f"/api/actions/{action_id}/execute")
+    failed = client.get(f"/api/actions/{action_id}").json()
+    assert first.status_code == 200
+    assert first.json()["success"] is False
+    assert failed["state"] == "failed"
+    assert failed["result"]["applied"] is False
+
+    future = datetime.now(UTC) + timedelta(days=1)
+    with patch("app.services.actions.service.utc_now", return_value=future):
+        expired = client.post(f"/api/actions/{action_id}/execute")
+
+    assert expired.status_code == 409
+    assert expired.json()["error"]["code"] == "action_expired"
+    assert client.get(f"/api/actions/{action_id}").json()["state"] == "expired"
+    assert _action_side_effect_counts(client) == (0, 1, 0)
+
+
 def test_concurrent_execute_claim_creates_business_record_once(client: TestClient) -> None:
     prepared = client.post(
         "/api/actions/prepare",
@@ -1097,6 +1208,59 @@ def test_expired_action_is_durably_marked_and_rejected(client: TestClient) -> No
     assert response.headers["Pragma"] == "no-cache"
     assert response.json()["error"]["code"] == "action_expired"
     assert client.get(f"/api/actions/{action_id}").json()["state"] == "expired"
+
+
+def test_bulk_expiry_preserves_actions_with_applied_business_writes(
+    client: TestClient,
+) -> None:
+    action_ids = [
+        client.post(
+            "/api/actions/prepare",
+            json={"action": "create_task", "payload": {"title": f"Bulk expiry {index}"}},
+        ).json()["id"]
+        for index in range(4)
+    ]
+    pending_id, failed_unapplied_id, failed_applied_id, executing_id = action_ids
+    past = datetime.now(UTC) - timedelta(days=1)
+
+    async def expire_rows() -> int:
+        factory = client.app.state.session_factory
+        async with factory() as session, session.begin():
+            rows = list(
+                await session.scalars(select(PendingAction).where(PendingAction.id.in_(action_ids)))
+            )
+            by_id = {row.id: row for row in rows}
+            for row in rows:
+                row.expires_at = past
+            by_id[failed_unapplied_id].state = PendingActionState.FAILED
+            by_id[failed_unapplied_id].result = {"applied": False}
+            by_id[failed_applied_id].state = PendingActionState.FAILED
+            by_id[failed_applied_id].result = {"applied": True}
+            by_id[executing_id].state = PendingActionState.EXECUTING
+            by_id[executing_id].result = {"applied": True}
+            await session.flush()
+            return await ActionRepository().expire_old_actions(
+                session, "user_demo", datetime.now(UTC)
+            )
+
+    expired_count = asyncio.run(expire_rows())
+
+    async def states() -> dict[str, PendingActionState]:
+        factory = client.app.state.session_factory
+        async with factory() as session:
+            rows = await session.execute(
+                select(PendingAction.id, PendingAction.state).where(
+                    PendingAction.id.in_(action_ids)
+                )
+            )
+            return {action_id: state for action_id, state in rows}
+
+    persisted = asyncio.run(states())
+    assert expired_count == 2
+    assert persisted[pending_id] == PendingActionState.EXPIRED
+    assert persisted[failed_unapplied_id] == PendingActionState.EXPIRED
+    assert persisted[failed_applied_id] == PendingActionState.FAILED
+    assert persisted[executing_id] == PendingActionState.EXECUTING
 
 
 def test_expired_undo_window_is_durably_rejected(client: TestClient) -> None:

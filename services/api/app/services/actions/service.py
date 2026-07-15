@@ -1725,12 +1725,17 @@ class ActionService:
     ) -> None:
         expired = False
         async with session.begin():
-            action = await self._pending_or_404(session, user_id, action_id, lock=True)
-            if action.state == PendingActionState.EXPIRED:
+            expired_id = await self.actions.expire_action(
+                session,
+                user_id,
+                action_id,
+                utc_now(),
+            )
+            if expired_id is not None:
                 expired = True
-            elif action.expires_at <= utc_now() and action.state not in TERMINAL_STATES:
-                action.state = PendingActionState.EXPIRED
-                expired = True
+            else:
+                action = await self._pending_or_404(session, user_id, action_id)
+                expired = action.state == PendingActionState.EXPIRED
         if expired:
             raise ConflictError("action_expired", "The pending action has expired")
 

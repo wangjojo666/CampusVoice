@@ -3,9 +3,27 @@ from typing import Any
 
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.models.entities import ActionLog, PendingAction, UndoRecord
 from app.models.enums import PendingActionState, UndoState
+
+
+def _is_unapplied_expirable_state() -> ColumnElement[bool]:
+    return or_(
+        PendingAction.state.in_(
+            [
+                PendingActionState.NEEDS_INPUT,
+                PendingActionState.AWAITING_CONFIRMATION,
+                PendingActionState.AWAITING_SECOND_CONFIRMATION,
+                PendingActionState.READY,
+            ]
+        ),
+        and_(
+            PendingAction.state == PendingActionState.FAILED,
+            PendingAction.result["applied"].as_boolean().is_not(True),
+        ),
+    )
 
 
 class ActionRepository:
@@ -288,23 +306,35 @@ class ActionRepository:
         return undo
 
     async def expire_old_actions(self, session: AsyncSession, user_id: str, now: object) -> int:
-        pending = list(
+        expired_ids = list(
             await session.scalars(
-                select(PendingAction).where(
+                update(PendingAction)
+                .where(
                     PendingAction.user_id == user_id,
                     PendingAction.expires_at <= now,
-                    PendingAction.state.in_(
-                        [
-                            PendingActionState.NEEDS_INPUT,
-                            PendingActionState.AWAITING_CONFIRMATION,
-                            PendingActionState.AWAITING_SECOND_CONFIRMATION,
-                            PendingActionState.READY,
-                            PendingActionState.FAILED,
-                        ]
-                    ),
+                    _is_unapplied_expirable_state(),
                 )
+                .values(state=PendingActionState.EXPIRED)
+                .returning(PendingAction.id)
             )
         )
-        for action in pending:
-            action.state = PendingActionState.EXPIRED
-        return len(pending)
+        return len(expired_ids)
+
+    async def expire_action(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        action_id: str,
+        now: object,
+    ) -> str | None:
+        return await session.scalar(
+            update(PendingAction)
+            .where(
+                PendingAction.id == action_id,
+                PendingAction.user_id == user_id,
+                PendingAction.expires_at <= now,
+                _is_unapplied_expirable_state(),
+            )
+            .values(state=PendingActionState.EXPIRED)
+            .returning(PendingAction.id)
+        )
