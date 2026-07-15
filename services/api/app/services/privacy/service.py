@@ -5,7 +5,7 @@ from secrets import token_urlsafe
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.dml import Delete
 
@@ -41,6 +41,7 @@ from app.models.entities import (
     WriteChallenge,
 )
 from app.models.enums import PendingActionState
+from app.repositories.actions import ActionRepository
 from app.schemas.privacy import (
     PrivacyDeletionChallengeResponse,
     PrivacyDeletionResult,
@@ -117,6 +118,7 @@ class PrivacyService:
     ) -> None:
         self._session_factory = session_factory
         self._settings = settings
+        self._actions = ActionRepository()
 
     def retention_policy(self) -> RetentionPolicy:
         return RetentionPolicy(
@@ -630,6 +632,7 @@ class PrivacyService:
         voice_sessions = select(VoiceSession.id).where(VoiceSession.user_id == user_id)
 
         async with self._session_factory() as session, session.begin():
+            await self._actions.expire_old_actions(session, user_id, now)
             deleted_counts = {
                 "transcriptions": await _delete_count(
                     session,
@@ -657,7 +660,13 @@ class PrivacyService:
                     delete(PendingAction).where(
                         PendingAction.user_id == user_id,
                         PendingAction.state.in_(_TERMINAL_ACTION_STATES),
-                        PendingAction.updated_at < pending_cutoff,
+                        or_(
+                            PendingAction.updated_at < pending_cutoff,
+                            and_(
+                                PendingAction.state == PendingActionState.EXPIRED,
+                                PendingAction.expires_at < pending_cutoff,
+                            ),
+                        ),
                     ),
                 ),
                 "action_logs": await _delete_count(
