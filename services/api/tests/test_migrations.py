@@ -117,6 +117,14 @@ def _unique_column_sets(connection: sqlite3.Connection, table: str) -> set[tuple
     return _index_column_sets(connection, table, unique=True)
 
 
+def test_alembic_accepts_percent_encoded_database_url(tmp_path: Path) -> None:
+    database_path = tmp_path / "percent%40encoded.db"
+
+    _run_alembic(database_path, "upgrade", "0001_initial_schema", "--sql")
+
+    assert not database_path.exists()
+
+
 def test_v08_repairs_current_heads_and_unambiguous_legacy_receipts(tmp_path: Path) -> None:
     database_path = tmp_path / "v08-repair.db"
     _run_alembic(database_path, "upgrade", "0007_notice_migration_safety")
