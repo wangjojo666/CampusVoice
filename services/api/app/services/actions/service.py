@@ -58,6 +58,7 @@ from app.services.actions.completeness import (
     parse_payload,
 )
 from app.services.errors import ConflictError, DomainError, NotFoundError
+from app.services.lineage import validate_notice_lineage
 from app.services.risk.engine import assess_risk
 from app.services.verification.service import VerificationReport, VerificationService
 
@@ -160,27 +161,34 @@ class ActionService:
         }
         requested_payload_model = parse_payload(request.action, request.payload)
         requested_payload = requested_payload_model.model_dump(mode="json", exclude_unset=True)
+        canonical_request = _canonical_prepare_request(
+            request,
+            requested_payload=requested_payload,
+            audit_options=audit_options,
+        )
         if request.idempotency_key:
             existing = await self.actions.by_idempotency_key(
                 session, user_id, request.idempotency_key
             )
             if existing is not None:
-                existing_requested_payload = existing.execution_options.get("requested_payload")
-                if not isinstance(existing_requested_payload, dict):
-                    existing_requested_payload = existing.payload
-                if (
-                    existing.action_type != request.action
-                    or existing_requested_payload != requested_payload
-                    or not self._idempotency_target_matches(existing, request)
-                    or any(
-                        existing.execution_options.get(name) != value
-                        for name, value in audit_options.items()
-                    )
+                if not self._idempotency_request_matches(
+                    existing,
+                    request,
+                    requested_payload=requested_payload,
+                    audit_options=audit_options,
+                    canonical_request=canonical_request,
                 ):
                     raise ConflictError(
                         "idempotency_key_reused",
                         "The idempotency key was already used for a different action",
                     )
+                await self._validate_prepare_lineage(
+                    session,
+                    user_id,
+                    request,
+                    payload=requested_payload,
+                    target_id=existing.target_id,
+                )
                 await session.commit()
                 return existing
 
@@ -197,6 +205,13 @@ class ActionService:
         resolution_diagnostics.update(default_diagnostics)
         payload_model = parse_payload(request.action, request.payload)
         payload = payload_model.model_dump(mode="json", exclude_unset=True)
+        await self._validate_prepare_lineage(
+            session,
+            user_id,
+            request,
+            payload=payload,
+            target_id=request.target_id,
+        )
         missing = missing_required_fields(
             request.action, request.target_id, payload_model, request.missing_fields
         )
@@ -250,31 +265,99 @@ class ActionService:
             **audit_options,
             "target_title": request.target_title,
             "requested_payload": requested_payload,
+            "canonical_request": canonical_request,
         }
         await session.rollback()
-        async with session.begin():
-            action = PendingAction(
-                user_id=user_id,
-                action_type=request.action,
-                entity_type=entity_for_action(request.action),
-                target_id=request.target_id,
-                payload=payload,
-                execution_options=execution_options,
-                state=state,
-                risk_level=risk.level,
-                risk_factors=list(risk.factors),
-                missing_fields=missing,
-                ambiguities=ambiguities,
-                blocking_reasons=blocking_reasons,
-                diagnostics=diagnostics,
-                required_confirmations=risk.required_confirmations,
-                confirmations_received=0,
-                idempotency_key=request.idempotency_key,
-                expires_at=now + timedelta(minutes=self.action_ttl_minutes),
+        try:
+            async with session.begin():
+                action = PendingAction(
+                    user_id=user_id,
+                    action_type=request.action,
+                    entity_type=entity_for_action(request.action),
+                    target_id=request.target_id,
+                    payload=payload,
+                    execution_options=execution_options,
+                    state=state,
+                    risk_level=risk.level,
+                    risk_factors=list(risk.factors),
+                    missing_fields=missing,
+                    ambiguities=ambiguities,
+                    blocking_reasons=blocking_reasons,
+                    diagnostics=diagnostics,
+                    required_confirmations=risk.required_confirmations,
+                    confirmations_received=0,
+                    idempotency_key=request.idempotency_key,
+                    expires_at=now + timedelta(minutes=self.action_ttl_minutes),
+                )
+                session.add(action)
+                await session.flush()
+        except IntegrityError as exc:
+            await session.rollback()
+            if request.idempotency_key is None:
+                raise
+            winner = await self.actions.by_idempotency_key(
+                session, user_id, request.idempotency_key
             )
-            session.add(action)
-            await session.flush()
+            if winner is None:
+                raise
+            if not self._idempotency_request_matches(
+                winner,
+                request,
+                requested_payload=requested_payload,
+                audit_options=audit_options,
+                canonical_request=canonical_request,
+            ):
+                raise ConflictError(
+                    "idempotency_key_reused",
+                    "The idempotency key was already used for a different action",
+                ) from exc
+            await self._validate_prepare_lineage(
+                session,
+                user_id,
+                request,
+                payload=requested_payload,
+                target_id=winner.target_id,
+            )
+            await session.commit()
+            return winner
         return action
+
+    def _idempotency_request_matches(
+        self,
+        existing: PendingAction,
+        request: ActionPrepareRequest,
+        *,
+        requested_payload: dict[str, Any],
+        audit_options: dict[str, Any],
+        canonical_request: dict[str, Any],
+    ) -> bool:
+        if "canonical_request" in existing.execution_options:
+            stored_canonical = existing.execution_options["canonical_request"]
+            return isinstance(stored_canonical, dict) and stored_canonical == canonical_request
+
+        existing_requested_payload = existing.execution_options.get("requested_payload")
+        if not isinstance(existing_requested_payload, dict):
+            existing_requested_payload = existing.payload
+        legacy_options = {
+            "asr_confidence": request.asr_confidence,
+            "batch_size": request.batch_size,
+            "overwrite_existing": request.overwrite_existing,
+            "hard_to_undo": request.hard_to_undo,
+            **audit_options,
+        }
+        return (
+            not request.missing_fields
+            and not request.ambiguities
+            and not existing.missing_fields
+            and not existing.ambiguities
+            and existing.action_type == request.action
+            and existing_requested_payload == requested_payload
+            and self._idempotency_target_matches(existing, request)
+            and all(
+                existing.execution_options.get(name) == value
+                for name, value in legacy_options.items()
+            )
+        )
 
     @staticmethod
     def _idempotency_target_matches(
@@ -288,6 +371,48 @@ class ActionService:
         if request.target_title is not None:
             return existing.execution_options.get("target_title") == request.target_title
         return existing.target_id is None
+
+    async def _validate_prepare_lineage(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        request: ActionPrepareRequest,
+        *,
+        payload: dict[str, Any],
+        target_id: str | None,
+    ) -> None:
+        candidate: TaskCreate | EventCreate | TaskDraft | EventDraft | None = None
+        if request.action == ActionType.CREATE_TASK:
+            candidate = TaskDraft.model_validate(payload)
+        elif request.action == ActionType.CREATE_EVENT:
+            candidate = EventDraft.model_validate(payload)
+        elif request.action == ActionType.UPDATE_TASK:
+            task = await self._task_or_404(session, user_id, target_id or "", False)
+            candidate = _merge_task(task, TaskDraft.model_validate(payload))
+        elif request.action == ActionType.UPDATE_EVENT:
+            event = await self._event_or_404(session, user_id, target_id or "", False)
+            candidate = _merge_event(
+                event,
+                EventDraft.model_validate(payload),
+                request.overwrite_existing,
+            )
+        if candidate is None:
+            return
+        await self._validate_candidate_lineage(session, user_id, candidate)
+
+    @staticmethod
+    async def _validate_candidate_lineage(
+        session: AsyncSession,
+        user_id: str,
+        candidate: TaskCreate | EventCreate | TaskDraft | EventDraft,
+    ) -> None:
+        await validate_notice_lineage(
+            session,
+            user_id,
+            document_id=candidate.source_document_id,
+            chunk_id=candidate.source_chunk_id,
+            claim_id=candidate.source_claim_id,
+        )
 
     async def _freeze_update_version(
         self,
@@ -971,6 +1096,7 @@ class ActionService:
     async def _apply(self, session: AsyncSession, action: PendingAction) -> AppliedOperation:
         if action.action_type == ActionType.CREATE_TASK:
             new_task_data = _task_create_from_payload(action.payload)
+            await self._validate_candidate_lineage(session, action.user_id, new_task_data)
             create_task_duplicates = await self.tasks.find_duplicates(
                 session,
                 action.user_id,
@@ -1005,6 +1131,7 @@ class ActionService:
             updated_task_candidate = _merge_task(
                 task_to_update, TaskDraft.model_validate(action.payload)
             )
+            await self._validate_candidate_lineage(session, action.user_id, updated_task_candidate)
             update_task_duplicates = await self.tasks.find_duplicates(
                 session,
                 action.user_id,
@@ -1049,6 +1176,7 @@ class ActionService:
             new_event_data = _event_create_from_payload(
                 action.payload, bool(action.execution_options.get("overwrite_existing"))
             )
+            await self._validate_candidate_lineage(session, action.user_id, new_event_data)
             await self._guard_event_collisions(session, action.user_id, new_event_data)
             created_event = await self.events.create(session, action.user_id, new_event_data)
             created_event_snapshot = _snapshot_event(created_event)
@@ -1081,6 +1209,7 @@ class ActionService:
                 EventDraft.model_validate(action.payload),
                 bool(action.execution_options.get("overwrite_existing")),
             )
+            await self._validate_candidate_lineage(session, action.user_id, updated_event_candidate)
             await self._guard_event_collisions(
                 session,
                 action.user_id,
@@ -1636,6 +1765,19 @@ class ActionService:
                 "The record changed after it was reviewed",
                 {"expected_version": expected, "current_version": current},
             )
+
+
+def _canonical_prepare_request(
+    request: ActionPrepareRequest,
+    *,
+    requested_payload: dict[str, Any],
+    audit_options: dict[str, Any],
+) -> dict[str, Any]:
+    canonical = request.model_dump(mode="json", exclude={"idempotency_key"})
+    canonical["payload"] = requested_payload
+    canonical["voice_session_id"] = audit_options["voice_session_id"]
+    canonical["corrected_text"] = audit_options["corrected_text"]
+    return canonical
 
 
 def _task_create_from_payload(payload: dict[str, Any]) -> TaskCreate:

@@ -7,7 +7,6 @@ from app.schemas.actions import ActionPrepareRequest, PendingActionView
 from app.schemas.domain import TaskCreate, TaskMutationResponse, TaskUpdate, TaskView
 from app.services.actions.service import ActionService
 from app.services.errors import ConfirmationRequiredError, VerificationFailedError
-from app.services.lineage import validate_notice_lineage
 
 
 class TaskService:
@@ -43,13 +42,6 @@ class TaskService:
         confirmed: bool,
         idempotency_key: str | None,
     ) -> TaskMutationResponse:
-        await validate_notice_lineage(
-            session,
-            user_id,
-            document_id=data.source_document_id,
-            chunk_id=data.source_chunk_id,
-            claim_id=data.source_claim_id,
-        )
         action = await self.actions.prepare(
             session,
             user_id,
@@ -71,13 +63,6 @@ class TaskService:
         confirmed: bool,
         idempotency_key: str | None,
     ) -> TaskMutationResponse:
-        await validate_notice_lineage(
-            session,
-            user_id,
-            document_id=data.source_document_id,
-            chunk_id=data.source_chunk_id,
-            claim_id=data.source_claim_id,
-        )
         action = await self.actions.prepare(
             session,
             user_id,

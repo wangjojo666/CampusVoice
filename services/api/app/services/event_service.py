@@ -7,7 +7,6 @@ from app.schemas.actions import ActionPrepareRequest, PendingActionView
 from app.schemas.domain import EventCreate, EventMutationResponse, EventUpdate, EventView
 from app.services.actions.service import ActionService
 from app.services.errors import ConfirmationRequiredError, VerificationFailedError
-from app.services.lineage import validate_notice_lineage
 
 
 class EventService:
@@ -24,13 +23,6 @@ class EventService:
         confirmed: bool,
         idempotency_key: str | None,
     ) -> EventMutationResponse:
-        await validate_notice_lineage(
-            session,
-            user_id,
-            document_id=data.source_document_id,
-            chunk_id=data.source_chunk_id,
-            claim_id=data.source_claim_id,
-        )
         payload = data.model_dump(mode="json", exclude={"allow_conflict"})
         if "end_at" not in data.model_fields_set:
             payload.pop("end_at", None)
@@ -58,13 +50,6 @@ class EventService:
         confirmed: bool,
         idempotency_key: str | None,
     ) -> EventMutationResponse:
-        await validate_notice_lineage(
-            session,
-            user_id,
-            document_id=data.source_document_id,
-            chunk_id=data.source_chunk_id,
-            claim_id=data.source_claim_id,
-        )
         action = await self.actions.prepare(
             session,
             user_id,
