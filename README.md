@@ -231,11 +231,43 @@ python scripts/seed_demo.py
 docker compose up --build
 ```
 
+API 容器固定从 `/data` 运行，因此根 `.env` 中的相对 SQLite URL
+`sqlite+aiosqlite:///./campusvoice.db` 会解析为命名卷内的
+`/data/campusvoice.db`；未设置该变量时的 Compose 默认值也指向同一文件。原生
+API 仍从 `services/api` 运行，相对路径语义不变。非 SQLite 数据库 URL 会原样传入
+容器，`CAMPUSVOICE_LOG_LEVEL` 也会由 Compose 传给 API。
+
+> **旧容器升级前的数据迁移警告：** 如果该部署曾使用本修复之前的
+> `.env.example` 启动，相对 SQLite 文件可能仍在旧容器可写层
+> `/app/services/api/campusvoice.db`。在旧容器仍存在时，必须先隔离外部写入，使用
+> 在线备份迁入命名卷并验证；不要先执行 `down`、删除容器或强制重建。下列 create
+> 命令在 `/data/campusvoice.db` 已存在时会拒绝覆盖，此时应停止并人工判断两个库，
+> 不能任选其一覆盖：
+
+```powershell
+docker compose exec api python -m app.jobs.sqlite_backup create `
+  /app/services/api/campusvoice.db /data/campusvoice.db
+if ($LASTEXITCODE -ne 0) { throw "SQLite backup creation failed; do not recreate the API container." }
+docker compose exec api python -m app.jobs.sqlite_backup verify /data/campusvoice.db
+if ($LASTEXITCODE -ne 0) { throw "SQLite backup verification failed; do not recreate the API container." }
+```
+
+仅当以上两步都成功后，继续保持外部写入隔离并单独执行重建；直到旧 API 已停止、
+新容器 ready 且业务验证完成前，不要解除写入隔离：
+
+```powershell
+docker compose up --detach --build --force-recreate --wait --wait-timeout 300
+if ($LASTEXITCODE -ne 0) { throw "API recreation failed; keep external writes isolated and inspect logs." }
+```
+
+已经使用 `/data/campusvoice.db` 的部署无需迁移。升级必须带 `--build`，避免新
+`working_dir` 与旧镜像的相对入口组合导致启动失败。
+
 默认 Compose 镜像不安装 AI 额外依赖，并明确使用 `ASR=disabled` 与 `knowledge=lexical`；它适合先验证任务、日历、确认、事务和引用链路，不会伪造语音转写结果。若手动把检索器切到 `embedding`，必须同时构建 AI 镜像。
 
 默认的 `demo` 身份不是网络认证，因此 Compose 只把 Web `3000` 和 API `8000` 发布到 `127.0.0.1`，不会无意暴露给局域网。若确需从其他设备访问，先切换到完整配置的 `jwt` 或 `oidc` 认证、设置精确的 CORS origin，并在构建 Web 镜像前把 `NEXT_PUBLIC_API_BASE_URL` 改为该设备可访问的 API 地址；随后显式设置 `CAMPUSVOICE_BIND_HOST=0.0.0.0`。不要把默认 demo 栈直接暴露到不受信网络。
 
-可在本地检查默认绑定和显式覆盖的解析结果：
+可在本地检查默认绑定、SQLite 卷路径、`.env.example` 和显式覆盖的解析结果：
 
 ```powershell
 python scripts/check_compose_bindings.py

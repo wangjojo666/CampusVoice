@@ -1,9 +1,13 @@
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_API_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = _API_ROOT.parents[1]
 
 _ASYMMETRIC_JWT_ALGORITHMS = frozenset(
     {
@@ -46,7 +50,7 @@ class Settings(BaseSettings):
     """Runtime settings loaded exclusively from environment variables or .env."""
 
     model_config = SettingsConfigDict(
-        env_file=(".env", "../../.env"),
+        env_file=(str(_API_ROOT / ".env"), str(_REPO_ROOT / ".env")),
         env_prefix="CAMPUSVOICE_",
         extra="ignore",
     )

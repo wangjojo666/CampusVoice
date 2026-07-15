@@ -11,7 +11,8 @@ services:
       CAMPUSVOICE_DEMO_USER_ID: smoke_user
       # Synthetic smoke-only value shared by both Uvicorn workers. Never use in production.
       CAMPUSVOICE_CONFIRMATION_SECRET: smoke-only-not-for-production-shared-secret-2026
-      CAMPUSVOICE_DATABASE_URL: sqlite+aiosqlite:////data/campusvoice.db
+      # Deliberately relative: the API runtime cwd must resolve this inside the /data volume.
+      CAMPUSVOICE_DATABASE_URL: sqlite+aiosqlite:///./campusvoice.db
       CAMPUSVOICE_DATABASE_AUTO_CREATE: "false"
       CAMPUSVOICE_CORS_ORIGINS: '["http://localhost:3000","http://127.0.0.1:3000"]'
       CAMPUSVOICE_ASR_PROVIDER: disabled
