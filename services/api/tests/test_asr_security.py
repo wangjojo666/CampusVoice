@@ -245,9 +245,13 @@ async def test_route_releases_connection_quota_when_session_cleanup_raises(
     )
     socket = DummySocket()
 
-    with pytest.raises(RuntimeError, match="adapter close failed"):
+    with pytest.raises(ExceptionGroup, match="ASR session cleanup failed") as caught:
         await asr_route.asr_websocket(socket)  # type: ignore[arg-type]
 
+    assert [str(error) for error in caught.value.exceptions] == [
+        "adapter close failed",
+        "persistence close failed",
+    ]
     registry = socket.app.state.asr_connections
     assert await registry.count("user-cleanup") == 0
     assert socket.adapter.close_calls == 1

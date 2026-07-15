@@ -256,15 +256,41 @@ async def test_adapter_and_persistence_cleanup_are_each_attempted_once_on_failur
 
     socket = StubSocket([{"type": "websocket.disconnect"}])
 
-    with pytest.raises(RuntimeError, match="adapter close failed"):
+    with pytest.raises(ExceptionGroup, match="ASR session cleanup failed") as caught:
         await handle_asr_websocket(  # type: ignore[arg-type]
             socket,
             lambda: adapter,
             close_hook=close_persistence,
         )
 
+    assert [type(error) for error in caught.value.exceptions] == [RuntimeError, RuntimeError]
+    assert [str(error) for error in caught.value.exceptions] == [
+        "adapter close failed",
+        "persistence close failed",
+    ]
     assert adapter.close_calls == 1
     assert persistence_close_calls == 1
+    assert socket.sent[-1]["code"] == "session_cleanup_failed"
+    assert socket.close_code == 1011
+
+
+@pytest.mark.asyncio
+async def test_single_cleanup_failure_preserves_original_exception() -> None:
+    failure = RuntimeError("adapter close failed")
+
+    class FailingCloseAdapter(StubAsrAdapter):
+        async def close(self) -> None:
+            raise failure
+
+    socket = StubSocket([{"type": "websocket.disconnect"}])
+
+    with pytest.raises(RuntimeError) as caught:
+        await handle_asr_websocket(  # type: ignore[arg-type]
+            socket,
+            FailingCloseAdapter,
+        )
+
+    assert caught.value is failure
     assert socket.sent[-1]["code"] == "session_cleanup_failed"
     assert socket.close_code == 1011
 
