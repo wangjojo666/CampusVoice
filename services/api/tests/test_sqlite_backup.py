@@ -1,5 +1,6 @@
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from threading import Barrier
 from typing import Any
@@ -11,7 +12,7 @@ from app.jobs.sqlite_backup import create_backup, verify_database
 
 
 def _create_source(path: Path, value: str = "campusvoice") -> None:
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("CREATE TABLE records (value TEXT NOT NULL)")
         connection.execute("INSERT INTO records VALUES (?)", (value,))
@@ -26,7 +27,7 @@ def test_online_sqlite_backup_is_consistent_and_refuses_overwrite(tmp_path: Path
 
     assert result["integrity_check"] == "ok"
     assert len(result["sha256"]) == 64
-    with sqlite3.connect(backup) as connection:
+    with closing(sqlite3.connect(backup)) as connection:
         assert connection.execute("SELECT value FROM records").fetchone() == ("campusvoice",)
     assert verify_database(backup)["sha256"] == result["sha256"]
     with pytest.raises(FileExistsError):
@@ -45,7 +46,7 @@ def test_failed_backup_removes_only_its_reservation_and_can_retry(tmp_path: Path
     source.unlink()
     _create_source(source, "repaired")
     assert create_backup(source, destination)["integrity_check"] == "ok"
-    with sqlite3.connect(destination) as connection:
+    with closing(sqlite3.connect(destination)) as connection:
         assert connection.execute("SELECT value FROM records").fetchone() == ("repaired",)
 
 

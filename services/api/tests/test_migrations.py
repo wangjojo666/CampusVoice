@@ -3,6 +3,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -75,7 +76,7 @@ def _run_alembic(database_path: Path, *arguments: str) -> None:
 
 
 def _application_tables(database_path: Path) -> set[str]:
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection:
         rows = connection.execute(
             "SELECT name FROM sqlite_master "
             "WHERE type = 'table' "
@@ -86,7 +87,7 @@ def _application_tables(database_path: Path) -> set[str]:
 
 
 def _current_revision(database_path: Path) -> str | None:
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection:
         row = connection.execute("SELECT version_num FROM alembic_version").fetchone()
     return str(row[0]) if row is not None else None
 
@@ -142,7 +143,7 @@ def test_v08_repairs_current_heads_and_unambiguous_legacy_receipts(tmp_path: Pat
         "database_snapshot": {"version": 3},
     }
 
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         connection.execute(
             "INSERT INTO users (id, display_name, is_active, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?)",
@@ -240,7 +241,7 @@ def test_v08_repairs_current_heads_and_unambiguous_legacy_receipts(tmp_path: Pat
         connection.commit()
 
     _run_alembic(database_path, "upgrade", "head")
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         assert connection.execute(
             "SELECT id FROM documents WHERE series_id = ? AND is_current = 1",
             ("series-v08",),
@@ -305,7 +306,7 @@ def test_v08_repairs_current_heads_and_unambiguous_legacy_receipts(tmp_path: Pat
         ) == {"operation": "execute", "marker": "keep"}
 
     _run_alembic(database_path, "downgrade", "0007_notice_migration_safety")
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection:
         assert (
             json.loads(
                 connection.execute(
@@ -345,7 +346,7 @@ def test_database_at_public_v01_revision_receives_all_later_tables(
     assert _application_tables(database_path) == V01_TABLES
     assert _current_revision(database_path) == "0001_initial_schema"
 
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         connection.execute(
             "INSERT INTO users "
             "(id, display_name, is_active, created_at, updated_at) "
@@ -357,7 +358,7 @@ def test_database_at_public_v01_revision_receives_all_later_tables(
     assert _application_tables(database_path) == ALL_TABLES
     assert _current_revision(database_path) == HEAD_REVISION
 
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection:
         existing_user_count = connection.execute(
             "SELECT count(*) FROM users WHERE id = ?",
             ("existing-user",),
@@ -425,7 +426,7 @@ def test_database_at_v02_receives_all_later_tables(tmp_path: Path) -> None:
     assert _application_tables(database_path) == V01_TABLES | V02_TABLES
     assert _current_revision(database_path) == "0002_security_tokens"
 
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         connection.execute(
             "INSERT INTO users "
             "(id, display_name, is_active, created_at, updated_at) "
@@ -437,7 +438,7 @@ def test_database_at_v02_receives_all_later_tables(tmp_path: Path) -> None:
 
     assert _application_tables(database_path) == ALL_TABLES
     assert _current_revision(database_path) == HEAD_REVISION
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection:
         assert connection.execute(
             "SELECT count(*) FROM users WHERE id = ?", ("v02-user",)
         ).fetchone() == (1,)
@@ -473,7 +474,7 @@ def test_v07_backfills_safety_columns_and_enforces_generation_and_undo_keys(
     database_path = tmp_path / "v07-safety-upgrade.db"
     _run_alembic(database_path, "upgrade", "0006_notice_impact_migrations")
 
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         connection.execute(
             "INSERT INTO impact_cases "
             "(id, user_id, change_item_id, entity_type, entity_id, entity_version, reason, "
@@ -536,7 +537,7 @@ def test_v07_backfills_safety_columns_and_enforces_generation_and_undo_keys(
     _run_alembic(database_path, "upgrade", "head")
     assert _current_revision(database_path) == HEAD_REVISION
 
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         impact_columns = _column_metadata(connection, "impact_cases")
         plan_columns = _column_metadata(connection, "impact_migration_plans")
         item_columns = _column_metadata(connection, "impact_migration_items")
@@ -805,7 +806,7 @@ def test_v07_backfills_safety_columns_and_enforces_generation_and_undo_keys(
     _run_alembic(database_path, "downgrade", "0006_notice_impact_migrations")
     assert _current_revision(database_path) == "0006_notice_impact_migrations"
 
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection:
         assert (
             _column_metadata(connection, "impact_cases")
             .keys()
@@ -839,7 +840,7 @@ def test_v07_backfills_safety_columns_and_enforces_generation_and_undo_keys(
 
     _run_alembic(database_path, "upgrade", "head")
     assert _current_revision(database_path) == HEAD_REVISION
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection:
         assert connection.execute(
             "SELECT generation, execute_receipt_json, undo_receipt_json "
             "FROM impact_migration_plans WHERE id = ?",

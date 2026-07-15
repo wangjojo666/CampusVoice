@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -17,7 +18,7 @@ def _database_path(client: TestClient) -> Path:
 
 
 def _stamp_revisions(client: TestClient, revisions: tuple[str, ...]) -> None:
-    with sqlite3.connect(_database_path(client)) as connection:
+    with closing(sqlite3.connect(_database_path(client))) as connection, connection:
         connection.execute(
             "CREATE TABLE IF NOT EXISTS alembic_version "
             "(version_num VARCHAR(255) NOT NULL PRIMARY KEY)"

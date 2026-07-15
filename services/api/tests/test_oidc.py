@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -140,7 +141,7 @@ def test_oidc_pkce_session_callback_logout_and_replay_protection(tmp_path: objec
 
         raw_session = client.cookies.get(settings.oidc_session_cookie_name)
         assert raw_session
-        with sqlite3.connect(Path(tmp_path) / "oidc.db") as database:
+        with closing(sqlite3.connect(Path(tmp_path) / "oidc.db")) as database, database:
             database.execute(
                 "UPDATE oidc_sessions SET expires_at = ? WHERE session_hash = ?",
                 ("2000-01-01 00:00:00.000000", hashlib.sha256(raw_session.encode()).hexdigest()),
