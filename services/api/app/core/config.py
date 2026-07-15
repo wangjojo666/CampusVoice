@@ -145,6 +145,11 @@ class Settings(BaseSettings):
                     "JWT authentication requires a supported asymmetric signing algorithm: "
                     + supported
                 )
+            if self.env == "production":
+                assert self.jwt_issuer is not None
+                assert self.jwt_jwks_url is not None
+                _require_production_https_url("jwt_issuer", self.jwt_issuer, issuer=True)
+                _require_production_https_url("jwt_jwks_url", self.jwt_jwks_url)
         if "*" in self.cors_origins:
             raise ValueError(
                 "Credentialed browser requests forbid wildcard CORS origins; "

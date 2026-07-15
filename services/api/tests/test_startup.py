@@ -13,6 +13,7 @@ from app.core.startup import validate_runtime_capabilities
 from app.db.base import Base
 from app.db.session import create_database_engine, create_session_factory
 from app.models.entities import User, UserSettings
+from app.services.asr.connections import RedisAsrConnectionRegistry
 
 
 async def test_demo_user_bootstrap_handles_two_workers(
@@ -195,3 +196,244 @@ def test_embedding_retrieval_fails_fast_without_sentence_transformers(
         validate_runtime_capabilities(
             Settings(env="test", asr_provider="disabled", knowledge_retriever="embedding")
         )
+
+
+class _LifecycleQuota:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        start_error: Exception | None = None,
+        close_error: Exception | None = None,
+    ) -> None:
+        self._events = events
+        self._start_error = start_error
+        self._close_error = close_error
+
+    async def start(self) -> None:
+        self._events.append("quota.start")
+        if self._start_error is not None:
+            raise self._start_error
+
+    async def close(self) -> None:
+        self._events.append("quota.close")
+        if self._close_error is not None:
+            raise self._close_error
+
+
+def _lifecycle_jwt_settings() -> Settings:
+    return Settings(
+        env="test",
+        auth_mode="jwt",
+        jwt_issuer="http://identity.test",
+        jwt_audience="campusvoice-api",
+        jwt_jwks_url="http://identity.test/.well-known/jwks.json",
+        database_auto_create=False,
+    )
+
+
+async def test_lifespan_closes_quota_and_owned_engine_when_quota_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    start_error = RuntimeError("quota start failed")
+    quota = _LifecycleQuota(events, start_error=start_error)
+    engine = create_database_engine("sqlite+aiosqlite:///:memory:")
+    original_dispose = type(engine).dispose
+
+    async def tracked_dispose(target: object) -> None:
+        assert target is engine
+        events.append("engine.dispose")
+        await original_dispose(engine)
+
+    monkeypatch.setattr(type(engine), "dispose", tracked_dispose)
+    monkeypatch.setattr(main_module, "create_database_engine", lambda _url: engine)
+    monkeypatch.setattr(main_module, "build_asr_quota_registry", lambda _settings: quota)
+    app = main_module.create_app(_lifecycle_jwt_settings(), initialize_schema=False)
+
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            async with app.router.lifespan_context(app):
+                pytest.fail("lifespan yielded after quota start failed")
+
+        assert caught.value is start_error
+        assert events == ["quota.start", "quota.close", "engine.dispose"]
+    finally:
+        await original_dispose(engine)
+
+
+async def test_lifespan_disposes_owned_engine_when_quota_close_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    close_error = RuntimeError("quota close failed")
+    quota = _LifecycleQuota(events, close_error=close_error)
+    engine = create_database_engine("sqlite+aiosqlite:///:memory:")
+    original_dispose = type(engine).dispose
+
+    async def tracked_dispose(target: object) -> None:
+        assert target is engine
+        events.append("engine.dispose")
+        await original_dispose(engine)
+
+    monkeypatch.setattr(type(engine), "dispose", tracked_dispose)
+    monkeypatch.setattr(main_module, "create_database_engine", lambda _url: engine)
+    monkeypatch.setattr(main_module, "build_asr_quota_registry", lambda _settings: quota)
+    app = main_module.create_app(_lifecycle_jwt_settings(), initialize_schema=False)
+
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            async with app.router.lifespan_context(app):
+                events.append("application.running")
+
+        assert caught.value is close_error
+        assert events == [
+            "quota.start",
+            "application.running",
+            "quota.close",
+            "engine.dispose",
+        ]
+    finally:
+        await original_dispose(engine)
+
+
+async def test_lifespan_never_disposes_injected_engine_when_quota_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    start_error = RuntimeError("quota start failed")
+    quota = _LifecycleQuota(events, start_error=start_error)
+    engine = create_database_engine("sqlite+aiosqlite:///:memory:")
+    original_dispose = type(engine).dispose
+
+    async def tracked_dispose(target: object) -> None:
+        assert target is engine
+        events.append("engine.dispose")
+        await original_dispose(engine)
+
+    monkeypatch.setattr(type(engine), "dispose", tracked_dispose)
+    monkeypatch.setattr(main_module, "build_asr_quota_registry", lambda _settings: quota)
+    app = main_module.create_app(
+        _lifecycle_jwt_settings(),
+        engine=engine,
+        initialize_schema=False,
+    )
+
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            async with app.router.lifespan_context(app):
+                pytest.fail("lifespan yielded after quota start failed")
+
+        assert caught.value is start_error
+        assert events == ["quota.start", "quota.close"]
+    finally:
+        await original_dispose(engine)
+
+
+async def test_lifespan_preserves_start_and_cleanup_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    start_error = RuntimeError("quota start failed")
+    close_error = RuntimeError("quota close failed")
+    quota = _LifecycleQuota(
+        events,
+        start_error=start_error,
+        close_error=close_error,
+    )
+    engine = create_database_engine("sqlite+aiosqlite:///:memory:")
+    original_dispose = type(engine).dispose
+
+    async def tracked_dispose(target: object) -> None:
+        assert target is engine
+        events.append("engine.dispose")
+        await original_dispose(engine)
+
+    monkeypatch.setattr(type(engine), "dispose", tracked_dispose)
+    monkeypatch.setattr(main_module, "create_database_engine", lambda _url: engine)
+    monkeypatch.setattr(main_module, "build_asr_quota_registry", lambda _settings: quota)
+    app = main_module.create_app(_lifecycle_jwt_settings(), initialize_schema=False)
+
+    try:
+        with pytest.raises(BaseExceptionGroup) as caught:
+            async with app.router.lifespan_context(app):
+                pytest.fail("lifespan yielded after quota start failed")
+
+        assert caught.value.exceptions == (start_error, close_error)
+        assert events == ["quota.start", "quota.close", "engine.dispose"]
+    finally:
+        await original_dispose(engine)
+
+
+async def test_lifespan_preserves_multiple_cleanup_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    close_error = RuntimeError("quota close failed")
+    dispose_error = RuntimeError("engine dispose failed")
+    quota = _LifecycleQuota(events, close_error=close_error)
+    engine = create_database_engine("sqlite+aiosqlite:///:memory:")
+    original_dispose = type(engine).dispose
+
+    async def failing_dispose(target: object) -> None:
+        assert target is engine
+        events.append("engine.dispose")
+        raise dispose_error
+
+    monkeypatch.setattr(type(engine), "dispose", failing_dispose)
+    monkeypatch.setattr(main_module, "create_database_engine", lambda _url: engine)
+    monkeypatch.setattr(main_module, "build_asr_quota_registry", lambda _settings: quota)
+    app = main_module.create_app(_lifecycle_jwt_settings(), initialize_schema=False)
+
+    try:
+        with pytest.raises(BaseExceptionGroup) as caught:
+            async with app.router.lifespan_context(app):
+                events.append("application.running")
+
+        assert caught.value.exceptions == (close_error, dispose_error)
+        assert events == [
+            "quota.start",
+            "application.running",
+            "quota.close",
+            "engine.dispose",
+        ]
+    finally:
+        await original_dispose(engine)
+
+
+async def test_lifespan_closes_real_redis_registry_after_ping_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    start_error = RuntimeError("redis ping failed")
+
+    class _FailingRedisClient:
+        async def ping(self) -> None:
+            events.append("redis.ping")
+            raise start_error
+
+        async def aclose(self) -> None:
+            events.append("redis.aclose")
+
+    registry = RedisAsrConnectionRegistry(  # type: ignore[arg-type]
+        _FailingRedisClient(),
+        key_prefix="test:quota",
+        lease_ttl_ms=30_000,
+    )
+    engine = create_database_engine("sqlite+aiosqlite:///:memory:")
+    monkeypatch.setattr(main_module, "build_asr_quota_registry", lambda _settings: registry)
+    app = main_module.create_app(
+        _lifecycle_jwt_settings(),
+        engine=engine,
+        initialize_schema=False,
+    )
+
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            async with app.router.lifespan_context(app):
+                pytest.fail("lifespan yielded after Redis ping failed")
+
+        assert caught.value is start_error
+        assert events == ["redis.ping", "redis.aclose"]
+    finally:
+        await engine.dispose()
