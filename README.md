@@ -225,6 +225,14 @@ docker compose up --build
 
 默认 Compose 镜像不安装 AI 额外依赖，并明确使用 `ASR=disabled` 与 `knowledge=lexical`；它适合先验证任务、日历、确认、事务和引用链路，不会伪造语音转写结果。若手动把检索器切到 `embedding`，必须同时构建 AI 镜像。
 
+默认的 `demo` 身份不是网络认证，因此 Compose 只把 Web `3000` 和 API `8000` 发布到 `127.0.0.1`，不会无意暴露给局域网。若确需从其他设备访问，先切换到完整配置的 `jwt` 或 `oidc` 认证、设置精确的 CORS origin，并在构建 Web 镜像前把 `NEXT_PUBLIC_API_BASE_URL` 改为该设备可访问的 API 地址；随后显式设置 `CAMPUSVOICE_BIND_HOST=0.0.0.0`。不要把默认 demo 栈直接暴露到不受信网络。
+
+可在本地检查默认绑定和显式覆盖的解析结果：
+
+```powershell
+python scripts/check_compose_bindings.py
+```
+
 多 worker ASR 必须启用 Redis 共享租约，不能让每个 worker 各自计算配额：
 
 ```powershell

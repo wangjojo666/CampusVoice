@@ -79,6 +79,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: python3 scripts/check_compose_bindings.py
       - run: docker compose config --quiet
       - run: docker compose -f docker-compose.yml -f docker-compose.gpu.yml config --quiet
       - run: docker compose -f docker-compose.yml -f docker-compose.smoke.yml config --quiet
