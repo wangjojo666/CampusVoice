@@ -93,18 +93,41 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
-        await application.state.asr_connections.start()
+        quota_registry = application.state.asr_connections
+        primary_error: BaseException | None = None
         try:
+            await quota_registry.start()
             if should_initialize:
                 async with database_engine.begin() as connection:
                     await connection.run_sync(Base.metadata.create_all)
             if settings.auth_mode == "demo":
                 await _ensure_demo_user(session_factory, settings)
             yield
-        finally:
-            await application.state.asr_connections.close()
-            if owns_engine:
+        except BaseException as exc:
+            primary_error = exc
+
+        cleanup_errors: list[BaseException] = []
+        try:
+            await quota_registry.close()
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        if owns_engine:
+            try:
                 await database_engine.dispose()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+
+        if primary_error is not None:
+            if cleanup_errors:
+                raise BaseExceptionGroup(
+                    "application lifespan and cleanup failed",
+                    [primary_error, *cleanup_errors],
+                )
+            raise primary_error.with_traceback(primary_error.__traceback__)
+        if len(cleanup_errors) == 1:
+            raise cleanup_errors[0].with_traceback(cleanup_errors[0].__traceback__)
+        if cleanup_errors:
+            raise BaseExceptionGroup("application cleanup failed", cleanup_errors)
 
     app = FastAPI(
         title=settings.app_name,

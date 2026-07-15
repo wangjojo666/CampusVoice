@@ -1,6 +1,9 @@
 import asyncio
+import urllib.error
+import urllib.request
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +21,8 @@ from app.security.authentication import (
     AuthenticationError,
     AuthPrincipal,
     JwtAuthenticator,
+    _HttpsOnlyPyJWKClient,
+    _HttpsOnlyRedirectHandler,
 )
 from app.security.websocket_tickets import consume_websocket_ticket
 from tests.helpers import confirmed_write
@@ -132,6 +137,103 @@ def test_production_rejects_missing_jwt_configuration() -> None:
 def test_production_rejects_non_asymmetric_jwt_algorithms(algorithm: str) -> None:
     with pytest.raises(ValueError, match="asymmetric signing algorithm"):
         _production_settings(jwt_algorithms=[algorithm])
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("jwt_issuer", "http://identity.campus.test"),
+        ("jwt_jwks_url", "http://identity.campus.test/.well-known/jwks.json"),
+        ("jwt_issuer", "https://user@identity.campus.test"),
+        ("jwt_jwks_url", "https:///missing-host/jwks.json"),
+        ("jwt_issuer", " https://identity.campus.test"),
+        ("jwt_issuer", "https://identity.campus.test\r\n.evil.test"),
+        ("jwt_jwks_url", "https://identity.campus.test:invalid/jwks.json"),
+    ],
+)
+def test_production_rejects_insecure_or_invalid_jwt_urls(field: str, value: str) -> None:
+    with pytest.raises(ValueError, match=f"valid HTTPS URL for {field}"):
+        _production_settings(**{field: value})
+
+
+def test_test_environment_allows_http_jwt_identity_provider() -> None:
+    settings = Settings(
+        env="test",
+        auth_mode="jwt",
+        jwt_issuer="http://identity.test",
+        jwt_audience=_AUDIENCE,
+        jwt_jwks_url="http://identity.test/.well-known/jwks.json",
+    )
+
+    assert settings.jwt_issuer == "http://identity.test"
+    assert settings.jwt_jwks_url == "http://identity.test/.well-known/jwks.json"
+
+
+@pytest.mark.parametrize(
+    "redirect_url",
+    [
+        "http://identity.campus.test/jwks.json",
+        "ftp://identity.campus.test/jwks.json",
+    ],
+)
+def test_https_jwks_client_rejects_transport_downgrade_redirects(redirect_url: str) -> None:
+    handler = _HttpsOnlyRedirectHandler()
+    request = urllib.request.Request("https://identity.campus.test/jwks.json")
+
+    with pytest.raises(urllib.error.HTTPError, match="must remain on HTTPS"):
+        handler.redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            Message(),
+            redirect_url,
+        )
+
+
+def test_https_jwks_client_allows_https_redirects() -> None:
+    handler = _HttpsOnlyRedirectHandler()
+    request = urllib.request.Request("https://identity.campus.test/jwks.json")
+
+    redirected = handler.redirect_request(
+        request,
+        None,
+        302,
+        "Found",
+        Message(),
+        "https://cdn.campus.test/jwks.json",
+    )
+
+    assert redirected is not None
+    assert redirected.full_url == "https://cdn.campus.test/jwks.json"
+
+
+def test_https_jwks_client_rejects_non_https_final_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _RedirectedResponse:
+        def __enter__(self) -> "_RedirectedResponse":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def geturl(self) -> str:
+            return "http://identity.campus.test/jwks.json"
+
+    class _RedirectedOpener:
+        def open(self, *_args: object, **_kwargs: object) -> _RedirectedResponse:
+            return _RedirectedResponse()
+
+    monkeypatch.setattr(
+        urllib.request,
+        "build_opener",
+        lambda *_handlers: _RedirectedOpener(),
+    )
+    client = _HttpsOnlyPyJWKClient("https://identity.campus.test/jwks.json")
+
+    with pytest.raises(jwt.PyJWKClientConnectionError, match="over HTTPS"):
+        client.fetch_data()
 
 
 def test_production_rejects_database_auto_create() -> None:
