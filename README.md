@@ -57,6 +57,9 @@ python -m uvicorn app.main:app --reload --port 8000
 
 ```powershell
 pnpm install --frozen-lockfile
+if (-not (Test-Path apps/web/.env.local)) {
+  Copy-Item apps/web/.env.example apps/web/.env.local
+}
 pnpm dev:web
 ```
 
@@ -155,8 +158,13 @@ python -m pip install --force-reinstall --no-deps `
 
 ```powershell
 pnpm install --frozen-lockfile
-Copy-Item .env.example .env
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+if (-not (Test-Path apps/web/.env.local)) {
+  Copy-Item apps/web/.env.example apps/web/.env.local
+}
 ```
+
+根目录 `.env` 供 API 运行时和 Compose 使用；其中的 `NEXT_PUBLIC_API_BASE_URL` 只作为 Compose 构建 Web 镜像的参数。原生 Next.js 不读取仓库根 `.env`；它按 Next.js 优先级读取进程环境及 `apps/web` 下的 `.env*`，本文以 `apps/web/.env.local` 为本地模板。不要在任何 `NEXT_PUBLIC_` 变量中存放密钥。
 
 本地默认仅在 `development` 下显式启用 demo auth。校园试点使用 `CAMPUSVOICE_ENV=production` 与 `CAMPUSVOICE_AUTH_MODE=oidc`，并配置 HTTPS issuer、client ID、API 回调地址、登录/登出跳转地址、`openid` scope、非对称 ID-token 算法，以及至少 32 字符的 `CAMPUSVOICE_CONFIRMATION_SECRET`；缺项会启动失败且绝不回退到 `user_demo`。PKCE verifier、state、nonce、可选 client secret 和 code exchange 全在 API 端；浏览器只持有 `HttpOnly` 随机会话 cookie，不接收或持久化 access token。非浏览器客户端仍可使用 `jwt` 模式。详见 [`docs/decisions/0004-oidc-authorization-code-pkce.md`](docs/decisions/0004-oidc-authorization-code-pkce.md)。
 

@@ -2,6 +2,7 @@
 node_modules/
 .pnpm-store/
 .next/
+apps/web/next-env.d.ts
 out/
 dist/
 coverage/
