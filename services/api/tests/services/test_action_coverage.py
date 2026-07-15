@@ -17,10 +17,13 @@ from app.db.base import Base
 from app.db.session import create_database_engine, create_session_factory
 from app.main import create_app
 from app.models.entities import PendingAction, User
+from app.models.enums import PendingActionState
 from app.schemas.actions import ActionPrepareRequest, ConfirmActionRequest
 from app.security.authentication import AuthenticationError, AuthPrincipal
 from app.security.confirmation import ConfirmationChallengeService
 from app.services.actions.service import ActionService
+from app.services.errors import ConflictError
+from app.services.verification.service import VerificationReport
 
 
 def _prepare(
@@ -197,9 +200,25 @@ async def test_action_service_task_crud_repeat_and_undo_transactions(
     assert restored.record.title == "Direct task"
 
     async with action_factory() as session:
-        removed = await service.undo(session, "action-user", created_action.id)
-    assert removed.success is True
-    assert removed.record is None
+        with pytest.raises(ConflictError) as stale_create:
+            await service.undo(session, "action-user", created_action.id)
+    assert stale_create.value.code == "undo_version_conflict"
+    async with action_factory() as session:
+        current_task = await service.tasks.get(session, "action-user", task_id)
+    assert current_task is not None
+    assert current_task.title == "Direct task"
+
+    immediate_create = await _direct_prepare(
+        action_factory,
+        service,
+        "create_task",
+        {"title": "Direct task removed immediately"},
+    )
+    await _direct_execute(action_factory, service, immediate_create)
+    async with action_factory() as session:
+        immediate_undo = await service.undo(session, "action-user", immediate_create.id)
+    assert immediate_undo.success is True
+    assert immediate_undo.record is None
 
     component_metrics = metrics.snapshot()["components"]
     assert any(
@@ -270,9 +289,140 @@ async def test_action_service_event_crud_and_undo_transactions(
     assert restored.record.title == "Direct event"
 
     async with action_factory() as session:
-        removed = await service.undo(session, "action-user", created_action.id)
-    assert removed.success is True
-    assert removed.record is None
+        with pytest.raises(ConflictError) as stale_create:
+            await service.undo(session, "action-user", created_action.id)
+    assert stale_create.value.code == "undo_version_conflict"
+    async with action_factory() as session:
+        current_event = await service.events.get(session, "action-user", event_id)
+    assert current_event is not None
+    assert current_event.title == "Direct event"
+
+    immediate_create = await _direct_prepare(
+        action_factory,
+        service,
+        "create_event",
+        {"title": "Direct event removed immediately", "start_at": "2026-08-03T09:00:00Z"},
+    )
+    await _direct_execute(action_factory, service, immediate_create)
+    async with action_factory() as session:
+        immediate_undo = await service.undo(session, "action-user", immediate_create.id)
+    assert immediate_undo.success is True
+    assert immediate_undo.record is None
+
+
+@pytest.mark.asyncio
+async def test_action_service_rejects_legacy_undo_without_recovery_marker(
+    action_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service = _direct_service()
+    created_action = await _direct_prepare(
+        action_factory,
+        service,
+        "create_task",
+        {"title": "Invalid legacy undo state"},
+    )
+    await _direct_execute(action_factory, service, created_action)
+    async with action_factory() as session, session.begin():
+        persisted = await service.actions.get_pending(session, "action-user", created_action.id)
+        assert persisted is not None
+        persisted.state = PendingActionState.UNDONE
+        persisted.result = {"success": False, "applied": True}
+
+    async with action_factory() as session:
+        with pytest.raises(ConflictError) as rejected:
+            await service.undo(session, "action-user", created_action.id)
+
+    assert rejected.value.code == "undo_recovery_state_invalid"
+
+
+@pytest.mark.asyncio
+async def test_action_service_retries_failed_undo_verification_without_reapplying(
+    action_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service = _direct_service()
+    created_action = await _direct_prepare(
+        action_factory,
+        service,
+        "create_task",
+        {"title": "Undo report original", "priority": "low"},
+    )
+    created = await _direct_execute(action_factory, service, created_action)
+    task_id = str(created["record_id"])
+    updated_action = await _direct_prepare(
+        action_factory,
+        service,
+        "update_task",
+        {"title": "Undo report changed", "priority": "high", "expected_version": 1},
+        target_id=task_id,
+    )
+    await _direct_execute(action_factory, service, updated_action)
+
+    original_verify = service.verifier.verify_task
+    calls = 0
+
+    async def fail_once(*args: object, **kwargs: object) -> VerificationReport:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return VerificationReport(False, {"title": False}, ("forced_failure",), None)
+        return await original_verify(*args, **kwargs)  # type: ignore[arg-type]
+
+    with patch.object(service.verifier, "verify_task", new=fail_once):
+        async with action_factory() as session:
+            first = await service.undo(session, "action-user", updated_action.id)
+        async with action_factory() as session, session.begin():
+            legacy = await service.actions.get_pending(session, "action-user", updated_action.id)
+            assert legacy is not None
+            legacy.state = PendingActionState.EXECUTED
+            legacy.result = first.model_dump(mode="json")
+        async with action_factory() as session:
+            second = await service.undo(session, "action-user", updated_action.id)
+
+    assert first.success is False
+    assert first.retryable is True
+    assert first.error == "undo_verification_failed"
+    assert second.success is True
+    async with action_factory() as session:
+        current = await service.tasks.get(session, "action-user", task_id)
+    assert current is not None
+    assert current.title == "Undo report original"
+    assert current.version == 3
+
+
+@pytest.mark.asyncio
+async def test_action_service_rotates_token_before_retrying_create_undo_verification(
+    action_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service = _direct_service()
+    created_action = await _direct_prepare(
+        action_factory,
+        service,
+        "create_task",
+        {"title": "Undo token retry"},
+    )
+    await _direct_execute(action_factory, service, created_action)
+    original_verify = service.verifier.verify_task
+    calls = 0
+
+    async def fail_once(*args: object, **kwargs: object) -> VerificationReport:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return VerificationReport(False, {"absent": False}, ("forced_failure",), None)
+        return await original_verify(*args, **kwargs)  # type: ignore[arg-type]
+
+    with patch.object(service.verifier, "verify_task", new=fail_once):
+        async with action_factory() as session:
+            first = await service.undo(session, "action-user", created_action.id)
+        async with action_factory() as session:
+            second = await service.undo(session, "action-user", created_action.id)
+
+    assert first.success is False
+    assert first.retryable is True
+    assert second.success is True
+    async with action_factory() as session:
+        removed = await service.tasks.get(session, "action-user", str(second.record_id))
+    assert removed is None
 
 
 def test_task_create_update_delete_execute_and_undo_lifecycle(client: TestClient) -> None:
@@ -322,9 +472,11 @@ def test_task_create_update_delete_execute_and_undo_lifecycle(client: TestClient
     assert restored.json()["record"]["title"] == "Coverage task"
 
     removed_again = client.post(f"/api/actions/{created_action['id']}/undo")
-    assert removed_again.status_code == 200, removed_again.text
-    assert removed_again.json()["success"] is True
-    assert client.get("/api/tasks").json()["total"] == 0
+    assert removed_again.status_code == 409, removed_again.text
+    assert removed_again.json()["error"]["code"] == "undo_version_conflict"
+    current_tasks = client.get("/api/tasks").json()
+    assert current_tasks["total"] == 1
+    assert current_tasks["items"][0]["title"] == "Coverage task"
 
 
 def test_event_create_update_delete_execute_and_undo_lifecycle(client: TestClient) -> None:
@@ -371,9 +523,11 @@ def test_event_create_update_delete_execute_and_undo_lifecycle(client: TestClien
     assert restored.json()["record"]["title"] == "Coverage review"
 
     removed_again = client.post(f"/api/actions/{created_action['id']}/undo")
-    assert removed_again.status_code == 200, removed_again.text
-    assert removed_again.json()["success"] is True
-    assert client.get("/api/events").json()["total"] == 0
+    assert removed_again.status_code == 409, removed_again.text
+    assert removed_again.json()["error"]["code"] == "undo_version_conflict"
+    current_events = client.get("/api/events").json()
+    assert current_events["total"] == 1
+    assert current_events["items"][0]["title"] == "Coverage review"
 
 
 def test_confirmation_challenge_is_single_use_under_concurrency(client: TestClient) -> None:

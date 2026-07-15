@@ -5,7 +5,7 @@ from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.entities import ActionLog, PendingAction, UndoRecord
-from app.models.enums import PendingActionState
+from app.models.enums import PendingActionState, UndoState
 
 
 class ActionRepository:
@@ -105,6 +105,96 @@ class ActionRepository:
             .execution_options(populate_existing=True)
         )
         return claimed
+
+    async def claim_undo_application(
+        self, session: AsyncSession, user_id: str, action_id: str
+    ) -> PendingAction | None:
+        claimed: PendingAction | None = await session.scalar(
+            update(PendingAction)
+            .where(
+                PendingAction.id == action_id,
+                PendingAction.user_id == user_id,
+                PendingAction.state == PendingActionState.EXECUTED,
+            )
+            .values(state=PendingActionState.UNDONE)
+            .returning(PendingAction)
+            .execution_options(populate_existing=True)
+        )
+        return claimed
+
+    async def claim_undo_verification(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        action_id: str,
+        *,
+        expected_token: str,
+        result: dict[str, Any],
+    ) -> PendingAction | None:
+        claimed: PendingAction | None = await session.scalar(
+            update(PendingAction)
+            .where(
+                PendingAction.id == action_id,
+                PendingAction.user_id == user_id,
+                PendingAction.state == PendingActionState.UNDONE,
+                PendingAction.result["_undo_phase"].as_string() == "applied",
+                PendingAction.result["_undo_verify_token"].as_string() == expected_token,
+            )
+            .values(result=result)
+            .returning(PendingAction)
+            .execution_options(populate_existing=True)
+        )
+        return claimed
+
+    async def finalize_undo_result(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        action_id: str,
+        *,
+        expected_token: str,
+        result: dict[str, Any],
+    ) -> PendingAction | None:
+        finalized: PendingAction | None = await session.scalar(
+            update(PendingAction)
+            .where(
+                PendingAction.id == action_id,
+                PendingAction.user_id == user_id,
+                PendingAction.state == PendingActionState.UNDONE,
+                PendingAction.result["_undo_phase"].as_string() == "applied",
+                PendingAction.result["_undo_verify_token"].as_string() == expected_token,
+            )
+            .values(result=result)
+            .returning(PendingAction)
+            .execution_options(populate_existing=True)
+        )
+        return finalized
+
+    async def finalize_undo_record(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        action_log_id: str,
+        *,
+        success: bool,
+        error_message: str | None,
+        undone_at: datetime | None,
+    ) -> UndoRecord | None:
+        values: dict[str, Any] = {"error_message": error_message}
+        if success:
+            values.update(state=UndoState.UNDONE, undone_at=undone_at)
+        finalized: UndoRecord | None = await session.scalar(
+            update(UndoRecord)
+            .where(
+                UndoRecord.action_log_id == action_log_id,
+                UndoRecord.user_id == user_id,
+                UndoRecord.state == UndoState.FAILED,
+            )
+            .values(**values)
+            .returning(UndoRecord)
+            .execution_options(populate_existing=True)
+        )
+        return finalized
 
     async def record_failed_execution_attempt(
         self,
