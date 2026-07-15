@@ -1,5 +1,6 @@
 import asyncio
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -167,7 +168,7 @@ def test_sqlite_wal_rejects_unexpected_journal_mode() -> None:
 async def test_real_sqlite_concurrent_first_connections_enable_wal(tmp_path: Path) -> None:
     for attempt in range(8):
         database_path = tmp_path / f"wal-race-{attempt}.db"
-        with sqlite3.connect(database_path) as connection:
+        with closing(sqlite3.connect(database_path)) as connection, connection:
             connection.execute("CREATE TABLE sentinel (id INTEGER PRIMARY KEY)")
             assert connection.execute("PRAGMA journal_mode").fetchone() == ("delete",)
 
