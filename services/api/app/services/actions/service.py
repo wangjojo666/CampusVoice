@@ -662,21 +662,21 @@ class ActionService:
     ) -> PendingAction:
         await self._reject_if_expired(session, user_id, action_id)
         async with session.begin():
-            action = await self._pending_or_404(session, user_id, action_id, lock=True)
-            if action.state in {
-                PendingActionState.EXECUTED,
-                PendingActionState.UNDONE,
-                PendingActionState.EXECUTING,
-            }:
-                raise ConflictError(
-                    "invalid_action_state", "An executing or executed action cannot be cancelled"
-                )
+            action = await self.actions.cancel_pending(
+                session,
+                user_id,
+                action_id,
+                cancelled_at=utc_now(),
+                reason=request.reason or "cancelled_by_user",
+            )
+            if action is not None:
+                return action
+            action = await self._pending_or_404(session, user_id, action_id)
             if action.state == PendingActionState.CANCELLED:
                 return action
-            action.state = PendingActionState.CANCELLED
-            action.cancelled_at = utc_now()
-            action.last_error = request.reason or "cancelled_by_user"
-        return action
+            raise ConflictError(
+                "invalid_action_state", "An executing or executed action cannot be cancelled"
+            )
 
     async def execute(self, session: AsyncSession, user_id: str, action_id: str) -> ExecutionResult:
         with observe_component(self.metrics, "action", "execute") as observation:
@@ -693,114 +693,179 @@ class ActionService:
         await self._reject_if_expired(session, user_id, action_id)
         operation: AppliedOperation | None = None
         action_type: ActionType | None = None
+        prior_attempt_count: int | None = None
         try:
             async with session.begin():
-                action = await self._pending_or_404(session, user_id, action_id, lock=True)
-                if action.state == PendingActionState.EXECUTED and action.result:
-                    return _public_result(action.result)
-                if action.state == PendingActionState.FAILED and action.result:
-                    if action.attempt_count >= action.max_attempts:
+                action = await self.actions.claim_execution(session, user_id, action_id)
+                if action is None:
+                    action = await self._pending_or_404(session, user_id, action_id)
+                    if action.state == PendingActionState.EXECUTED and action.result:
+                        return _public_result(action.result)
+                    if (
+                        action.state == PendingActionState.EXECUTING
+                        and action.result
+                        and action.result.get("applied") is True
+                    ):
+                        operation = _operation_from_result(action.result)
+                        action_type = action.action_type
+                    elif (
+                        action.state == PendingActionState.FAILED
+                        and action.attempt_count >= action.max_attempts
+                    ):
                         raise ConflictError(
                             "retry_limit_reached", "The action retry limit has been reached"
                         )
-                    operation = _operation_from_result(action.result)
-                    action.attempt_count += 1
-                    action.state = PendingActionState.EXECUTING
-                else:
-                    if action.state != PendingActionState.READY:
+                    else:
                         raise ConflictError(
                             "invalid_action_state",
                             "Action must receive all required confirmations before execution",
                             {"state": action.state.value},
                         )
-                    if action.confirmed_payload != action.payload:
-                        raise ConflictError(
-                            "confirmation_payload_changed",
-                            "The action payload changed after confirmation; prepare it again",
-                        )
-                    if action.attempt_count >= action.max_attempts:
-                        raise ConflictError(
-                            "retry_limit_reached", "The action retry limit has been reached"
-                        )
-                    action.attempt_count += 1
-                    action.state = PendingActionState.EXECUTING
-                    operation = await self._apply(session, action)
-                    action.target_id = operation.record_id
-                    created_log = ActionLog(
-                        user_id=user_id,
-                        pending_action_id=action.id,
-                        voice_session_id=action.execution_options.get("voice_session_id"),
-                        transcription_id=action.execution_options.get("transcription_id"),
-                        action_type=action.action_type,
-                        entity_type=action.entity_type,
-                        target_id=operation.record_id,
-                        source_text=action.execution_options.get("source_text"),
-                        corrected_text=action.execution_options.get("corrected_text"),
-                        recognized_intent=action.action_type.value,
-                        extracted_slots=dict(action.payload),
-                        risk_level=action.risk_level,
-                        user_confirmed=action.confirmations_received
-                        >= action.required_confirmations,
-                        before_snapshot=operation.before_snapshot,
-                        after_snapshot=operation.after_snapshot,
-                    )
-                    session.add(created_log)
-                    await session.flush()
-                    session.add(
-                        UndoRecord(
+                else:
+                    prior_attempt_count = action.attempt_count - 1
+                    if action.result and action.result.get("applied") is True:
+                        operation = _operation_from_result(action.result)
+                        action_type = action.action_type
+                    else:
+                        if action.confirmed_payload != action.payload:
+                            raise ConflictError(
+                                "confirmation_payload_changed",
+                                "The action payload changed after confirmation; prepare it again",
+                            )
+                        operation = await self._apply(session, action)
+                        action.target_id = operation.record_id
+                        created_log = ActionLog(
                             user_id=user_id,
-                            action_log_id=created_log.id,
+                            pending_action_id=action.id,
+                            voice_session_id=action.execution_options.get("voice_session_id"),
+                            transcription_id=action.execution_options.get("transcription_id"),
+                            action_type=action.action_type,
                             entity_type=action.entity_type,
                             target_id=operation.record_id,
-                            undo_action=operation.undo_action,
-                            snapshot=operation.undo_snapshot,
-                            expires_at=utc_now() + timedelta(minutes=self.undo_ttl_minutes),
+                            source_text=action.execution_options.get("source_text"),
+                            corrected_text=action.execution_options.get("corrected_text"),
+                            recognized_intent=action.action_type.value,
+                            extracted_slots=dict(action.payload),
+                            risk_level=action.risk_level,
+                            user_confirmed=action.confirmations_received
+                            >= action.required_confirmations,
+                            before_snapshot=operation.before_snapshot,
+                            after_snapshot=operation.after_snapshot,
                         )
-                    )
-                    action.result = _provisional_result(action.id, action.action_type, operation)
-                action_type = action.action_type
+                        session.add(created_log)
+                        await session.flush()
+                        session.add(
+                            UndoRecord(
+                                user_id=user_id,
+                                action_log_id=created_log.id,
+                                entity_type=action.entity_type,
+                                target_id=operation.record_id,
+                                undo_action=operation.undo_action,
+                                snapshot=operation.undo_snapshot,
+                                expires_at=utc_now() + timedelta(minutes=self.undo_ttl_minutes),
+                            )
+                        )
+                        action.result = _provisional_result(
+                            action.id, action.action_type, operation
+                        )
+                        action_type = action.action_type
         except DomainError:
             raise
         except Exception as exc:
             await session.rollback()
+            if prior_attempt_count is None:
+                raise
             return await self._record_execution_failure(
-                session, user_id, action_id, f"database_write_failed: {exc}"
+                session,
+                user_id,
+                action_id,
+                prior_attempt_count=prior_attempt_count,
+                error=f"database_write_failed: {exc}",
             )
 
         assert operation is not None and action_type is not None
-        report = await self._verify(session, user_id, action_type, operation)
-        action = await self._pending_or_404(session, user_id, action_id)
-        verification_log = await self.actions.log_for_action(session, user_id, action_id)
-        result = _execution_result(action, operation, report)
-        if report.success:
-            action.state = PendingActionState.EXECUTED
-            action.executed_at = utc_now()
-            action.last_error = None
-        else:
-            action.state = PendingActionState.FAILED
-            action.last_error = "post_commit_verification_failed"
-        action.result = result.model_dump(mode="json") | {
-            "_operation": _operation_to_dict(operation),
-            "applied": True,
-        }
-        if verification_log is not None:
-            verification_log.success = report.success
-            verification_log.verification_result = report.as_dict()
-            verification_log.error_message = None if report.success else action.last_error
-        await session.commit()
-        return result
+        attempt_count = action.attempt_count
+        max_attempts = action.max_attempts
+        try:
+            report = await self._verify(session, user_id, action_type, operation)
+        except Exception as exc:
+            report = VerificationReport(
+                False,
+                {field: False for field in operation.expected_fields},
+                ("verification_exception",),
+                None,
+            )
+            result = _execution_verification_result(
+                action_id,
+                action_type,
+                attempt_count,
+                max_attempts,
+                operation,
+                report,
+            )
+            await session.rollback()
+            return await self._finalize_execution_verification(
+                session,
+                user_id,
+                action_id,
+                operation,
+                report,
+                result,
+                expected_attempt_count=attempt_count,
+                last_error=f"post_commit_verification_exception: {type(exc).__name__}",
+            )
+        result = _execution_verification_result(
+            action_id,
+            action_type,
+            attempt_count,
+            max_attempts,
+            operation,
+            report,
+        )
+        await session.rollback()
+        return await self._finalize_execution_verification(
+            session,
+            user_id,
+            action_id,
+            operation,
+            report,
+            result,
+            expected_attempt_count=attempt_count,
+            last_error=None if report.success else "post_commit_verification_failed",
+        )
 
     async def _record_execution_failure(
         self,
         session: AsyncSession,
         user_id: str,
         action_id: str,
+        *,
+        prior_attempt_count: int,
         error: str,
     ) -> ExecutionResult:
         async with session.begin():
-            action = await self._pending_or_404(session, user_id, action_id, lock=True)
-            action.state = PendingActionState.FAILED
-            action.last_error = error[:1_000]
+            action = await self.actions.record_failed_execution_attempt(
+                session,
+                user_id,
+                action_id,
+                prior_attempt_count=prior_attempt_count,
+                error=error,
+            )
+            if action is None:
+                action = await self._pending_or_404(session, user_id, action_id)
+                if action.state == PendingActionState.EXECUTED and action.result:
+                    return _public_result(action.result)
+                if action.state == PendingActionState.FAILED and action.result:
+                    return _public_result(action.result)
+                if action.state == PendingActionState.EXECUTING:
+                    raise ConflictError(
+                        "action_execution_in_progress", "The action is already being executed"
+                    )
+                raise ConflictError(
+                    "invalid_action_state",
+                    "The action state changed while recording a failed execution",
+                    {"state": action.state.value},
+                )
             result = ExecutionResult(
                 success=False,
                 action=action.action_type.value,
@@ -812,6 +877,7 @@ class ActionService:
                 retryable=action.attempt_count < action.max_attempts,
                 action_id=action.id,
             )
+            action.result = result.model_dump(mode="json") | {"applied": False}
             session.add(
                 ActionLog(
                     user_id=user_id,
@@ -831,6 +897,60 @@ class ActionService:
                     error_message=action.last_error,
                 )
             )
+        return result
+
+    async def _finalize_execution_verification(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        action_id: str,
+        operation: AppliedOperation,
+        report: VerificationReport,
+        result: ExecutionResult,
+        *,
+        expected_attempt_count: int,
+        last_error: str | None,
+    ) -> ExecutionResult:
+        persisted_result = result.model_dump(mode="json") | {
+            "_operation": _operation_to_dict(operation),
+            "applied": True,
+        }
+        async with session.begin():
+            action = await self.actions.finalize_execution(
+                session,
+                user_id,
+                action_id,
+                expected_attempt_count=expected_attempt_count,
+                success=report.success,
+                result=persisted_result,
+                last_error=last_error,
+                executed_at=utc_now() if report.success else None,
+            )
+            if action is None:
+                action = await self._pending_or_404(session, user_id, action_id)
+                if (
+                    action.state
+                    in {
+                        PendingActionState.EXECUTED,
+                        PendingActionState.FAILED,
+                    }
+                    and action.result
+                ):
+                    return _public_result(action.result)
+                if action.state == PendingActionState.EXECUTING:
+                    raise ConflictError(
+                        "action_execution_in_progress", "A newer action attempt is in progress"
+                    )
+                raise ConflictError(
+                    "invalid_action_state",
+                    "The action state changed while finalizing verification",
+                    {"state": action.state.value},
+                )
+            verification_log = await self.actions.log_for_action(session, user_id, action_id)
+            if verification_log is not None:
+                verification_log.success = report.success
+                verification_log.verification_result = report.as_dict()
+                verification_log.error_message = last_error
         return result
 
     async def _apply(self, session: AsyncSession, action: PendingAction) -> AppliedOperation:
@@ -1469,6 +1589,35 @@ def _provisional_result(
         "applied": True,
         "_operation": _operation_to_dict(operation),
     }
+
+
+def _execution_verification_result(
+    action_id: str,
+    action_type: ActionType,
+    attempt_count: int,
+    max_attempts: int,
+    operation: AppliedOperation,
+    report: VerificationReport,
+) -> ExecutionResult:
+    record: TaskView | EventView | None = None
+    if isinstance(report.record, Task):
+        record = TaskView.model_validate(report.record)
+    elif isinstance(report.record, CalendarEvent):
+        record = EventView.model_validate(report.record)
+    return ExecutionResult(
+        success=report.success,
+        action=action_type.value,
+        record_id=operation.record_id,
+        verified_fields=report.verified_fields,
+        side_effects=list(report.side_effects),
+        message=(
+            _action_label(action_type) if report.success else "数据库最终状态验证失败，未报告为成功"
+        ),
+        error=None if report.success else "post_commit_verification_failed",
+        retryable=not report.success and attempt_count < max_attempts,
+        action_id=action_id,
+        record=record,
+    )
 
 
 def _execution_result(
