@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import subprocess
@@ -8,7 +9,7 @@ import pytest
 
 API_ROOT = Path(__file__).resolve().parents[1]
 ALEMBIC_INI = API_ROOT / "alembic.ini"
-HEAD_REVISION = "0007_notice_migration_safety"
+HEAD_REVISION = "0008_notice_current_and_receipt_repair"
 
 V01_TABLES = {
     "action_logs",
@@ -113,6 +114,209 @@ def _index_column_sets(
 
 def _unique_column_sets(connection: sqlite3.Connection, table: str) -> set[tuple[str, ...]]:
     return _index_column_sets(connection, table, unique=True)
+
+
+def test_v08_repairs_current_heads_and_unambiguous_legacy_receipts(tmp_path: Path) -> None:
+    database_path = tmp_path / "v08-repair.db"
+    _run_alembic(database_path, "upgrade", "0007_notice_migration_safety")
+    verified_at = "2026-07-15T01:02:03+00:00"
+    plan_execute = {
+        "operation": "execute",
+        "verified": True,
+        "verified_count": 1,
+        "total_count": 1,
+        "verified_at": verified_at,
+        "status": "verified",
+    }
+    plan_undo = plan_execute | {"operation": "undo", "status": "undone"}
+    item_execute = {
+        "operation": "execute",
+        "verified": True,
+        "verified_at": verified_at,
+        "expected_snapshot": {"version": 2},
+        "database_snapshot": {"version": 2},
+    }
+    item_undo = item_execute | {
+        "operation": "undo",
+        "expected_snapshot": {"version": 1},
+        "database_snapshot": {"version": 3},
+    }
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO users (id, display_name, is_active, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("user-v08", "V08", 1, verified_at, verified_at),
+        )
+        connection.execute(
+            "INSERT INTO notice_series "
+            "(id, user_id, canonical_key, normalized_title, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("series-v08", "user-v08", "v08", "v08", verified_at, verified_at),
+        )
+        for revision, document_id, created_at in (
+            (1, "doc-v08-a", "2026-07-15T00:00:00"),
+            (2, "doc-v08-b", "2026-07-15T00:01:00"),
+            (3, "doc-v08-c", "2026-07-15T00:02:00"),
+            (None, "doc-v08-null", "2026-07-15T00:03:00"),
+        ):
+            connection.execute(
+                "INSERT INTO documents "
+                "(id, user_id, title, file_type, storage_path, content_sha256, status, "
+                "series_id, revision_number, is_current, ingest_source, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    document_id,
+                    "user-v08",
+                    document_id,
+                    "txt",
+                    f"inline://{document_id}",
+                    document_id.ljust(64, "0"),
+                    "ready",
+                    "series-v08",
+                    revision,
+                    1,
+                    "test",
+                    created_at,
+                    created_at,
+                ),
+            )
+        for suffix, legacy, execute_target in (
+            ("execute", plan_execute, {}),
+            ("undo", plan_undo, {}),
+            ("occupied", plan_execute, {"operation": "execute", "marker": "keep"}),
+            ("ambiguous", {"verified": True}, {}),
+        ):
+            connection.execute(
+                "INSERT INTO impact_migration_plans "
+                "(id, user_id, change_set_id, status, risk_level, conflicts_json, "
+                "verification_json, execute_receipt_json, undo_receipt_json, version, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"plan-v08-{suffix}",
+                    "user-v08",
+                    f"change-v08-{suffix}",
+                    "verified",
+                    "low",
+                    "[]",
+                    json.dumps(legacy),
+                    json.dumps(execute_target),
+                    "{}",
+                    1,
+                    verified_at,
+                    verified_at,
+                ),
+            )
+        for suffix, plan_id, legacy in (
+            ("execute", "plan-v08-execute", item_execute),
+            ("undo", "plan-v08-undo", item_undo),
+            ("ambiguous", "plan-v08-ambiguous", {"verified": True}),
+            ("occupied", "plan-v08-occupied", item_execute),
+        ):
+            connection.execute(
+                "INSERT INTO impact_migration_items "
+                "(id, plan_id, user_id, entity_type, entity_id, expected_version, "
+                "before_snapshot, proposed_patch, source_claim_ids, verification_json, "
+                "execute_verification_json, undo_verification_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"item-v08-{suffix}",
+                    plan_id,
+                    "user-v08",
+                    "task",
+                    f"task-v08-{suffix}",
+                    1,
+                    "{}",
+                    "{}",
+                    "[]",
+                    json.dumps(legacy),
+                    json.dumps({"operation": "execute", "marker": "keep"})
+                    if suffix == "occupied"
+                    else "{}",
+                    "{}",
+                    verified_at,
+                ),
+            )
+        connection.commit()
+
+    _run_alembic(database_path, "upgrade", "head")
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT id FROM documents WHERE series_id = ? AND is_current = 1",
+            ("series-v08",),
+        ).fetchall() == [("doc-v08-c",)]
+        assert ("series_id",) in _unique_column_sets(connection, "documents")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE documents SET is_current = 1 WHERE id = ?", ("doc-v08-b",))
+        connection.rollback()
+
+        assert (
+            json.loads(
+                connection.execute(
+                    "SELECT execute_receipt_json FROM impact_migration_plans WHERE id = ?",
+                    ("plan-v08-execute",),
+                ).fetchone()[0]
+            )
+            == plan_execute
+        )
+        assert (
+            json.loads(
+                connection.execute(
+                    "SELECT undo_receipt_json FROM impact_migration_plans WHERE id = ?",
+                    ("plan-v08-undo",),
+                ).fetchone()[0]
+            )
+            == plan_undo
+        )
+        assert json.loads(
+            connection.execute(
+                "SELECT execute_receipt_json FROM impact_migration_plans WHERE id = ?",
+                ("plan-v08-occupied",),
+            ).fetchone()[0]
+        ) == {"operation": "execute", "marker": "keep"}
+        assert connection.execute(
+            "SELECT execute_receipt_json, undo_receipt_json "
+            "FROM impact_migration_plans WHERE id = ?",
+            ("plan-v08-ambiguous",),
+        ).fetchone() == ("{}", "{}")
+        assert (
+            json.loads(
+                connection.execute(
+                    "SELECT execute_verification_json FROM impact_migration_items WHERE id = ?",
+                    ("item-v08-execute",),
+                ).fetchone()[0]
+            )
+            == item_execute
+        )
+        assert (
+            json.loads(
+                connection.execute(
+                    "SELECT undo_verification_json FROM impact_migration_items WHERE id = ?",
+                    ("item-v08-undo",),
+                ).fetchone()[0]
+            )
+            == item_undo
+        )
+        assert json.loads(
+            connection.execute(
+                "SELECT execute_verification_json FROM impact_migration_items WHERE id = ?",
+                ("item-v08-occupied",),
+            ).fetchone()[0]
+        ) == {"operation": "execute", "marker": "keep"}
+
+    _run_alembic(database_path, "downgrade", "0007_notice_migration_safety")
+    with sqlite3.connect(database_path) as connection:
+        assert (
+            json.loads(
+                connection.execute(
+                    "SELECT execute_receipt_json FROM impact_migration_plans WHERE id = ?",
+                    ("plan-v08-execute",),
+                ).fetchone()[0]
+            )
+            == plan_execute
+        )
+
+    _run_alembic(database_path, "upgrade", "head")
 
 
 def test_fresh_database_upgrade_check_downgrade_and_reupgrade(tmp_path: Path) -> None:

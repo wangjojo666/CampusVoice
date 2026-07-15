@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db.types import utc_now
@@ -119,7 +120,34 @@ class NoticeRadarService:
         series_id: str,
         data: NoticeVersionCreate,
     ) -> NoticeVersionView:
-        series = await self._owned_series(session, user_id, series_id)
+        try:
+            return await self._add_version_locked(session, user_id, series_id, data)
+        except Exception:
+            await session.rollback()
+            raise
+
+    async def _add_version_locked(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        series_id: str,
+        data: NoticeVersionCreate,
+    ) -> NoticeVersionView:
+        # SQLite ignores SELECT FOR UPDATE. Make a no-op write the first database
+        # statement so competing version writers serialize before reading the
+        # current head or checking idempotency.
+        series = (
+            await session.execute(
+                update(NoticeSeries)
+                .where(NoticeSeries.id == series_id, NoticeSeries.user_id == user_id)
+                .values(updated_at=NoticeSeries.updated_at)
+                .returning(NoticeSeries)
+            )
+        ).scalar_one_or_none()
+        if series is None:
+            await session.rollback()
+            raise NotFoundError("notice series", series_id)
+        content_hash = _content_hash(data.content)
         existing_revision = await session.scalar(
             select(Document).where(
                 Document.user_id == user_id,
@@ -128,12 +156,22 @@ class NoticeRadarService:
             )
         )
         if existing_revision is not None:
-            if existing_revision.content_sha256 == _content_hash(data.content):
+            if existing_revision.content_sha256 == content_hash:
+                existing_id = existing_revision.id
+                await session.rollback()
+                existing_revision = await session.get(Document, existing_id)
+                if existing_revision is None:
+                    raise ConflictError(
+                        "notice_version_conflict",
+                        "The matching notice revision disappeared; reload the timeline and retry",
+                    )
                 return await self._version_view(session, existing_revision, include_claims=True)
+            existing_id = existing_revision.id
+            await session.rollback()
             raise ConflictError(
                 "notice_revision_exists",
                 "This revision number already contains different content",
-                {"document_id": existing_revision.id},
+                {"document_id": existing_id},
             )
 
         current = await session.scalar(
@@ -172,14 +210,16 @@ class NoticeRadarService:
         duplicate_content = await session.scalar(
             select(Document).where(
                 Document.user_id == user_id,
-                Document.content_sha256 == _content_hash(data.content),
+                Document.content_sha256 == content_hash,
             )
         )
         if duplicate_content is not None:
+            duplicate_id = duplicate_content.id
+            await session.rollback()
             raise ConflictError(
                 "duplicate_document",
                 "Identical content was already imported and was not duplicated",
-                {"document_id": duplicate_content.id},
+                {"document_id": duplicate_id},
             )
 
         now = utc_now()
@@ -196,7 +236,7 @@ class NoticeRadarService:
             version=data.version_label,
             file_type="txt",
             storage_path=f"inline://notice/{series_id}/{data.revision_number}",
-            content_sha256=_content_hash(data.content),
+            content_sha256=content_hash,
             status=DocumentStatus.READY,
             series_id=series_id,
             supersedes_document_id=data.supersedes_document_id,
@@ -212,36 +252,90 @@ class NoticeRadarService:
             content=data.content,
             metadata_json={"source": data.ingest_source, "evidence_offsets": "unicode-codepoints"},
         )
-        if current is not None:
-            current.is_current = False
-        series.updated_at = now
-        session.add(document)
-        session.add(chunk)
-        await session.flush()
-        for extracted in extract_claims(data.content):
-            session.add(
-                NoticeClaim(
-                    user_id=user_id,
-                    document_id=document.id,
-                    chunk_id=chunk.id,
-                    claim_key=extracted.key,
-                    claim_type=extracted.claim_type,
-                    value_json=extracted.value,
-                    normalized_value_json=extracted.normalized,
-                    audience_rule_json=extracted.audience,
-                    confidence=extracted.confidence,
-                    evidence_start=extracted.start,
-                    evidence_end=extracted.end,
-                    extractor_version=EXTRACTOR_VERSION,
-                    review_state=extracted.review_state,
+        try:
+            if current is not None:
+                predecessor = (
+                    await session.execute(
+                        update(Document)
+                        .where(
+                            Document.id == current.id,
+                            Document.user_id == user_id,
+                            Document.series_id == series_id,
+                            Document.is_current.is_(True),
+                        )
+                        .values(is_current=False)
+                        .returning(Document.id)
+                    )
+                ).scalar_one_or_none()
+                if predecessor is None:
+                    await session.rollback()
+                    raise ConflictError(
+                        "ambiguous_version_chain",
+                        "The selected predecessor is no longer the current revision",
+                    )
+            series.updated_at = now
+            session.add(document)
+            session.add(chunk)
+            await session.flush()
+            for extracted in extract_claims(data.content):
+                session.add(
+                    NoticeClaim(
+                        user_id=user_id,
+                        document_id=document.id,
+                        chunk_id=chunk.id,
+                        claim_key=extracted.key,
+                        claim_type=extracted.claim_type,
+                        value_json=extracted.value,
+                        normalized_value_json=extracted.normalized,
+                        audience_rule_json=extracted.audience,
+                        confidence=extracted.confidence,
+                        evidence_start=extracted.start,
+                        evidence_end=extracted.end,
+                        extractor_version=EXTRACTOR_VERSION,
+                        review_state=extracted.review_state,
+                    )
+                )
+            await session.flush()
+            if current is not None:
+                await self._ensure_claim_version(session, user_id, current)
+                change_set = await self._create_change_set(
+                    session, user_id, series, current, document
+                )
+                await self._detect_impacts_internal(session, user_id, change_set)
+            await session.commit()
+        except IntegrityError as error:
+            await session.rollback()
+            winner = await session.scalar(
+                select(Document).where(
+                    Document.user_id == user_id,
+                    Document.series_id == series_id,
+                    Document.revision_number == data.revision_number,
                 )
             )
-        await session.flush()
-        if current is not None:
-            await self._ensure_claim_version(session, user_id, current)
-            change_set = await self._create_change_set(session, user_id, series, current, document)
-            await self._detect_impacts_internal(session, user_id, change_set)
-        await session.commit()
+            if winner is not None and winner.content_sha256 == content_hash:
+                return await self._version_view(session, winner, include_claims=True)
+            if winner is not None:
+                raise ConflictError(
+                    "notice_revision_exists",
+                    "This revision number already contains different content",
+                    {"document_id": winner.id},
+                ) from error
+            duplicate = await session.scalar(
+                select(Document).where(
+                    Document.user_id == user_id,
+                    Document.content_sha256 == content_hash,
+                )
+            )
+            if duplicate is not None:
+                raise ConflictError(
+                    "duplicate_document",
+                    "Identical content was already imported and was not duplicated",
+                    {"document_id": duplicate.id},
+                ) from error
+            raise
+        except Exception:
+            await session.rollback()
+            raise
         return await self._version_view(session, document, include_claims=True)
 
     async def timeline(
@@ -889,8 +983,11 @@ class NoticeRadarService:
     ) -> VerificationReceiptView:
         async with self._factory() as session:
             plan = await self._owned_plan(session, user_id, plan_id)
-            receipt = (
-                plan.execute_receipt_json if operation == "execute" else plan.undo_receipt_json
+            receipt = _operation_receipt(
+                plan.execute_receipt_json if operation == "execute" else plan.undo_receipt_json,
+                plan.verification_json,
+                operation,
+                receipt_type="plan",
             )
             if not receipt:
                 raise DomainError(
@@ -907,9 +1004,14 @@ class NoticeRadarService:
                 )
             )
             item_receipts = [
-                item.execute_verification_json
-                if operation == "execute"
-                else item.undo_verification_json
+                _operation_receipt(
+                    item.execute_verification_json
+                    if operation == "execute"
+                    else item.undo_verification_json,
+                    item.verification_json,
+                    operation,
+                    receipt_type="item",
+                )
                 for item in items
             ]
             item_views = []
@@ -1420,8 +1522,11 @@ class NoticeRadarService:
     ) -> VerificationReceiptView:
         async with self._factory() as session:
             plan = await self._owned_plan(session, user_id, plan_id)
-            existing_receipt = (
-                plan.execute_receipt_json if operation == "execute" else plan.undo_receipt_json
+            existing_receipt = _operation_receipt(
+                plan.execute_receipt_json if operation == "execute" else plan.undo_receipt_json,
+                plan.verification_json,
+                operation,
+                receipt_type="plan",
             )
             terminal_status = "verified" if operation == "execute" else "undone"
             if existing_receipt and plan.status == terminal_status:
@@ -2092,6 +2197,61 @@ def _normalize_title(value: str) -> str:
 
 def _content_hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _operation_receipt(
+    separated: dict[str, Any],
+    legacy: dict[str, Any],
+    operation: Literal["execute", "undo"],
+    *,
+    receipt_type: Literal["plan", "item"],
+) -> dict[str, Any]:
+    if separated:
+        return separated
+    if not isinstance(legacy, dict) or legacy.get("operation") != operation:
+        return {}
+    if receipt_type == "plan" and _valid_legacy_plan_receipt(legacy):
+        return legacy
+    if receipt_type == "item" and _valid_legacy_item_receipt(legacy):
+        return legacy
+    return {}
+
+
+def _valid_legacy_plan_receipt(receipt: dict[str, Any]) -> bool:
+    verified_count = receipt.get("verified_count")
+    total_count = receipt.get("total_count")
+    return (
+        receipt.get("operation") in {"execute", "undo"}
+        and type(receipt.get("verified")) is bool
+        and type(verified_count) is int
+        and type(total_count) is int
+        and verified_count >= 0
+        and total_count >= 0
+        and verified_count <= total_count
+        and isinstance(receipt.get("status"), str)
+        and bool(receipt.get("status"))
+        and _valid_receipt_datetime(receipt.get("verified_at"))
+    )
+
+
+def _valid_legacy_item_receipt(receipt: dict[str, Any]) -> bool:
+    return (
+        receipt.get("operation") in {"execute", "undo"}
+        and type(receipt.get("verified")) is bool
+        and _valid_receipt_datetime(receipt.get("verified_at"))
+        and isinstance(receipt.get("expected_snapshot"), dict)
+        and isinstance(receipt.get("database_snapshot"), dict)
+    )
+
+
+def _valid_receipt_datetime(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _stable_json(value: Any) -> str:

@@ -200,6 +200,15 @@ class Document(TimestampMixin, Base):
     ingest_source: Mapped[str] = mapped_column(String(40), default="upload", nullable=False)
 
 
+Index(
+    "uq_documents_series_current",
+    Document.series_id,
+    unique=True,
+    sqlite_where=Document.series_id.is_not(None) & Document.is_current.is_(True),
+    postgresql_where=Document.series_id.is_not(None) & Document.is_current.is_(True),
+)
+
+
 class DocumentChunk(Base):
     __tablename__ = "document_chunks"
     __table_args__ = (
