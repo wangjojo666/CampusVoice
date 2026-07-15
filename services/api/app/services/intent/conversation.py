@@ -44,7 +44,8 @@ class ConversationService:
             session.add(conversation)
             await session.flush()
         else:
-            conversation = await self._get(session, user_id, conversation_id, lock=True)
+            await self._lock_existing(session, user_id, conversation_id)
+            conversation = await self._get(session, user_id, conversation_id, refresh=True)
 
         turns = list(conversation.context.get("turns", []))
         turn: dict[str, Any] = {
@@ -62,19 +63,44 @@ class ConversationService:
         return conversation.id
 
     @staticmethod
+    async def _lock_existing(
+        session: AsyncSession,
+        user_id: str,
+        conversation_id: str,
+    ) -> None:
+        locked_id = await session.scalar(
+            update(Conversation)
+            .where(
+                Conversation.id == conversation_id,
+                Conversation.user_id == user_id,
+            )
+            # UPDATE is deliberately the first database statement in record().
+            # It serializes writers on SQLite and locks this row on PostgreSQL
+            # without changing the durable timestamp or conversation content.
+            .values(updated_at=Conversation.updated_at)
+            .returning(Conversation.id)
+            .execution_options(synchronize_session=False)
+        )
+        if locked_id is None:
+            raise NotFoundError("conversation", conversation_id)
+
+    @staticmethod
     async def _get(
         session: AsyncSession,
         user_id: str,
         conversation_id: str,
         *,
-        lock: bool = False,
+        refresh: bool = False,
     ) -> Conversation:
         statement = select(Conversation).where(
             Conversation.id == conversation_id,
             Conversation.user_id == user_id,
         )
-        if lock:
-            statement = statement.with_for_update()
+        if refresh:
+            # parse_intent reuses one session across its read and record phases.
+            # Reload after acquiring the write lock instead of accepting a stale
+            # identity-map object from the earlier context lookup.
+            statement = statement.execution_options(populate_existing=True)
         conversation = await session.scalar(statement)
         if conversation is None:
             raise NotFoundError("conversation", conversation_id)
