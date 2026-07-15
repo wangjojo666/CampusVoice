@@ -26,6 +26,7 @@ export function useAsr() {
   const recorderRef = useRef<PcmAudioRecorder | null>(null);
   const clientRef = useRef<AsrWebSocketClient | null>(null);
   const mountedRef = useRef(true);
+  const lifecycleRef = useRef(0);
 
   const handleMessage = useCallback((message: AsrServerMessage) => {
     if (message.type === "ready") dispatch({ type: "SOCKET_READY", sessionId: message.session_id });
@@ -50,7 +51,6 @@ export function useAsr() {
     }
     if (message.type === "completed") {
       dispatch({ type: "COMPLETED" });
-      clientRef.current?.close();
     }
     if (message.type === "error") {
       dispatch({
@@ -63,6 +63,7 @@ export function useAsr() {
   }, []);
 
   const cleanup = useCallback(async () => {
+    lifecycleRef.current += 1;
     clientRef.current?.close();
     clientRef.current = null;
     const recorder = recorderRef.current;
@@ -80,7 +81,9 @@ export function useAsr() {
 
   const start = useCallback(async () => {
     if (!["idle", "completed", "error"].includes(state.phase)) return;
+    const lifecycle = lifecycleRef.current + 1;
     await cleanup();
+    if (!mountedRef.current || lifecycleRef.current !== lifecycle) return;
     dispatch({ type: "START" });
     const hotwordsPromise = Promise.allSettled([api.hotwords.list(), api.settings.get()]).then(
       ([hotwords, settings]) =>
@@ -91,32 +94,69 @@ export function useAsr() {
     );
     const recorder = new PcmAudioRecorder();
     recorderRef.current = recorder;
+    const startWasCancelled = () => !mountedRef.current || lifecycleRef.current !== lifecycle;
+    const releaseRecorder = async () => {
+      if (recorderRef.current === recorder) recorderRef.current = null;
+      await recorder.stop();
+    };
     try {
       await recorder.start({
-        onChunk: (chunk) => clientRef.current?.sendAudio(chunk),
-        onLevel: (level) => mountedRef.current && dispatch({ type: "LEVEL", level }),
+        onChunk: (chunk) => {
+          if (!startWasCancelled()) clientRef.current?.sendAudio(chunk);
+        },
+        onLevel: (level) => {
+          if (!startWasCancelled()) dispatch({ type: "LEVEL", level });
+        },
       });
-      if (!mountedRef.current) return;
+      if (startWasCancelled()) {
+        await releaseRecorder();
+        return;
+      }
       dispatch({ type: "PERMISSION_GRANTED" });
       // Request the short-lived ticket only after the user has answered the
       // permission prompt; otherwise it may expire while the prompt is open.
       const ticket = await api.auth.websocketTicket();
+      if (startWasCancelled()) {
+        await releaseRecorder();
+        return;
+      }
+      const hotwords = await hotwordsPromise;
+      if (startWasCancelled()) {
+        await releaseRecorder();
+        return;
+      }
       const client = new AsrWebSocketClient(
         {
-          onMessage: handleMessage,
-          onClose: (expected) =>
-            mountedRef.current && dispatch({ type: "SOCKET_CLOSED", expected }),
-          onError: (message) =>
-            mountedRef.current && dispatch({ type: "FAIL", message, retryable: true }),
+          onMessage: (message) => {
+            if (startWasCancelled() || clientRef.current !== client) return;
+            handleMessage(message);
+            if (message.type === "completed") {
+              client.close();
+              if (clientRef.current === client) clientRef.current = null;
+            }
+          },
+          onClose: (expected) => {
+            if (startWasCancelled() || clientRef.current !== client) return;
+            clientRef.current = null;
+            dispatch({ type: "SOCKET_CLOSED", expected });
+          },
+          onError: (message) => {
+            if (startWasCancelled() || clientRef.current !== client) return;
+            dispatch({ type: "FAIL", message, retryable: true });
+          },
         },
-        { hotwords: await hotwordsPromise, ticket: ticket.ticket },
+        { hotwords, ticket: ticket.ticket },
       );
       clientRef.current = client;
       await client.connect();
+      if (startWasCancelled()) {
+        client.close();
+        if (clientRef.current === client) clientRef.current = null;
+        await releaseRecorder();
+      }
     } catch (reason) {
-      await recorder.stop();
-      recorderRef.current = null;
-      if (mountedRef.current) {
+      await releaseRecorder();
+      if (!startWasCancelled()) {
         if (reason instanceof DOMException)
           dispatch({ type: "PERMISSION_DENIED", message: microphoneError(reason) });
         else
