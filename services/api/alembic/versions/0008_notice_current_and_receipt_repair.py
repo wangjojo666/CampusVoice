@@ -349,6 +349,16 @@ def upgrade() -> None:
                 "Revision 0008 offline SQL supports only SQLite and PostgreSQL; "
                 f"received dialect {offline_dialect!r}"
             )
+    if migration_context.dialect.name == "postgresql":
+        # Alembic creates version_num as VARCHAR(32), but this published
+        # revision identifier is longer. Widen before Alembic stamps 0008.
+        op.alter_column(
+            "alembic_version",
+            "version_num",
+            existing_type=sa.String(32),
+            type_=sa.Text(),
+            existing_nullable=False,
+        )
 
     # Legacy databases can contain more than one current row. Select a single
     # deterministic head before adding the invariant that prevents recurrence.
