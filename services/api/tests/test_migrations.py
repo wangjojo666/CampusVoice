@@ -49,17 +49,17 @@ def _database_url(database_path: Path) -> str:
     return f"sqlite+aiosqlite:///{database_path.resolve().as_posix()}"
 
 
-def _run_alembic(database_path: Path, *arguments: str) -> None:
+def _alembic_process(database_url: str, *arguments: str) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment.update(
         {
             "CAMPUSVOICE_AUTH_MODE": "demo",
             "CAMPUSVOICE_DATABASE_AUTO_CREATE": "false",
-            "CAMPUSVOICE_DATABASE_URL": _database_url(database_path),
+            "CAMPUSVOICE_DATABASE_URL": database_url,
             "CAMPUSVOICE_ENV": "test",
         }
     )
-    completed = subprocess.run(
+    return subprocess.run(
         [sys.executable, "-m", "alembic", "-c", str(ALEMBIC_INI), *arguments],
         cwd=API_ROOT,
         env=environment,
@@ -68,11 +68,20 @@ def _run_alembic(database_path: Path, *arguments: str) -> None:
         text=True,
         timeout=60,
     )
+
+
+def _run_alembic_url(database_url: str, *arguments: str) -> subprocess.CompletedProcess[str]:
+    completed = _alembic_process(database_url, *arguments)
     assert completed.returncode == 0, (
         f"alembic {' '.join(arguments)} failed\n"
         f"stdout:\n{completed.stdout}\n"
         f"stderr:\n{completed.stderr}"
     )
+    return completed
+
+
+def _run_alembic(database_path: Path, *arguments: str) -> None:
+    _run_alembic_url(_database_url(database_path), *arguments)
 
 
 def _application_tables(database_path: Path) -> set[str]:
@@ -123,6 +132,337 @@ def test_alembic_accepts_percent_encoded_database_url(tmp_path: Path) -> None:
     _run_alembic(database_path, "upgrade", "0001_initial_schema", "--sql")
 
     assert not database_path.exists()
+
+
+def test_offline_postgresql_upgrade_renders_through_head() -> None:
+    completed = _run_alembic_url(
+        "postgresql://offline:offline@127.0.0.1:1/offline",
+        "upgrade",
+        "head",
+        "--sql",
+    )
+
+    assert f"version_num='{HEAD_REVISION}'" in completed.stdout
+    assert "CREATE UNIQUE INDEX uq_documents_series_current" in completed.stdout
+    assert completed.stdout.count("UPDATE impact_migration_plans") == 2
+    assert completed.stdout.count("UPDATE impact_migration_items") == 2
+    assert "SELECT impact_migration_plans.id" not in completed.stdout
+    assert "SELECT impact_migration_items.id" not in completed.stdout
+    expected_targets = {
+        "execute_receipt_json": "execute",
+        "undo_receipt_json": "undo",
+        "execute_verification_json": "execute",
+        "undo_verification_json": "undo",
+    }
+    for target, operation in expected_targets.items():
+        assignment = f"SET {target} = verification_json"
+        assert completed.stdout.count(assignment) == 1
+        predicate = completed.stdout.split(assignment, maxsplit=1)[1].split(";", maxsplit=1)[0]
+        assert f"verification_json ->> 'operation' = '{operation}'" in predicate
+        assert f"CASE WHEN json_typeof({target}) = 'object'" in predicate
+        assert f"THEN {target} ELSE CAST('{{}}' AS json) END" in predicate
+        assert "CASE WHEN json_typeof(verification_json) = 'object'" in predicate
+        assert "json_typeof(verification_json -> 'verified') = 'boolean'" in predicate
+    assert "CAST(execute_receipt_json AS jsonb)" not in completed.stdout
+    assert " AS numeric)" not in completed.stdout
+    assert completed.stdout.rstrip().endswith("COMMIT;")
+
+
+def test_offline_v08_rejects_unsupported_dialect_before_revision_sql() -> None:
+    completed = _alembic_process(
+        "mysql://offline:offline@127.0.0.1:1/offline",
+        "upgrade",
+        "0007_notice_migration_safety:head",
+        "--sql",
+    )
+
+    assert completed.returncode != 0
+    assert "offline SQL supports only SQLite and PostgreSQL" in completed.stderr
+    assert "WITH ranked AS" not in completed.stdout
+    assert "uq_documents_series_current" not in completed.stdout
+    assert "UPDATE impact_migration_plans" not in completed.stdout
+
+
+def test_offline_sqlite_v08_repairs_receipts_and_current_heads(tmp_path: Path) -> None:
+    database_path = tmp_path / "offline-v08.db"
+    render_path = tmp_path / "render-only.db"
+    _run_alembic(database_path, "upgrade", "0007_notice_migration_safety")
+    verified_at = "2026-07-15T01:02:03+00:00"
+    plan_execute = {
+        "operation": "execute",
+        "verified": True,
+        "verified_count": 1,
+        "total_count": 1,
+        "verified_at": verified_at,
+        "status": "verified",
+    }
+    plan_undo = plan_execute | {"operation": "undo", "status": "undone"}
+    plan_large_count = plan_execute | {
+        "verified_count": 9_223_372_036_854_775_808,
+        "total_count": 9_223_372_036_854_775_809,
+    }
+    item_execute = {
+        "operation": "execute",
+        "verified": True,
+        "verified_at": verified_at,
+        "expected_snapshot": {"version": 1},
+        "database_snapshot": {"version": 2},
+    }
+    item_undo = item_execute | {"operation": "undo"}
+    invalid_plan_receipts: dict[str, object] = {
+        "negative": plan_execute | {"verified_count": -1},
+        "over-count": plan_execute | {"verified_count": 2},
+        "float-count": plan_execute | {"verified_count": 1.0},
+        "large-over-count": plan_execute
+        | {
+            "verified_count": 9_223_372_036_854_775_809,
+            "total_count": 9_223_372_036_854_775_808,
+        },
+        "wrong-type": plan_execute | {"verified": "true"},
+        "invalid-time": plan_execute | {"verified_at": "2026-02-30T01:02:03+00:00"},
+        "ambiguous": {"operation": "execute", "verified": True},
+        "duplicate-operation": (
+            '{"operation":"execute","operation":"undo","verified":true,'
+            '"verified_count":1,"total_count":1,"verified_at":'
+            f'"{verified_at}","status":"verified"}}'
+        ),
+        "duplicate-count": (
+            '{"operation":"execute","verified":true,"verified_count":1,'
+            '"verified_count":2,"total_count":1,"verified_at":'
+            f'"{verified_at}","status":"verified"}}'
+        ),
+        "malformed": "{not-json",
+    }
+    invalid_item_receipts: dict[str, object] = {
+        "array-snapshot": item_execute | {"expected_snapshot": []},
+        "wrong-type": item_execute | {"verified": 1},
+        "invalid-time": item_execute | {"verified_at": "2026-07-15T25:02:03+00:00"},
+        "ambiguous": {"operation": "execute", "verified": True},
+        "duplicate-operation": (
+            '{"operation":"execute","operation":"undo","verified":true,'
+            f'"verified_at":"{verified_at}","expected_snapshot":{{}},'
+            '"database_snapshot":{}}'
+        ),
+        "malformed": "{not-json",
+    }
+
+    with closing(sqlite3.connect(database_path)) as connection, connection:
+        connection.executemany(
+            "INSERT INTO documents "
+            "(id, user_id, title, file_type, storage_path, content_sha256, status, "
+            "series_id, revision_number, is_current, ingest_source, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    "doc-offline-old",
+                    "user-offline",
+                    "Old",
+                    "txt",
+                    "inline://old",
+                    "a" * 64,
+                    "ready",
+                    "series-offline",
+                    1,
+                    1,
+                    "test",
+                    verified_at,
+                    verified_at,
+                ),
+                (
+                    "doc-offline-new",
+                    "user-offline",
+                    "New",
+                    "txt",
+                    "inline://new",
+                    "b" * 64,
+                    "ready",
+                    "series-offline",
+                    2,
+                    1,
+                    "test",
+                    verified_at,
+                    verified_at,
+                ),
+            ],
+        )
+        plan_rows = [
+            ("plan-offline-execute", plan_execute, {}, {}),
+            ("plan-offline-undo", plan_undo, {}, {}),
+            ("plan-offline-large-count", plan_large_count, {}, {}),
+            (
+                "plan-offline-occupied",
+                plan_execute,
+                {"operation": "execute", "marker": "keep"},
+                {},
+            ),
+            (
+                "plan-offline-undo-occupied",
+                plan_undo,
+                {},
+                {"operation": "undo", "marker": "keep"},
+            ),
+            ("plan-offline-malformed-target", plan_execute, {}, {}),
+        ]
+        plan_rows.extend(
+            (f"plan-offline-{suffix}", receipt, {}, {})
+            for suffix, receipt in invalid_plan_receipts.items()
+        )
+        connection.executemany(
+            "INSERT INTO impact_migration_plans "
+            "(id, user_id, change_set_id, status, risk_level, conflicts_json, "
+            "verification_json, execute_receipt_json, undo_receipt_json, generation, "
+            "version, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    plan_id,
+                    "user-offline",
+                    f"change-{plan_id}",
+                    "verified",
+                    "low",
+                    "[]",
+                    receipt if isinstance(receipt, str) else json.dumps(receipt),
+                    json.dumps(execute_target),
+                    json.dumps(undo_target),
+                    1,
+                    1,
+                    verified_at,
+                    verified_at,
+                )
+                for plan_id, receipt, execute_target, undo_target in plan_rows
+            ],
+        )
+        item_rows = [
+            ("item-offline-execute", item_execute, {}, {}),
+            ("item-offline-undo", item_undo, {}, {}),
+            (
+                "item-offline-occupied",
+                item_execute,
+                {"operation": "execute", "marker": "keep"},
+                {},
+            ),
+            (
+                "item-offline-undo-occupied",
+                item_undo,
+                {},
+                {"operation": "undo", "marker": "keep"},
+            ),
+            ("item-offline-malformed-target", item_execute, {}, {}),
+        ]
+        item_rows.extend(
+            (f"item-offline-{suffix}", receipt, {}, {})
+            for suffix, receipt in invalid_item_receipts.items()
+        )
+        connection.executemany(
+            "INSERT INTO impact_migration_items "
+            "(id, plan_id, user_id, entity_type, entity_id, expected_version, "
+            "before_snapshot, proposed_patch, source_claim_ids, verification_json, "
+            "execute_verification_json, undo_verification_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    item_id,
+                    "plan-offline-execute",
+                    "user-offline",
+                    "task",
+                    f"task-{item_id}",
+                    1,
+                    "{}",
+                    "{}",
+                    "[]",
+                    receipt if isinstance(receipt, str) else json.dumps(receipt),
+                    json.dumps(execute_target),
+                    json.dumps(undo_target),
+                    verified_at,
+                )
+                for item_id, receipt, execute_target, undo_target in item_rows
+            ],
+        )
+        connection.execute(
+            "UPDATE impact_migration_plans SET execute_receipt_json = ? WHERE id = ?",
+            ("{not-json", "plan-offline-malformed-target"),
+        )
+        connection.execute(
+            "UPDATE impact_migration_items SET execute_verification_json = ? WHERE id = ?",
+            ("{not-json", "item-offline-malformed-target"),
+        )
+
+    completed = _run_alembic_url(
+        _database_url(render_path),
+        "upgrade",
+        "0007_notice_migration_safety:head",
+        "--sql",
+    )
+
+    assert not render_path.exists()
+    assert "SELECT impact_migration_plans.id" not in completed.stdout
+    assert "SELECT impact_migration_items.id" not in completed.stdout
+    assert f"version_num='{HEAD_REVISION}'" in completed.stdout
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.executescript(completed.stdout)
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
+            HEAD_REVISION,
+        )
+        assert connection.execute(
+            "SELECT id FROM documents WHERE series_id = ? AND is_current = 1",
+            ("series-offline",),
+        ).fetchall() == [("doc-offline-new",)]
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE documents SET is_current = 1 WHERE id = ?",
+                ("doc-offline-old",),
+            )
+        connection.rollback()
+
+        def decode_json(raw: str) -> object:
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                return raw
+
+        plan_receipts = {
+            str(plan_id): (decode_json(execute_raw), decode_json(undo_raw))
+            for plan_id, execute_raw, undo_raw in connection.execute(
+                "SELECT id, execute_receipt_json, undo_receipt_json FROM impact_migration_plans"
+            )
+        }
+        assert plan_receipts["plan-offline-execute"] == (plan_execute, {})
+        assert plan_receipts["plan-offline-undo"] == ({}, plan_undo)
+        assert plan_receipts["plan-offline-large-count"] == (plan_large_count, {})
+        assert plan_receipts["plan-offline-occupied"] == (
+            {"operation": "execute", "marker": "keep"},
+            {},
+        )
+        assert plan_receipts["plan-offline-undo-occupied"] == (
+            {},
+            {"operation": "undo", "marker": "keep"},
+        )
+        assert plan_receipts["plan-offline-malformed-target"] == ("{not-json", {})
+        assert all(
+            plan_receipts[f"plan-offline-{suffix}"] == ({}, {}) for suffix in invalid_plan_receipts
+        )
+
+        item_receipts = {
+            str(item_id): (decode_json(execute_raw), decode_json(undo_raw))
+            for item_id, execute_raw, undo_raw in connection.execute(
+                "SELECT id, execute_verification_json, undo_verification_json "
+                "FROM impact_migration_items"
+            )
+        }
+        assert item_receipts["item-offline-execute"] == (item_execute, {})
+        assert item_receipts["item-offline-undo"] == ({}, item_undo)
+        assert item_receipts["item-offline-occupied"] == (
+            {"operation": "execute", "marker": "keep"},
+            {},
+        )
+        assert item_receipts["item-offline-undo-occupied"] == (
+            {},
+            {"operation": "undo", "marker": "keep"},
+        )
+        assert item_receipts["item-offline-malformed-target"] == ("{not-json", {})
+        assert all(
+            item_receipts[f"item-offline-{suffix}"] == ({}, {}) for suffix in invalid_item_receipts
+        )
 
 
 def test_v08_repairs_current_heads_and_unambiguous_legacy_receipts(tmp_path: Path) -> None:
