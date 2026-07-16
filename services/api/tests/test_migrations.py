@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import os
 import sqlite3
@@ -5,8 +6,10 @@ import subprocess
 import sys
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import sqlalchemy as sa
 
 API_ROOT = Path(__file__).resolve().parents[1]
 ALEMBIC_INI = API_ROOT / "alembic.ini"
@@ -134,15 +137,20 @@ def test_alembic_accepts_percent_encoded_database_url(tmp_path: Path) -> None:
     assert not database_path.exists()
 
 
-def test_offline_postgresql_upgrade_renders_through_head() -> None:
+@pytest.mark.parametrize("target", ["head", "0007_notice_migration_safety:head"])
+def test_offline_postgresql_upgrade_renders_through_head(target: str) -> None:
     completed = _run_alembic_url(
         "postgresql://offline:offline@127.0.0.1:1/offline",
         "upgrade",
-        "head",
+        target,
         "--sql",
     )
 
-    assert f"version_num='{HEAD_REVISION}'" in completed.stdout
+    version_widening = "ALTER TABLE alembic_version ALTER COLUMN version_num TYPE TEXT"
+    head_update = f"version_num='{HEAD_REVISION}'"
+    assert len(HEAD_REVISION) > 32
+    assert version_widening in completed.stdout
+    assert completed.stdout.index(version_widening) < completed.stdout.index(head_update)
     assert "CREATE UNIQUE INDEX uq_documents_series_current" in completed.stdout
     assert completed.stdout.count("UPDATE impact_migration_plans") == 2
     assert completed.stdout.count("UPDATE impact_migration_items") == 2
@@ -166,6 +174,71 @@ def test_offline_postgresql_upgrade_renders_through_head() -> None:
     assert "CAST(execute_receipt_json AS jsonb)" not in completed.stdout
     assert " AS numeric)" not in completed.stdout
     assert completed.stdout.rstrip().endswith("COMMIT;")
+
+
+@pytest.mark.parametrize(
+    ("dialect", "expects_widening"),
+    [("postgresql", True), ("sqlite", False)],
+)
+def test_v08_online_widens_version_column_only_on_postgresql(
+    dialect: str,
+    expects_widening: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    revision_path = API_ROOT / "alembic" / "versions" / "0008_notice_current_and_receipt_repair.py"
+    spec = importlib.util.spec_from_file_location("v08_version_width_test", revision_path)
+    assert spec is not None and spec.loader is not None
+    revision_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(revision_module)
+    events: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    migration_context = SimpleNamespace(
+        as_sql=False,
+        dialect=SimpleNamespace(name=dialect),
+    )
+    monkeypatch.setattr(revision_module.op, "get_context", lambda: migration_context)
+    monkeypatch.setattr(
+        revision_module.op,
+        "alter_column",
+        lambda *args, **kwargs: events.append(("alter", args, kwargs)),
+    )
+    monkeypatch.setattr(
+        revision_module.op,
+        "execute",
+        lambda *args, **kwargs: events.append(("execute", args, kwargs)),
+    )
+    monkeypatch.setattr(
+        revision_module.op,
+        "create_index",
+        lambda *args, **kwargs: events.append(("index", args, kwargs)),
+    )
+    monkeypatch.setattr(revision_module, "_repair_receipts", lambda: None)
+
+    revision_module.upgrade()
+
+    alters = [event for event in events if event[0] == "alter"]
+    if not expects_widening:
+        assert alters == []
+        return
+    assert events[0][0] == "alter"
+    assert len(alters) == 1
+    _, args, kwargs = alters[0]
+    assert args == ("alembic_version", "version_num")
+    assert isinstance(kwargs["existing_type"], sa.String)
+    assert kwargs["existing_type"].length == 32
+    assert isinstance(kwargs["type_"], sa.Text)
+    assert kwargs["existing_nullable"] is False
+
+
+def test_offline_postgresql_downgrade_does_not_narrow_version_column() -> None:
+    completed = _run_alembic_url(
+        "postgresql://offline:offline@127.0.0.1:1/offline",
+        "downgrade",
+        "0008_notice_current_and_receipt_repair:0007_notice_migration_safety",
+        "--sql",
+    )
+
+    assert "ALTER COLUMN version_num TYPE" not in completed.stdout
+    assert "version_num='0007_notice_migration_safety'" in completed.stdout
 
 
 def test_offline_v08_rejects_unsupported_dialect_before_revision_sql() -> None:
