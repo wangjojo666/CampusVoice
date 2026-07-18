@@ -1,7 +1,248 @@
+import asyncio
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.models.entities import CalendarEvent, Course, User
 from tests.helpers import confirm_action, confirmed_write
+
+
+async def _seed_event_course_references(
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    legacy_event: bool = False,
+) -> None:
+    async with factory() as session, session.begin():
+        if await session.get(User, "user_other") is None:
+            session.add(User(id="user_other", display_name="Other user"))
+            await session.flush()
+        session.add_all(
+            [
+                Course(id="course_event_owned", user_id="user_demo", name="Owned course"),
+                Course(
+                    id="course_event_owned_alt",
+                    user_id="user_demo",
+                    name="Other owned course",
+                ),
+                Course(
+                    id="course_event_foreign",
+                    user_id="user_other",
+                    name="Foreign course",
+                ),
+            ]
+        )
+        await session.flush()
+        if legacy_event:
+            start_at = datetime(2026, 7, 18, 1, tzinfo=UTC)
+            session.add(
+                CalendarEvent(
+                    id="event_legacy_foreign_course",
+                    user_id="user_demo",
+                    title="Legacy cross-user course event",
+                    course_id="course_event_foreign",
+                    start_at=start_at,
+                    end_at=start_at + timedelta(hours=1),
+                )
+            )
+
+
+async def _move_event_course_to_other_user(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with factory() as session, session.begin():
+        course = await session.get(Course, "course_event_owned")
+        assert course is not None
+        course.user_id = "user_other"
+
+
+def _event_payload(title: str, *, course_id: str) -> dict[str, object]:
+    return {
+        "title": title,
+        "course_id": course_id,
+        "start_at": "2026-07-19T09:00:00+08:00",
+        "end_at": "2026-07-19T10:00:00+08:00",
+    }
+
+
+@pytest.mark.parametrize("course_id", ["course_event_foreign", "course_event_missing"])
+def test_event_create_rejects_course_not_owned_by_current_user(
+    client: TestClient,
+    course_id: str,
+) -> None:
+    asyncio.run(_seed_event_course_references(client.app.state.session_factory))
+
+    response = confirmed_write(
+        client,
+        "POST",
+        "/api/events",
+        _event_payload(f"Rejected {course_id}", course_id=course_id),
+    )
+
+    assert response.status_code == 404, response.text
+    assert response.json()["error"] == {
+        "code": "not_found",
+        "message": "course was not found",
+        "details": {"entity": "course", "id": course_id},
+    }
+    assert client.get("/api/events").json()["total"] == 0
+
+
+@pytest.mark.parametrize("course_id", ["course_event_foreign", "course_event_missing"])
+def test_event_update_rejects_course_not_owned_by_current_user(
+    client: TestClient,
+    course_id: str,
+) -> None:
+    asyncio.run(_seed_event_course_references(client.app.state.session_factory))
+    created = confirmed_write(
+        client,
+        "POST",
+        "/api/events",
+        _event_payload("Owned event", course_id="course_event_owned"),
+    )
+    assert created.status_code == 201, created.text
+    event_id = created.json()["record_id"]
+    before = client.get("/api/events").json()["items"][0]
+
+    response = confirmed_write(
+        client,
+        "PATCH",
+        f"/api/events/{event_id}",
+        {"course_id": course_id, "expected_version": 1},
+    )
+
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "not_found"
+    assert response.json()["error"]["details"] == {"entity": "course", "id": course_id}
+    assert client.get("/api/events").json()["items"][0] == before
+
+
+def test_event_accepts_owned_course_and_allows_clearing_it(client: TestClient) -> None:
+    asyncio.run(_seed_event_course_references(client.app.state.session_factory))
+
+    created = confirmed_write(
+        client,
+        "POST",
+        "/api/events",
+        _event_payload("Owned course event", course_id="course_event_owned"),
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["record"]["course_id"] == "course_event_owned"
+
+    event_id = created.json()["record_id"]
+    reassigned = confirmed_write(
+        client,
+        "PATCH",
+        f"/api/events/{event_id}",
+        {"course_id": "course_event_owned_alt", "expected_version": 1},
+    )
+    assert reassigned.status_code == 200, reassigned.text
+    assert reassigned.json()["record"]["course_id"] == "course_event_owned_alt"
+
+    cleared = confirmed_write(
+        client,
+        "PATCH",
+        f"/api/events/{event_id}",
+        {"course_id": None, "expected_version": 2},
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["record"]["course_id"] is None
+
+
+def test_event_execution_rechecks_course_ownership_after_prepare(client: TestClient) -> None:
+    factory = client.app.state.session_factory
+    asyncio.run(_seed_event_course_references(factory))
+    prepared = client.post(
+        "/api/actions/prepare",
+        json={
+            "action": "create_event",
+            "payload": _event_payload(
+                "Ownership changed after prepare",
+                course_id="course_event_owned",
+            ),
+        },
+    )
+    assert prepared.status_code == 201, prepared.text
+    action_id = prepared.json()["id"]
+    asyncio.run(_move_event_course_to_other_user(factory))
+    confirm_action(client, action_id)
+
+    executed = client.post(f"/api/actions/{action_id}/execute")
+
+    assert executed.status_code == 404, executed.text
+    assert executed.json()["error"]["details"] == {
+        "entity": "course",
+        "id": "course_event_owned",
+    }
+    assert client.get("/api/events").json()["total"] == 0
+
+
+def test_event_update_execution_rechecks_course_ownership_after_prepare(
+    client: TestClient,
+) -> None:
+    factory = client.app.state.session_factory
+    asyncio.run(_seed_event_course_references(factory))
+    created = confirmed_write(
+        client,
+        "POST",
+        "/api/events",
+        _event_payload("Update ownership after prepare", course_id="course_event_owned_alt"),
+    )
+    assert created.status_code == 201, created.text
+    event_id = created.json()["record_id"]
+    prepared = client.post(
+        "/api/actions/prepare",
+        json={
+            "action": "update_event",
+            "target_id": event_id,
+            "payload": {"course_id": "course_event_owned"},
+        },
+    )
+    assert prepared.status_code == 201, prepared.text
+    action_id = prepared.json()["id"]
+    asyncio.run(_move_event_course_to_other_user(factory))
+    confirm_action(client, action_id)
+
+    executed = client.post(f"/api/actions/{action_id}/execute")
+
+    assert executed.status_code == 404, executed.text
+    assert executed.json()["error"]["details"] == {
+        "entity": "course",
+        "id": "course_event_owned",
+    }
+    record = client.get("/api/events").json()["items"][0]
+    assert record["course_id"] == "course_event_owned_alt"
+    assert record["version"] == 1
+
+
+def test_event_undo_does_not_restore_legacy_cross_user_course(client: TestClient) -> None:
+    asyncio.run(_seed_event_course_references(client.app.state.session_factory, legacy_event=True))
+    prepared = client.post(
+        "/api/actions/prepare",
+        json={
+            "action": "update_event",
+            "target_id": "event_legacy_foreign_course",
+            "payload": {"course_id": None},
+        },
+    )
+    assert prepared.status_code == 201, prepared.text
+    action_id = prepared.json()["id"]
+    confirm_action(client, action_id)
+    executed = client.post(f"/api/actions/{action_id}/execute")
+    assert executed.status_code == 200, executed.text
+    assert executed.json()["record"]["course_id"] is None
+
+    undone = client.post(f"/api/actions/{action_id}/undo")
+
+    assert undone.status_code == 404, undone.text
+    assert undone.json()["error"]["details"] == {
+        "entity": "course",
+        "id": "course_event_foreign",
+    }
+    record = client.get("/api/events").json()["items"][0]
+    assert record["course_id"] is None
+    assert record["version"] == 2
 
 
 def _create_event(client: TestClient, title: str = "高等数学") -> str:
