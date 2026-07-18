@@ -11,9 +11,11 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import Link from "next/link";
+import { useState } from "react";
 
 import { ExecutionResult } from "@/components/actions/execution-result";
 import { ApiError, api } from "@/lib/api-client";
+import { createVerifiedFinishEvent, type VerifiedFinishEvent } from "@/lib/verified-finish";
 import { useAssistantStore } from "@/stores/assistant-store";
 
 const intentLabels: Record<string, string> = {
@@ -36,6 +38,7 @@ function stateTone(ready: boolean) {
 
 export function WorkflowSnapshot() {
   const store = useAssistantStore();
+  const [verifiedFinish, setVerifiedFinish] = useState<VerifiedFinishEvent | null>(null);
   const correctionReady = Boolean(store.correction);
   const intentReady = Boolean(store.intent);
   const confirmationReady = Boolean(store.pendingAction || store.execution?.success);
@@ -52,11 +55,15 @@ export function WorkflowSnapshot() {
   const undo = async () => {
     const actionId = store.lastExecutedActionId;
     if (!actionId) return;
+    setVerifiedFinish(null);
     store.setWorkflowStatus("executing");
     try {
       const result = await api.actions.undo(actionId);
       store.setExecution(result);
-      if (result.success) store.setLastExecutedActionId(null);
+      if (result.success) {
+        store.setLastExecutedActionId(null);
+        setVerifiedFinish(createVerifiedFinishEvent(result, "undo"));
+      }
       store.setWorkflowStatus(result.success ? "succeeded" : "error");
       if (!result.success) store.setError(result.message);
     } catch (reason) {
@@ -169,6 +176,7 @@ export function WorkflowSnapshot() {
         <div className="mt-4">
           <ExecutionResult
             result={store.execution}
+            verifiedFinish={verifiedFinish}
             onUndo={
               store.execution.success && store.lastExecutedActionId ? () => void undo() : undefined
             }

@@ -836,7 +836,14 @@ export const api = {
 
   tasks: {
     list: (
-      filters: { status?: string; course?: string; due_from?: string; due_to?: string } = {},
+      filters: {
+        status?: string;
+        course?: string;
+        due_from?: string;
+        due_to?: string;
+        limit?: number;
+        offset?: number;
+      } = {},
     ) => listRequest<Task>(`/api/tasks${asQuery(filters)}`),
     create: (data: TaskCreate) =>
       confirmedJsonRequest<MutationResult<Task>>("POST", "/api/tasks", data, idempotencyHeaders()),
@@ -851,9 +858,23 @@ export const api = {
   },
 
   events: {
-    list: (filters: { start?: string; end?: string; course?: string } = {}) =>
+    list: (
+      filters: {
+        start?: string;
+        end?: string;
+        course?: string;
+        limit?: number;
+        offset?: number;
+      } = {},
+    ) =>
       listRequest<CalendarEvent>(
-        `/api/events${asQuery({ starts_after: filters.start, starts_before: filters.end, course: filters.course })}`,
+        `/api/events${asQuery({
+          starts_after: filters.start,
+          starts_before: filters.end,
+          course: filters.course,
+          limit: filters.limit,
+          offset: filters.offset,
+        })}`,
       ),
     create: (data: CalendarEventCreate) =>
       confirmedJsonRequest<MutationResult<CalendarEvent>>(

@@ -9,9 +9,10 @@ import {
 import Link from "next/link";
 
 import type { TodaySummary } from "@/lib/dashboard/today";
+import type { DashboardResourceStatus } from "@/lib/dashboard/resource-status";
 import { formatDateTime } from "@/lib/format";
 
-export type TodayResourceStatus = "loading" | "ready" | "stale" | "error";
+export type TodayResourceStatus = DashboardResourceStatus;
 
 type TodayPanelProps = {
   clockReady: boolean;

@@ -1,6 +1,10 @@
 import type { CalendarEvent, Task } from "@campusvoice/shared-types";
 
-import { fromLocalInputValue, toLocalInputValue } from "@/lib/format";
+import {
+  addLocalDays,
+  firstValidInstantOfLocalDay,
+  localDateKey,
+} from "@/lib/dashboard/local-days";
 
 export type TodayTimelineItem =
   | {
@@ -36,33 +40,6 @@ type TodaySummaryOptions = {
   now: Date;
   timezone: string;
 };
-
-function localDateKey(date: Date, timezone: string) {
-  return toLocalInputValue(date.toISOString(), timezone).slice(0, 10);
-}
-
-function addLocalDays(dateKey: string, days: number) {
-  const value = new Date(dateKey + "T00:00:00.000Z");
-  value.setUTCDate(value.getUTCDate() + days);
-  return value.toISOString().slice(0, 10);
-}
-
-function firstValidInstantOfLocalDay(dateKey: string, timezone: string) {
-  let candidateDate = dateKey;
-  for (let dayAttempt = 0; dayAttempt < 3; dayAttempt += 1) {
-    for (let minute = 0; minute < 24 * 60; minute += 1) {
-      const hourText = String(Math.floor(minute / 60)).padStart(2, "0");
-      const minuteText = String(minute % 60).padStart(2, "0");
-      const value = fromLocalInputValue(
-        candidateDate + "T" + hourText + ":" + minuteText,
-        timezone,
-      );
-      if (value) return new Date(value).getTime();
-    }
-    candidateDate = addLocalDays(candidateDate, 1);
-  }
-  throw new RangeError("Unable to resolve local day " + dateKey + " in " + timezone);
-}
 
 function timestamp(value: string | null | undefined) {
   if (!value) return null;

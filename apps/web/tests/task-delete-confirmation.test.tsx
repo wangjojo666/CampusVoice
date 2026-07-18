@@ -119,6 +119,7 @@ describe("TasksPage destructive confirmation", () => {
     expect(
       await screen.findByText("第一次确认已完成。只有再次点击下方按钮后，系统才会执行删除。"),
     ).toBeInTheDocument();
+    expect(screen.queryByText("这一步稳稳落地了")).not.toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("重新输入完整标题进行第二次确认"), {
       target: { value: "提交机器学习作业" },
@@ -128,6 +129,7 @@ describe("TasksPage destructive confirmation", () => {
     await waitFor(() => expect(mocks.confirm).toHaveBeenCalledTimes(2));
     expect(mocks.execute).toHaveBeenCalledWith("action-delete-task");
     expect(await screen.findByText("待办已删除并通过数据库验证")).toBeInTheDocument();
+    expect(screen.getByText("这一步稳稳落地了")).toBeInTheDocument();
   });
 
   it("skips a newer event action and undoes the latest task action", async () => {
@@ -158,5 +160,6 @@ describe("TasksPage destructive confirmation", () => {
     await waitFor(() => expect(mocks.undo).toHaveBeenCalledWith("task-action"));
     expect(mocks.undo).not.toHaveBeenCalledWith("event-action");
     expect(await screen.findByText("待办撤销成功")).toBeInTheDocument();
+    expect(screen.getByText("已撤回并通过数据库验证。")).toBeInTheDocument();
   });
 });

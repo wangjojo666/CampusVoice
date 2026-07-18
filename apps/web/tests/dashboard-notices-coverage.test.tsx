@@ -259,6 +259,7 @@ describe("dashboard business states", () => {
     store.setLastExecutedActionId("action-old");
 
     render(<HomePage />);
+    expect(screen.queryByText("这一步稳稳落地了")).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "盯住实验报告截止" }));
 
     expect(useAssistantStore.getState()).toMatchObject({
@@ -314,6 +315,10 @@ describe("dashboard business states", () => {
     render(<HomePage />);
 
     const today = await screen.findByRole("region", { name: "今天" });
+    const weekly = await screen.findByRole("region", { name: "一周节奏" });
+    const voice = screen.getByRole("region", { name: "问声程" });
+    expect(today.compareDocumentPosition(weekly) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(weekly.compareDocumentPosition(voice) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     await waitFor(() =>
       expect(within(today).getByText("3 天内截止").previousElementSibling).toHaveTextContent("2"),
     );

@@ -205,7 +205,30 @@ button:disabled {
   }
 }
 
+@keyframes verified-finish-settle {
+  from {
+    opacity: 0;
+    transform: translateY(0.35rem);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .verified-finish {
+    animation: verified-finish-settle 240ms ease-out both;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
+  .verified-finish {
+    animation: none !important;
+    transform: none !important;
+  }
+
   *,
   *::before,
   *::after {
