@@ -1,9 +1,11 @@
+import logging
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import OperationalError
 
 from app.core.config import Settings
 from app.db.base import Base
@@ -29,6 +31,18 @@ class _RetryingExecutor(RetentionExecutor):
 
     async def _sleep(self, delay: float) -> None:  # type: ignore[override]
         self._sleep_delays.append(delay)
+
+
+class _FailingExecutor(RetentionExecutor):
+    def __init__(self, settings: Settings, message: str) -> None:
+        self._settings = settings
+        self._message = message
+
+    async def run_once(self) -> dict[str, dict[str, int]]:
+        raise RuntimeError(self._message)
+
+    async def _sleep(self, _delay: float) -> None:  # type: ignore[override]
+        return None
 
 
 @pytest.mark.asyncio
@@ -68,6 +82,28 @@ async def test_retention_job_emits_summary_and_disposes_engine(
     )
 
 
+def test_retention_job_failure_uses_safe_stderr_and_nonzero_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    private_sentinel = "retention-cli-private-sentinel"
+
+    async def fail() -> None:
+        raise RuntimeError(private_sentinel)
+
+    monkeypatch.setattr(retention_job, "_run", fail)
+
+    with pytest.raises(SystemExit) as caught:
+        retention_job.main()
+
+    captured = capsys.readouterr()
+    assert caught.value.code == 1
+    assert captured.out == ""
+    assert captured.err.strip() == "retention_job_failed"
+    assert private_sentinel not in captured.err
+    assert "Traceback" not in captured.err
+
+
 @pytest.mark.asyncio
 async def test_retention_executor_retries_with_bounded_exponential_backoff() -> None:
     settings = Settings(
@@ -80,6 +116,58 @@ async def test_retention_executor_retries_with_bounded_exponential_backoff() -> 
     assert result == {"user": {"transcriptions": 2}}
     assert executor.calls == 3
     assert executor._sleep_delays == [0.1, 0.2]
+
+
+@pytest.mark.asyncio
+async def test_retention_failure_logs_do_not_include_exception_details(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    private_sentinel = "retention-log-private-sentinel"
+    executor = _FailingExecutor(
+        Settings(
+            env="test",
+            retention_scheduler_max_retries=1,
+            retention_scheduler_retry_base_seconds=0.1,
+        ),
+        private_sentinel,
+    )
+
+    with (
+        caplog.at_level(logging.WARNING, logger="campusvoice.retention"),
+        pytest.raises(RuntimeError, match=private_sentinel),
+    ):
+        await executor.run_with_retries()
+
+    records = [record for record in caplog.records if record.name == "campusvoice.retention"]
+    assert [record.message for record in records] == [
+        "retention_run_retry",
+        "retention_run_failed",
+    ]
+    assert [record.exception_type for record in records] == ["RuntimeError", "RuntimeError"]
+    assert all(record.exc_info is None for record in records)
+    assert private_sentinel not in caplog.text
+    assert "Traceback" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_database_engine_hides_bound_parameters_in_errors() -> None:
+    private_sentinel = "retention-engine-private-sentinel"
+    engine = create_database_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        with pytest.raises(OperationalError) as caught:
+            async with engine.connect() as connection:
+                await connection.execute(
+                    text(
+                        "SELECT value FROM deliberately_missing_retention_table "
+                        "WHERE user_id = :user_id"
+                    ),
+                    {"user_id": private_sentinel},
+                )
+        rendered = str(caught.value)
+        assert private_sentinel not in rendered
+        assert "parameters hidden" in rendered.lower()
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
