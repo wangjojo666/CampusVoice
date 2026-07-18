@@ -15,6 +15,7 @@ from app.models.entities import (
     ActionLog,
     CalendarEvent,
     ConfirmationNonce,
+    Course,
     PendingAction,
     Task,
     Transcription,
@@ -398,14 +399,23 @@ class ActionService:
             )
         if candidate is None:
             return
-        await self._validate_candidate_lineage(session, user_id, candidate)
+        await self._validate_candidate_references(session, user_id, candidate)
 
     @staticmethod
-    async def _validate_candidate_lineage(
+    async def _validate_candidate_references(
         session: AsyncSession,
         user_id: str,
         candidate: TaskCreate | EventCreate | TaskDraft | EventDraft,
     ) -> None:
+        if candidate.course_id is not None:
+            course_id = await session.scalar(
+                select(Course.id).where(
+                    Course.id == candidate.course_id,
+                    Course.user_id == user_id,
+                )
+            )
+            if course_id is None:
+                raise NotFoundError("course", candidate.course_id)
         await validate_notice_lineage(
             session,
             user_id,
@@ -1096,7 +1106,7 @@ class ActionService:
     async def _apply(self, session: AsyncSession, action: PendingAction) -> AppliedOperation:
         if action.action_type == ActionType.CREATE_TASK:
             new_task_data = _task_create_from_payload(action.payload)
-            await self._validate_candidate_lineage(session, action.user_id, new_task_data)
+            await self._validate_candidate_references(session, action.user_id, new_task_data)
             create_task_duplicates = await self.tasks.find_duplicates(
                 session,
                 action.user_id,
@@ -1131,7 +1141,9 @@ class ActionService:
             updated_task_candidate = _merge_task(
                 task_to_update, TaskDraft.model_validate(action.payload)
             )
-            await self._validate_candidate_lineage(session, action.user_id, updated_task_candidate)
+            await self._validate_candidate_references(
+                session, action.user_id, updated_task_candidate
+            )
             update_task_duplicates = await self.tasks.find_duplicates(
                 session,
                 action.user_id,
@@ -1176,7 +1188,7 @@ class ActionService:
             new_event_data = _event_create_from_payload(
                 action.payload, bool(action.execution_options.get("overwrite_existing"))
             )
-            await self._validate_candidate_lineage(session, action.user_id, new_event_data)
+            await self._validate_candidate_references(session, action.user_id, new_event_data)
             await self._guard_event_collisions(session, action.user_id, new_event_data)
             created_event = await self.events.create(session, action.user_id, new_event_data)
             created_event_snapshot = _snapshot_event(created_event)
@@ -1209,7 +1221,9 @@ class ActionService:
                 EventDraft.model_validate(action.payload),
                 bool(action.execution_options.get("overwrite_existing")),
             )
-            await self._validate_candidate_lineage(session, action.user_id, updated_event_candidate)
+            await self._validate_candidate_references(
+                session, action.user_id, updated_event_candidate
+            )
             await self._guard_event_collisions(
                 session,
                 action.user_id,
@@ -1604,6 +1618,7 @@ class ActionService:
         snapshot: dict[str, Any],
     ) -> Task:
         data = TaskCreate.model_validate(_task_business_fields(snapshot))
+        await self._validate_candidate_references(session, user_id, data)
         if current is None:
             current = Task(
                 id=snapshot["id"],
@@ -1629,6 +1644,7 @@ class ActionService:
         data = EventCreate.model_validate(
             _event_business_fields(snapshot) | {"allow_conflict": True}
         )
+        await self._validate_candidate_references(session, user_id, data)
         values = data.model_dump(exclude={"allow_conflict"})
         if current is None:
             current = CalendarEvent(
