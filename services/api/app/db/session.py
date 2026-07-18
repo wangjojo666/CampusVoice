@@ -92,7 +92,12 @@ def _set_sqlite_pragmas(dbapi_connection: object, _connection_record: object) ->
 
 def create_database_engine(database_url: str, *, echo: bool = False) -> AsyncEngine:
     _ensure_sqlite_parent(database_url)
-    engine = create_async_engine(database_url, echo=echo, pool_pre_ping=True)
+    engine = create_async_engine(
+        database_url,
+        echo=echo,
+        hide_parameters=True,
+        pool_pre_ping=True,
+    )
 
     if make_url(database_url).drivername.startswith("sqlite"):
         event.listen(engine.sync_engine, "connect", _set_sqlite_pragmas)

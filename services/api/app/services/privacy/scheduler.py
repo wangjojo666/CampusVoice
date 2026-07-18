@@ -49,18 +49,27 @@ class RetentionExecutor:
                 return await self.run_once()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                exception_type = type(exc).__name__
                 if attempt + 1 >= attempts:
-                    logger.exception(
+                    logger.error(
                         "retention_run_failed",
-                        extra={"attempt": attempt + 1, "attempts": attempts},
+                        extra={
+                            "attempt": attempt + 1,
+                            "attempts": attempts,
+                            "exception_type": exception_type,
+                        },
                     )
                     raise
                 delay = self._settings.retention_scheduler_retry_base_seconds * (2**attempt)
                 logger.warning(
                     "retention_run_retry",
-                    extra={"attempt": attempt + 1, "attempts": attempts, "delay_seconds": delay},
-                    exc_info=True,
+                    extra={
+                        "attempt": attempt + 1,
+                        "attempts": attempts,
+                        "delay_seconds": delay,
+                        "exception_type": exception_type,
+                    },
                 )
                 await self._sleep(delay)
         raise RuntimeError("unreachable retention retry state")

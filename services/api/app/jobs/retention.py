@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sys
 
 from app.core.config import get_settings
 from app.db.session import create_database_engine, create_session_factory
@@ -18,7 +19,11 @@ async def _run() -> None:
 
 
 def main() -> None:
-    asyncio.run(_run())
+    try:
+        asyncio.run(_run())
+    except Exception:
+        print("retention_job_failed", file=sys.stderr)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":
