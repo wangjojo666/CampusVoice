@@ -11,6 +11,7 @@ import { CalendarPlus, Check, Clock3, Edit3, MapPin, Plus, RotateCcw, Trash2 } f
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useState } from "react";
 
+import { VerifiedFinish } from "@/components/actions/verified-finish";
 import { EventForm } from "@/components/calendar/event-form";
 import { PageHeader } from "@/components/layout/page-header";
 import { EmptyState } from "@/components/ui/empty-state";
@@ -21,6 +22,7 @@ import { ApiError, api } from "@/lib/api-client";
 import { latestUndoableEventAction } from "@/lib/calendar/undo";
 import { formatDateTime } from "@/lib/format";
 import { useUserSettings } from "@/lib/user-settings";
+import { createVerifiedFinishEvent, type VerifiedFinishEvent } from "@/lib/verified-finish";
 
 const CalendarView = dynamic(
   () => import("@/components/calendar/calendar-view").then((module) => module.CalendarView),
@@ -37,6 +39,7 @@ export default function CalendarPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [verifiedFinish, setVerifiedFinish] = useState<VerifiedFinishEvent | null>(null);
   const [editorOpen, setEditorOpen] = useState(false);
   const [editing, setEditing] = useState<CalendarEvent | null>(null);
   const [defaultStart, setDefaultStart] = useState<Date | null>(null);
@@ -68,6 +71,7 @@ export default function CalendarPage() {
     setConflicts([]);
     setEditorOpen(true);
     setNotice(null);
+    setVerifiedFinish(null);
   };
   const openEdit = (event: CalendarEvent) => {
     setEditing(event);
@@ -75,6 +79,7 @@ export default function CalendarPage() {
     setConflicts([]);
     setEditorOpen(true);
     setNotice(null);
+    setVerifiedFinish(null);
   };
 
   const save = async (
@@ -86,6 +91,8 @@ export default function CalendarPage() {
     }
     setBusy(true);
     setError(null);
+    setNotice(null);
+    setVerifiedFinish(null);
     setConflicts([]);
     try {
       const conflictResult = await api.events.checkConflict({
@@ -105,6 +112,7 @@ export default function CalendarPage() {
         : await api.events.create(data as CalendarEventCreate);
       if (!result.success) throw new ApiError(result.message, { status: 409, details: result });
       setNotice(result.message);
+      setVerifiedFinish(createVerifiedFinishEvent(result, "execute"));
       setEditorOpen(false);
       await load();
     } catch (reason) {
@@ -118,6 +126,8 @@ export default function CalendarPage() {
     if (!deleting || deleteText !== deleting.title) return;
     setBusy(true);
     setError(null);
+    setNotice(null);
+    setVerifiedFinish(null);
     try {
       const action = pendingDelete ?? (await api.events.remove(deleting.id));
       const isFirstConfirmation = action.status === "awaiting_confirmation";
@@ -153,6 +163,7 @@ export default function CalendarPage() {
       const result = await api.actions.execute(updated.id);
       if (!result.success) throw new ApiError(result.message, { status: 409, details: result });
       setNotice(result.message);
+      setVerifiedFinish(createVerifiedFinishEvent(result, "execute"));
       setDeleting(null);
       setDeleteText("");
       setPendingDelete(null);
@@ -167,6 +178,8 @@ export default function CalendarPage() {
   const undoLatest = async () => {
     setBusy(true);
     setError(null);
+    setNotice(null);
+    setVerifiedFinish(null);
     try {
       const logs = await api.actionLogs.list(50);
       const latest = latestUndoableEventAction(logs.items);
@@ -177,6 +190,7 @@ export default function CalendarPage() {
       const result = await api.actions.undo(latest.action_id);
       if (!result.success) throw new ApiError(result.message, { status: 409, details: result });
       setNotice(result.message);
+      setVerifiedFinish(createVerifiedFinishEvent(result, "undo"));
       await load();
     } catch (reason) {
       setError(reason instanceof ApiError ? reason.userMessage : "撤销失败，请重试。");
@@ -215,9 +229,16 @@ export default function CalendarPage() {
       {notice ? (
         <div
           role="status"
-          className="mb-5 flex items-center gap-2 rounded-2xl border border-teal-100 bg-teal-50 p-4 text-sm font-semibold text-teal-700"
+          className="mb-5 rounded-2xl border border-teal-100 bg-teal-50 p-4 text-sm font-semibold text-teal-700"
         >
-          <Check size={17} /> {notice}
+          <div className="flex items-center gap-2">
+            <Check size={17} aria-hidden="true" /> {notice}
+          </div>
+          {verifiedFinish ? (
+            <div className="mt-3">
+              <VerifiedFinish key={verifiedFinish.id} event={verifiedFinish} />
+            </div>
+          ) : null}
         </div>
       ) : null}
       {loading ? (

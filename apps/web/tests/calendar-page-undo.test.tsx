@@ -72,6 +72,7 @@ describe("CalendarPage undo entry", () => {
     await waitFor(() => expect(mocks.undo).toHaveBeenCalledWith("action-1"));
     expect(mocks.listEvents).toHaveBeenCalledTimes(2);
     expect(await screen.findByText("撤销已完成并通过数据库验证")).toBeInTheDocument();
+    expect(screen.getByText("已撤回并通过数据库验证。")).toBeInTheDocument();
   });
 
   it("requires two separate confirmation clicks before deleting an event", async () => {
@@ -146,6 +147,7 @@ describe("CalendarPage undo entry", () => {
     expect(
       await screen.findByText("第一次确认已完成。只有再次点击下方按钮后，系统才会执行删除。"),
     ).toBeInTheDocument();
+    expect(screen.queryByText("这一步稳稳落地了")).not.toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("重新输入完整标题进行第二次确认"), {
       target: { value: event.title },
@@ -155,5 +157,6 @@ describe("CalendarPage undo entry", () => {
     await waitFor(() => expect(mocks.confirm).toHaveBeenCalledTimes(2));
     expect(mocks.execute).toHaveBeenCalledWith("action-delete-event");
     expect(await screen.findByText("日程已删除并通过数据库验证")).toBeInTheDocument();
+    expect(screen.getByText("这一步稳稳落地了")).toBeInTheDocument();
   });
 });

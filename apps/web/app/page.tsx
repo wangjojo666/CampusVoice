@@ -6,6 +6,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { TodayPanel, type TodayResourceStatus } from "@/components/dashboard/today-panel";
+import { WeeklyRhythmPanel } from "@/components/dashboard/weekly-rhythm-panel";
 import { PageHeader } from "@/components/layout/page-header";
 import { CampusRadar } from "@/components/radar/campus-radar";
 import { EmptyState } from "@/components/ui/empty-state";
@@ -15,6 +16,7 @@ import { AsrRecorder } from "@/components/voice/asr-recorder";
 import { WorkflowSnapshot } from "@/components/voice/workflow-snapshot";
 import { ApiError, api } from "@/lib/api-client";
 import { buildTodaySummary } from "@/lib/dashboard/today";
+import { buildWeeklyRhythm } from "@/lib/dashboard/weekly-rhythm";
 import { formatDateTime, relativeTime } from "@/lib/format";
 import { useUserSettings } from "@/lib/user-settings";
 import { useAssistantStore } from "@/stores/assistant-store";
@@ -50,6 +52,8 @@ export default function HomePage() {
   const [taskStatus, setTaskStatus] = useState<TodayResourceStatus>("loading");
   const [eventStatus, setEventStatus] = useState<TodayResourceStatus>("loading");
   const [logStatus, setLogStatus] = useState<TodayResourceStatus>("loading");
+  const [taskComplete, setTaskComplete] = useState(false);
+  const [eventComplete, setEventComplete] = useState(false);
   const [clockMs, setClockMs] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [logsExpanded, setLogsExpanded] = useState(false);
@@ -63,15 +67,17 @@ export default function HomePage() {
     setTaskStatus((current) => (current === "error" ? "loading" : current));
     setEventStatus((current) => (current === "error" ? "loading" : current));
     setLogStatus((current) => (current === "error" ? "loading" : current));
+    const requestedAt = new Date().toISOString();
     const results = await Promise.allSettled([
-      api.tasks.list(),
-      api.events.list(),
+      api.tasks.list({ limit: 500 }),
+      api.events.list({ start: requestedAt, limit: 500 }),
       api.actionLogs.list(6),
     ]);
     const failed: string[] = [];
     const [taskResult, eventResult, logResult] = results;
     if (taskResult.status === "fulfilled") {
       setTasks(taskResult.value.items);
+      setTaskComplete(taskResult.value.items.length >= taskResult.value.total);
       setTaskStatus("ready");
     } else {
       setTaskStatus(failedResourceStatus);
@@ -81,6 +87,7 @@ export default function HomePage() {
     }
     if (eventResult.status === "fulfilled") {
       setEvents(eventResult.value.items);
+      setEventComplete(eventResult.value.items.length >= eventResult.value.total);
       setEventStatus("ready");
     } else {
       setEventStatus(failedResourceStatus);
@@ -115,6 +122,14 @@ export default function HomePage() {
   const summary = useMemo(
     () =>
       buildTodaySummary(tasks, events, {
+        now: new Date(clockMs ?? 0),
+        timezone: userSettings.timezone,
+      }),
+    [clockMs, events, tasks, userSettings.timezone],
+  );
+  const weeklyRhythm = useMemo(
+    () =>
+      buildWeeklyRhythm(tasks, events, {
         now: new Date(clockMs ?? 0),
         timezone: userSettings.timezone,
       }),
@@ -175,6 +190,14 @@ export default function HomePage() {
         eventsStatus={eventStatus}
         summary={summary}
         tasksStatus={taskStatus}
+        timezone={userSettings.timezone}
+      />
+
+      <WeeklyRhythmPanel
+        clockReady={clockMs !== null}
+        eventsResource={{ status: eventStatus, complete: eventComplete }}
+        rhythm={weeklyRhythm}
+        tasksResource={{ status: taskStatus, complete: taskComplete }}
         timezone={userSettings.timezone}
       />
 

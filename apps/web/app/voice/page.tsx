@@ -29,6 +29,7 @@ import { CorrectionDiff } from "@/components/voice/correction-diff";
 import { ApiError, api } from "@/lib/api-client";
 import { formatDateTime } from "@/lib/format";
 import { useUserSettings } from "@/lib/user-settings";
+import { createVerifiedFinishEvent, type VerifiedFinishEvent } from "@/lib/verified-finish";
 import { actionRequestFrom } from "@/lib/voice/action-request";
 import { useAssistantStore } from "@/stores/assistant-store";
 
@@ -80,10 +81,12 @@ export default function VoicePage() {
   const [originalTranscript, setOriginalTranscript] = useState("");
   const [asrConfidence, setAsrConfidence] = useState<number | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
+  const [verifiedFinish, setVerifiedFinish] = useState<VerifiedFinishEvent | null>(null);
   const busy = ["analyzing", "preparing", "confirming", "executing"].includes(store.workflowStatus);
 
   const execute = useCallback(
     async (action: PendingAction) => {
+      setVerifiedFinish(null);
       store.setWorkflowStatus("executing");
       try {
         const result = await api.actions.execute(action.id);
@@ -91,8 +94,10 @@ export default function VoicePage() {
         store.setLastExecutedActionId(result.success ? action.id : null);
         store.setPendingAction(result.success ? null : action);
         store.setWorkflowStatus(result.success ? "succeeded" : "error");
-        if (result.success) store.setSourceDocumentId(null);
-        else store.setError(result.message);
+        if (result.success) {
+          store.setSourceDocumentId(null);
+          setVerifiedFinish(createVerifiedFinishEvent(result, "execute"));
+        } else store.setError(result.message);
       } catch (reason) {
         store.setWorkflowStatus("error");
         store.setError(reason instanceof ApiError ? reason.userMessage : "执行失败，请重试。");
@@ -185,6 +190,7 @@ export default function VoicePage() {
   const analyze = useCallback(
     async (text = store.transcript) => {
       if (!text.trim()) return;
+      setVerifiedFinish(null);
       store.clearResult();
       setScheduleResults(null);
       store.setTranscript(text.trim());
@@ -286,6 +292,7 @@ export default function VoicePage() {
   const cancel = async () => {
     const action = store.pendingAction;
     if (!action) return;
+    setVerifiedFinish(null);
     store.setWorkflowStatus("confirming");
     try {
       await api.actions.cancel(action.id);
@@ -299,6 +306,7 @@ export default function VoicePage() {
   };
 
   const undo = async () => {
+    setVerifiedFinish(null);
     const actionId = store.lastExecutedActionId ?? store.pendingAction?.id;
     if (!actionId) {
       try {
@@ -312,7 +320,10 @@ export default function VoicePage() {
         }
         const result = await api.actions.undo(latest.action_id ?? latest.id);
         store.setExecution(result);
-        if (result.success) store.setLastExecutedActionId(null);
+        if (result.success) {
+          store.setLastExecutedActionId(null);
+          setVerifiedFinish(createVerifiedFinishEvent(result, "undo"));
+        }
       } catch (reason) {
         store.setError(reason instanceof ApiError ? reason.userMessage : "撤销失败，请重试。");
       }
@@ -320,7 +331,10 @@ export default function VoicePage() {
     }
     const result = await api.actions.undo(actionId);
     store.setExecution(result);
-    if (result.success) store.setLastExecutedActionId(null);
+    if (result.success) {
+      store.setLastExecutedActionId(null);
+      setVerifiedFinish(createVerifiedFinishEvent(result, "undo"));
+    }
   };
 
   const clarificationQuestion =
@@ -360,6 +374,7 @@ export default function VoicePage() {
                   setVoiceSessionId(null);
                   setTranscriptionId(null);
                   setOriginalTranscript("");
+                  setVerifiedFinish(null);
                 }}
                 className="btn-secondary"
               >
@@ -374,6 +389,7 @@ export default function VoicePage() {
         <div className="space-y-6">
           <AsrRecorder
             onTranscriptChange={(text, confidence) => {
+              setVerifiedFinish(null);
               store.setTranscript(text);
               store.setInputMode("voice");
               setAsrConfidence(confidence);
@@ -385,6 +401,7 @@ export default function VoicePage() {
               setOriginalTranscript("");
               setAsrConfidence(null);
               setConversationId(null);
+              setVerifiedFinish(null);
               store.reset();
             }}
           />
@@ -538,6 +555,7 @@ export default function VoicePage() {
           {store.execution ? (
             <ExecutionResult
               result={store.execution}
+              verifiedFinish={verifiedFinish}
               onRetry={
                 store.execution.retryable
                   ? () => store.pendingAction && void execute(store.pendingAction)

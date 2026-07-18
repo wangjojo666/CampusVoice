@@ -13,7 +13,9 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 
+import { VerifiedFinish } from "@/components/actions/verified-finish";
 import { formatDateTime } from "@/lib/format";
+import type { VerifiedFinishEvent } from "@/lib/verified-finish";
 
 const sideEffectLabels: Record<string, string> = {
   duplicate_task_created: "创建后检测到重复待办",
@@ -25,10 +27,12 @@ export function ExecutionResult({
   result,
   onRetry,
   onUndo,
+  verifiedFinish,
 }: Readonly<{
   result: VerificationResult;
   onRetry?: () => void;
   onUndo?: () => void;
+  verifiedFinish?: VerifiedFinishEvent | null;
 }>) {
   const record = result.record ?? null;
   const eventRecord = record && "start_at" in record ? record : null;
@@ -56,6 +60,11 @@ export function ExecutionResult({
       </div>
 
       <div className="p-5">
+        {result.success && verifiedFinish ? (
+          <div className="mb-4">
+            <VerifiedFinish key={verifiedFinish.id} event={verifiedFinish} />
+          </div>
+        ) : null}
         {result.success && record ? (
           <div className="mb-4 rounded-2xl border border-teal-100 bg-teal-50/45 p-4">
             <p className="text-base font-extrabold text-ink-900">{record.title}</p>

@@ -4,6 +4,7 @@ import type { PendingAction, Task, TaskCreate, TaskUpdate } from "@campusvoice/s
 import { Check, ChevronDown, Clock3, Edit3, Plus, RotateCcw, Search, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+import { VerifiedFinish } from "@/components/actions/verified-finish";
 import { PageHeader } from "@/components/layout/page-header";
 import { TaskForm } from "@/components/tasks/task-form";
 import { EmptyState } from "@/components/ui/empty-state";
@@ -14,6 +15,7 @@ import { ApiError, api } from "@/lib/api-client";
 import { latestUndoableTaskAction } from "@/lib/calendar/undo";
 import { formatDateTime } from "@/lib/format";
 import { useUserSettings } from "@/lib/user-settings";
+import { createVerifiedFinishEvent, type VerifiedFinishEvent } from "@/lib/verified-finish";
 
 const statusLabel = {
   pending: "待处理",
@@ -30,6 +32,7 @@ export default function TasksPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [verifiedFinish, setVerifiedFinish] = useState<VerifiedFinishEvent | null>(null);
   const [status, setStatus] = useState("active");
   const [course, setCourse] = useState("");
   const [query, setQuery] = useState("");
@@ -88,16 +91,20 @@ export default function TasksPage() {
     setEditing(null);
     setEditorOpen(true);
     setNotice(null);
+    setVerifiedFinish(null);
   };
   const openEdit = (task: Task) => {
     setEditing(task);
     setEditorOpen(true);
     setNotice(null);
+    setVerifiedFinish(null);
   };
 
   const save = async (data: TaskCreate | Omit<TaskUpdate, "expected_version">) => {
     setBusy(true);
     setError(null);
+    setNotice(null);
+    setVerifiedFinish(null);
     try {
       const result = editing
         ? await api.tasks.update(editing.id, {
@@ -107,6 +114,7 @@ export default function TasksPage() {
         : await api.tasks.create(data as TaskCreate);
       if (!result.success) throw new ApiError(result.message, { status: 409, details: result });
       setNotice(result.message);
+      setVerifiedFinish(createVerifiedFinishEvent(result, "execute"));
       setEditorOpen(false);
       await load();
     } catch (reason) {
@@ -119,6 +127,8 @@ export default function TasksPage() {
   const complete = async (task: Task) => {
     setBusy(true);
     setError(null);
+    setNotice(null);
+    setVerifiedFinish(null);
     try {
       const result = await api.tasks.update(task.id, {
         status: task.status === "completed" ? "pending" : "completed",
@@ -126,6 +136,7 @@ export default function TasksPage() {
       });
       if (!result.success) throw new ApiError(result.message, { status: 409, details: result });
       setNotice(result.message);
+      setVerifiedFinish(createVerifiedFinishEvent(result, "execute"));
       await load();
     } catch (reason) {
       setError(reason instanceof ApiError ? reason.userMessage : "状态更新失败。");
@@ -138,6 +149,8 @@ export default function TasksPage() {
     if (!deleting || deleteText !== deleting.title) return;
     setBusy(true);
     setError(null);
+    setNotice(null);
+    setVerifiedFinish(null);
     try {
       const action = pendingDelete ?? (await api.tasks.remove(deleting.id));
       const isFirstConfirmation = action.status === "awaiting_confirmation";
@@ -173,6 +186,7 @@ export default function TasksPage() {
       const result = await api.actions.execute(updated.id);
       if (!result.success) throw new ApiError(result.message, { status: 409, details: result });
       setNotice(result.message);
+      setVerifiedFinish(createVerifiedFinishEvent(result, "execute"));
       setDeleting(null);
       setDeleteText("");
       setPendingDelete(null);
@@ -187,6 +201,8 @@ export default function TasksPage() {
   const undoLatest = async () => {
     setBusy(true);
     setError(null);
+    setNotice(null);
+    setVerifiedFinish(null);
     try {
       const logs = await api.actionLogs.list(30);
       const target = latestUndoableTaskAction(logs.items);
@@ -197,6 +213,7 @@ export default function TasksPage() {
       const result = await api.actions.undo(target.action_id);
       if (!result.success) throw new ApiError(result.message, { status: 409, details: result });
       setNotice(result.message);
+      setVerifiedFinish(createVerifiedFinishEvent(result, "undo"));
       await load();
     } catch (reason) {
       setError(reason instanceof ApiError ? reason.userMessage : "撤销失败。");
@@ -235,9 +252,16 @@ export default function TasksPage() {
       {notice ? (
         <div
           role="status"
-          className="mb-5 flex items-center gap-2 rounded-2xl border border-teal-100 bg-teal-50 p-4 text-sm font-semibold text-teal-700"
+          className="mb-5 rounded-2xl border border-teal-100 bg-teal-50 p-4 text-sm font-semibold text-teal-700"
         >
-          <Check size={17} /> {notice}
+          <div className="flex items-center gap-2">
+            <Check size={17} aria-hidden="true" /> {notice}
+          </div>
+          {verifiedFinish ? (
+            <div className="mt-3">
+              <VerifiedFinish key={verifiedFinish.id} event={verifiedFinish} />
+            </div>
+          ) : null}
         </div>
       ) : null}
 
