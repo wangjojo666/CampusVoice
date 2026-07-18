@@ -5,7 +5,7 @@ import type {
   KnowledgeEvidence,
   Task,
 } from "@campusvoice/shared-types";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -35,12 +35,14 @@ vi.mock("next/link", () => ({
     href,
     children,
     className,
+    "aria-label": ariaLabel,
   }: {
     href: string;
     children: ReactNode;
     className?: string;
+    "aria-label"?: string;
   }) => (
-    <a href={href} className={className}>
+    <a href={href} className={className} aria-label={ariaLabel}>
       {children}
     </a>
   ),
@@ -170,6 +172,7 @@ const scholarshipEvidence: KnowledgeEvidence = {
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   setCurrentUserSettings(DEFAULT_USER_SETTINGS);
 });
 
@@ -189,25 +192,35 @@ beforeEach(() => {
 });
 
 describe("dashboard business states", () => {
-  it("places the voice-first entry before Campus Radar and fills examples into the shared workflow", async () => {
+  it("places Today before the student voice entry and fills a full prompt into the shared workflow", async () => {
     const user = userEvent.setup();
 
     render(<HomePage />);
 
-    expect(screen.getByRole("heading", { name: "说一句，校园安排自动落地" })).toBeInTheDocument();
-    const voiceEntry = screen.getByRole("region", { name: "直接说出任务、日程或校园问题" });
-    const campusRadar = screen.getByRole("region", { name: "与我有关的通知变化" });
+    expect(screen.getByRole("heading", { name: "今天先把最重要的事接住" })).toBeInTheDocument();
+    const today = screen.getByRole("region", { name: "今天" });
+    const voiceEntry = screen.getByRole("region", { name: "问声程" });
+    const campusRadar = screen.getByRole("region", { name: "与你有关的变化与截止" });
+    expect(within(today).getByText("正在加载下一安排")).toBeInTheDocument();
+    expect(within(today).queryByText("暂时没有排定日程")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "看看已有日程" })).toHaveAttribute(
+      "title",
+      "查询我的日程。",
+    );
+    expect(screen.getByRole("button", { name: "考试地点变了吗" })).toHaveAttribute(
+      "title",
+      "查询校园通知：人工智能考试地点有没有变化。",
+    );
+    expect(today.compareDocumentPosition(voiceEntry) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(
+      0,
+    );
     expect(
       voiceEntry.compareDocumentPosition(campusRadar) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).not.toBe(0);
 
-    await user.click(
-      screen.getByRole("button", {
-        name: "新建待办：后天下午三点提交人工智能作业，提前一天提醒我。",
-      }),
-    );
+    await user.click(screen.getByRole("button", { name: "盯住实验报告截止" }));
     expect(useAssistantStore.getState().transcript).toBe(
-      "新建待办：后天下午三点提交人工智能作业，提前一天提醒我。",
+      "新建待办：后天晚上八点提交实验报告，提前一天提醒我。",
     );
     expect(useAssistantStore.getState().inputMode).toBe("text_demo");
     expect(screen.getByText("文本指令演示，不是语音识别结果")).toBeInTheDocument();
@@ -246,14 +259,10 @@ describe("dashboard business states", () => {
     store.setLastExecutedActionId("action-old");
 
     render(<HomePage />);
-    await user.click(
-      screen.getByRole("button", {
-        name: "新建待办：后天下午三点提交人工智能作业，提前一天提醒我。",
-      }),
-    );
+    await user.click(screen.getByRole("button", { name: "盯住实验报告截止" }));
 
     expect(useAssistantStore.getState()).toMatchObject({
-      transcript: "新建待办：后天下午三点提交人工智能作业，提前一天提醒我。",
+      transcript: "新建待办：后天晚上八点提交实验报告，提前一天提醒我。",
       inputMode: "text_demo",
       correction: null,
       intent: null,
@@ -261,6 +270,62 @@ describe("dashboard business states", () => {
       lastExecutedActionId: null,
     });
     expect(screen.queryByText("旧记录已验证")).not.toBeInTheDocument();
+  });
+
+  it("summarizes the next schedule, near-term deadlines, overdue work, and unscheduled work", async () => {
+    mocks.listTasks.mockResolvedValue({
+      items: [
+        task({ id: "due-tomorrow", title: "提交实验报告", due_at: localTime(1, 18) }),
+        task({ id: "due-day-after", title: "准备答辩材料", due_at: localTime(2, 18) }),
+        task({
+          id: "overdue",
+          title: "补交课程小测",
+          due_at: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+        }),
+        task({ id: "unscheduled", title: "整理课堂笔记", due_at: null }),
+        task({
+          id: "completed",
+          title: "已经完成的任务",
+          due_at: localTime(1, 10),
+          status: "completed",
+        }),
+      ],
+      total: 5,
+    });
+    mocks.listEvents.mockResolvedValue({
+      items: [
+        event({
+          id: "ended",
+          title: "已经结束的课程",
+          start_at: localTime(-1, 9),
+          end_at: localTime(-1, 10),
+        }),
+        event({
+          id: "next",
+          title: "机器学习研讨课",
+          start_at: localTime(1, 9),
+          end_at: localTime(1, 10),
+          location: "教学楼 B205",
+        }),
+      ],
+      total: 2,
+    });
+
+    render(<HomePage />);
+
+    const today = await screen.findByRole("region", { name: "今天" });
+    await waitFor(() =>
+      expect(within(today).getByText("3 天内截止").previousElementSibling).toHaveTextContent("2"),
+    );
+    expect(within(today).getByText("需要补救").previousElementSibling).toHaveTextContent("1");
+    expect(within(today).getByText("7 天任务与日程").closest("a")).toBeNull();
+    expect(within(today).getByText(/1 项还没设置截止时间/)).toBeInTheDocument();
+    expect(within(today).getByRole("link", { name: /下一安排：机器学习研讨课/ })).toHaveAttribute(
+      "href",
+      "/calendar",
+    );
+    expect(within(today).queryByText("已经结束的课程")).not.toBeInTheDocument();
+    expect(within(today).queryByText("已经完成的任务")).not.toBeInTheDocument();
   });
 
   it("shows the verified Home record and binds undo to its executed action", async () => {
@@ -314,21 +379,30 @@ describe("dashboard business states", () => {
     expect(useAssistantStore.getState().lastExecutedActionId).toBeNull();
   });
 
-  it("shows upcoming seeded work, verified totals, and the voice continuation", async () => {
+  it("shows upcoming work, progressively discloses verification records, and continues voice", async () => {
     const user = userEvent.setup();
     mocks.listTasks.mockResolvedValue({
       items: [
-        task({ id: "task-today", due_at: localTime(0, 18) }),
+        task({ id: "task-today", due_at: localTime(1, 18) }),
         task({ id: "task-unscheduled", title: "整理课程笔记", due_at: null }),
         task({ id: "task-complete", title: "已完成报告", status: "completed" }),
-        task({ id: "task-future", title: "下周任务", due_at: localTime(1, 18) }),
+        task({ id: "task-future", title: "下周任务", due_at: localTime(2, 18) }),
       ],
       total: 4,
     });
     mocks.listEvents.mockResolvedValue({
       items: [
-        event({ id: "event-today" }),
-        event({ id: "event-future", title: "明天班会", start_at: localTime(1, 9) }),
+        event({
+          id: "event-today",
+          start_at: localTime(1, 9),
+          end_at: localTime(1, 10),
+        }),
+        event({
+          id: "event-future",
+          title: "明天班会",
+          start_at: localTime(2, 9),
+          end_at: localTime(2, 10),
+        }),
       ],
       total: 2,
     });
@@ -342,17 +416,23 @@ describe("dashboard business states", () => {
 
     render(<HomePage />);
 
-    expect(await screen.findByText("完成数据库作业")).toBeInTheDocument();
-    expect(screen.getByText("整理课程笔记")).toBeInTheDocument();
-    expect(screen.getByText("算法答疑")).toBeInTheDocument();
+    const today = await screen.findByRole("region", { name: "今天" });
+    const upNext = screen.getByRole("region", { name: "接下来" });
+    await waitFor(() => expect(within(today).getByText("完成数据库作业")).toBeInTheDocument());
+    expect(within(upNext).getByText("整理课程笔记")).toBeInTheDocument();
+    expect(within(today).getByText("算法答疑")).toBeInTheDocument();
     expect(screen.queryByText("已完成报告")).not.toBeInTheDocument();
-    expect(screen.getByText("下周任务")).toBeInTheDocument();
-    expect(screen.getByText("明天班会")).toBeInTheDocument();
-    expect(screen.getByText("待处理事项").previousElementSibling).toHaveTextContent("3");
-    expect(screen.getByText("日程记录").previousElementSibling).toHaveTextContent("2");
-    expect(screen.getByText("最近验证成功").previousElementSibling).toHaveTextContent("1");
+    expect(within(upNext).getByText("下周任务")).toBeInTheDocument();
+    expect(within(upNext).getByText("明天班会")).toBeInTheDocument();
+    const disclosure = screen.getByRole("button", { name: "查看执行详情" });
+    expect(disclosure).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("待办写入后已重新查询验证")).not.toBeInTheDocument();
+    expect(screen.queryByText("日程验证失败")).not.toBeInTheDocument();
+    await user.click(disclosure);
+    expect(disclosure).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("待办写入后已重新查询验证")).toBeInTheDocument();
     expect(screen.getByText("日程验证失败")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "查看确认与验证流程" })).toHaveClass("min-h-11");
 
     await user.click(screen.getByRole("button", { name: "模拟语音识别" }));
     expect(useAssistantStore.getState().transcript).toBe("明天完成数据库作业");
@@ -368,20 +448,95 @@ describe("dashboard business states", () => {
     mocks.listTasks
       .mockRejectedValueOnce(new ApiError("待办服务异常", { status: 503 }))
       .mockResolvedValueOnce({ items: [task({ id: "task-retry" })], total: 1 });
+    mocks.listActionLogs.mockRejectedValueOnce(new ApiError("操作记录服务异常", { status: 503 }));
 
     render(<HomePage />);
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("服务暂时不可用，请稍后重试。");
-    expect(screen.getByText("还没有近期安排")).toBeInTheDocument();
-    expect(screen.getByText("还没有操作记录")).toBeInTheDocument();
+    const today = screen.getByRole("region", { name: "今天" });
+    expect(within(today).getByText("3 天内截止").previousElementSibling).toHaveTextContent("—");
+    expect(within(today).getByText("待办数据暂不可用")).toBeInTheDocument();
+    expect(screen.queryByText("还没有近期安排")).not.toBeInTheDocument();
+    expect(screen.getByText("部分安排暂不可用")).toBeInTheDocument();
+    expect(screen.getByText("操作记录暂不可用")).toBeInTheDocument();
+    expect(screen.queryByText("还没有操作记录")).not.toBeInTheDocument();
 
     await user.click(within(alert).getByRole("button", { name: "重试" }));
     expect(await screen.findByText("完成数据库作业")).toBeInTheDocument();
     await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+    expect(screen.getByText("还没有操作记录")).toBeInTheDocument();
     expect(mocks.listTasks).toHaveBeenCalledTimes(2);
     expect(mocks.listEvents).toHaveBeenCalledTimes(2);
     expect(mocks.listActionLogs).toHaveBeenCalledTimes(2);
+  });
+
+  it("advances one shared clock across a local day, task deadline, and event end", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-17T15:59:30.000Z"));
+    mocks.listTasks.mockResolvedValue({
+      items: [task({ id: "clock-task", due_at: "2026-07-17T16:00:15.000Z" })],
+      total: 1,
+    });
+    mocks.listEvents.mockResolvedValue({
+      items: [
+        event({
+          id: "clock-event",
+          title: "跨日答疑",
+          start_at: "2026-07-17T15:58:30.000Z",
+          end_at: "2026-07-17T16:00:15.000Z",
+        }),
+      ],
+      total: 1,
+    });
+
+    render(<HomePage />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    const today = screen.getByRole("region", { name: "今天" });
+    expect(screen.getByText(/今天 · 7月17日/)).toBeInTheDocument();
+    expect(within(today).getByText("跨日答疑")).toBeInTheDocument();
+    expect(within(today).getByText("3 天内截止").previousElementSibling).toHaveTextContent("1");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+
+    expect(screen.getByText(/今天 · 7月18日/)).toBeInTheDocument();
+    expect(within(today).queryByText("跨日答疑")).not.toBeInTheDocument();
+    expect(within(today).getByText("暂时没有排定日程")).toBeInTheDocument();
+    expect(within(today).getByText("3 天内截止").previousElementSibling).toHaveTextContent("0");
+    expect(within(today).getByText("需要补救").previousElementSibling).toHaveTextContent("1");
+  });
+
+  it("marks retained task data as stale when a retry fails instead of presenting it as fresh", async () => {
+    const user = userEvent.setup();
+    mocks.listTasks
+      .mockResolvedValueOnce({
+        items: [task({ id: "task-stale", due_at: localTime(1, 18) })],
+        total: 1,
+      })
+      .mockRejectedValueOnce(new ApiError("待办刷新异常", { status: 503 }));
+    mocks.listEvents
+      .mockRejectedValueOnce(new ApiError("日程服务异常", { status: 503 }))
+      .mockResolvedValueOnce({ items: [], total: 0 });
+
+    render(<HomePage />);
+
+    const firstAlert = await screen.findByRole("alert");
+    const today = screen.getByRole("region", { name: "今天" });
+    await waitFor(() =>
+      expect(within(today).getByText("3 天内截止").previousElementSibling).toHaveTextContent("1"),
+    );
+    expect(within(today).getByRole("status")).toHaveTextContent("日程数据暂不可用");
+
+    await user.click(within(firstAlert).getByRole("button", { name: "重试" }));
+    expect(await within(today).findByText("待办为上次同步数据")).toBeInTheDocument();
+    expect(within(today).getByText("3 天内截止").previousElementSibling).toHaveTextContent("1");
+    expect(mocks.listTasks).toHaveBeenCalledTimes(2);
+    expect(mocks.listEvents).toHaveBeenCalledTimes(2);
   });
 });
 

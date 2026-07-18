@@ -22,14 +22,15 @@ import { OIDC_ENABLED } from "@/lib/auth";
 import { setCurrentUserSettings } from "@/lib/user-settings";
 
 const navigation = [
-  { href: "/", label: "首页", icon: Home },
-  { href: "/voice", label: "语音助手", icon: Mic2 },
-  { href: "/tasks", label: "待办", icon: ListTodo },
-  { href: "/calendar", label: "日历", icon: CalendarDays },
-  { href: "/notices", label: "校园通知", icon: FileText },
+  { href: "/", label: "今天", icon: Home },
+  { href: "/voice", label: "问声程", icon: Mic2 },
+  { href: "/tasks", label: "计划", icon: ListTodo },
+  { href: "/calendar", label: "日程", icon: CalendarDays },
+  { href: "/notices", label: "校园情报", icon: FileText },
 ] as const;
 
 function isActive(pathname: string, href: string) {
+  if (href === "/notices" && pathname.startsWith("/radar")) return true;
   return href === "/" ? pathname === "/" : pathname.startsWith(href);
 }
 
@@ -100,6 +101,12 @@ export function AppShell({
 
   return (
     <div className="min-h-screen lg:grid lg:grid-cols-[264px_minmax(0,1fr)]">
+      <a
+        href="#main-content"
+        className="sr-only fixed top-3 left-3 z-50 rounded-xl bg-ink-950 px-4 py-3 font-bold text-white focus:fixed focus:not-sr-only"
+      >
+        跳到主要内容
+      </a>
       <aside className="sticky top-0 hidden h-screen border-r border-mist-200/80 bg-white/72 px-5 py-6 backdrop-blur-xl lg:flex lg:flex-col">
         <Link href="/" className="mb-9 flex items-center gap-3 rounded-xl px-2 py-1">
           <span className="flex size-11 items-center justify-center rounded-2xl bg-teal-600 text-white shadow-[0_8px_24px_rgba(14,127,109,.2)]">
@@ -109,7 +116,7 @@ export function AppShell({
             <span className="block text-[1.12rem] font-extrabold tracking-tight text-ink-950">
               声程
             </span>
-            <span className="block text-[0.68rem] font-semibold tracking-[0.14em] text-ink-400 uppercase">
+            <span className="block text-[0.68rem] font-semibold tracking-[0.14em] text-ink-500 uppercase">
               CampusVoice
             </span>
           </span>
@@ -144,7 +151,7 @@ export function AppShell({
               <p className="truncate text-sm font-bold text-ink-800">
                 {oidcEnabled ? "校园账户" : "本地演示用户"}
               </p>
-              <p className="truncate text-xs text-ink-400">
+              <p className="truncate text-xs text-ink-500">
                 {oidcEnabled ? "校园统一身份" : "单用户 · 数据仅存本机"}
               </p>
             </div>
@@ -187,7 +194,11 @@ export function AppShell({
             ) : null}
           </div>
         </header>
-        <main className="mx-auto w-full max-w-[1480px] px-4 py-6 pb-28 sm:px-6 lg:px-9 lg:py-9 lg:pb-12">
+        <main
+          id="main-content"
+          tabIndex={-1}
+          className="mx-auto w-full max-w-[1480px] px-4 py-6 pb-28 outline-none sm:px-6 lg:px-9 lg:py-9 lg:pb-12"
+        >
           {authError ? (
             <div
               role="alert"
@@ -237,8 +248,8 @@ export function AppShell({
               key={href}
               href={href}
               aria-current={active ? "page" : undefined}
-              className={`flex min-w-0 flex-col items-center gap-1 rounded-xl px-1 py-2 text-[0.62rem] font-bold ${
-                active ? "bg-teal-50 text-teal-700" : "text-ink-400"
+              className={`flex min-h-11 min-w-0 flex-col items-center justify-center gap-1 rounded-xl px-1 py-2 text-[0.7rem] font-bold ${
+                active ? "bg-teal-50 text-teal-700" : "text-ink-600"
               }`}
             >
               <Icon size={18} />

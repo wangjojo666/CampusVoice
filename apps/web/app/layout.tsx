@@ -9,7 +9,7 @@ export const metadata: Metadata = {
     default: "声程 CampusVoice",
     template: "%s · 声程",
   },
-  description: "可验证的校园语音学习助手",
+  description: "把校园通知和一句话，变成有证据、先确认、可撤销的个人行动。",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
