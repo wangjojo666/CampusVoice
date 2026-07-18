@@ -615,7 +615,7 @@ describe("VoicePage ASR lineage", () => {
     useAssistantStore.getState().setSourceDocumentId("stale-document-1");
     render(<VoicePage />);
 
-    expect(screen.getByRole("heading", { name: "说出安排，确认后再执行" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "一句话，把校园安排接住" })).toBeInTheDocument();
     expect(screen.getByText("转写 → 理解 → 风险 → 确认 → 验证")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "提交语音转写" }));

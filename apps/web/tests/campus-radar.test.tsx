@@ -41,6 +41,10 @@ describe("CampusRadar", () => {
     });
     render(<CampusRadar />);
 
+    expect(screen.getByRole("region", { name: "与你有关的变化与截止" })).toBeInTheDocument();
+    expect(screen.getByText("校园情报")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "查看全部" })).toHaveAttribute("href", "/notices");
+    expect(screen.getByRole("link", { name: "查看全部" })).toHaveClass("min-h-11");
     expect(await screen.findByText("2026 人工智能专业考试安排")).toBeInTheDocument();
     expect(screen.getByText("需审核")).toBeInTheDocument();
     expect(screen.getByText(/v1 → v2/)).toBeInTheDocument();

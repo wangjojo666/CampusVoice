@@ -208,9 +208,9 @@ export default function TasksPage() {
   return (
     <div>
       <PageHeader
-        eyebrow="Task manager"
-        title="待办"
-        description="管理学习任务。每次修改都会以后端事务和提交后的数据库验证结果为准。"
+        eyebrow="我的计划"
+        title="计划"
+        description="把作业、复习和报名 DDL 放到一处。每次修改仍以后端事务和提交后的数据库验证结果为准。"
         actions={
           <>
             <button

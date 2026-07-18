@@ -45,19 +45,22 @@ export function CampusRadar() {
             <Radar size={21} aria-hidden="true" />
           </span>
           <div>
-            <p className="text-xs font-bold tracking-wider text-teal-600 uppercase">Campus Radar</p>
+            <p className="text-xs font-bold tracking-wider text-teal-600 uppercase">校园情报</p>
             <h2 id="campus-radar-title" className="text-xl font-extrabold text-ink-950">
-              与我有关的通知变化
+              与你有关的变化与截止
             </h2>
           </div>
         </div>
-        <Link href="/notices" className="text-sm font-bold text-teal-700">
-          通知库
+        <Link
+          href="/notices"
+          className="inline-flex min-h-11 items-center rounded-xl px-3 text-sm font-bold text-teal-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-700"
+        >
+          查看全部
         </Link>
       </div>
 
       <div className="p-4 sm:p-5" aria-live="polite">
-        {loading ? <p className="text-sm text-ink-400">正在检查通知版本与个人安排…</p> : null}
+        {loading ? <p className="text-sm text-ink-500">正在检查通知版本与个人安排…</p> : null}
         {error ? (
           <div role="status" className="flex flex-wrap items-center justify-between gap-3">
             <p className="text-sm text-coral-600">{error}</p>
@@ -121,7 +124,7 @@ export function CampusRadar() {
                     </div>
                     <p className="mt-1 text-sm leading-6 text-ink-600">{item.message}</p>
                     {cardType === "version_change" ? (
-                      <p className="mt-2 text-xs font-semibold text-ink-400">
+                      <p className="mt-2 text-xs font-semibold text-ink-600">
                         v{item.from_revision} → v{item.to_revision} · {item.change_count}{" "}
                         项结构化变化
                       </p>
@@ -137,7 +140,7 @@ export function CampusRadar() {
                       </p>
                     ) : null}
                     {item.applicability_reason ? (
-                      <p className="mt-1 text-xs text-ink-400">
+                      <p className="mt-1 text-xs text-ink-600">
                         适用说明：{item.applicability_reason}
                       </p>
                     ) : null}

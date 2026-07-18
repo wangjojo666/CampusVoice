@@ -11,7 +11,7 @@ function task(id: string, title: string, course = "机器学习") {
     title,
     description: `${title}的说明`,
     course,
-    due_at: nowIso,
+    due_at: laterIso,
     reminder_at: null,
     priority: "medium",
     status: "pending",
@@ -260,6 +260,9 @@ async function installApiMocks(page: Page, options: MockOptions = {}) {
         record: created,
       });
     }
+
+    if (path === "/api/notice-radar" && method === "GET")
+      return fulfill(route, { items: [], total: 0 });
 
     if (path === "/api/documents" && method === "GET") return fulfill(route, state.documents);
     if (path === "/api/documents" && method === "POST") {
@@ -628,13 +631,29 @@ async function installSyntheticAudioAndWebSocket(page: Page) {
   });
 }
 
-test("01 仪表盘展示 REST 返回的今日任务、日程和已验证操作", async ({ page }) => {
+test("01 今天面板展示真实任务与日程，并渐进披露已验证操作", async ({ page }) => {
   await installApiMocks(page);
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: "说一句，校园安排自动落地" })).toBeVisible();
-  await expect(page.getByText("复习机器学习", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "今天先把最重要的事接住" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "今天" })).toBeVisible();
+  await expect(page.getByText("复习机器学习", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("机器学习研讨课", { exact: true })).toBeVisible();
+  await expect(page.getByText("暂无需要处理的版本变化")).toBeVisible();
+  await expect(page.getByText("待办写入已验证", { exact: true })).toBeHidden();
+  await page.getByRole("button", { name: "查看执行详情" }).click();
   await expect(page.getByText("待办写入已验证", { exact: true })).toBeVisible();
+
+  const desktopNavigation = page.getByRole("navigation", { name: "主导航" });
+  await expect(desktopNavigation.getByRole("link", { name: "今天" })).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+  await expect(desktopNavigation.getByRole("link", { name: "问声程" })).toBeVisible();
+
+  await page.setViewportSize({ width: 375, height: 812 });
+  const mobileNavigation = page.getByRole("navigation", { name: "移动端主导航" });
+  await expect(mobileNavigation).toBeVisible();
+  await expect(mobileNavigation.getByRole("link", { name: "校园情报" })).toBeVisible();
 });
 
 test("02 待办列表在浏览器中完成关键词和状态筛选", async ({ page }) => {

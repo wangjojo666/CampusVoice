@@ -122,9 +122,9 @@ export default function NoticesPage() {
   return (
     <div>
       <PageHeader
-        eyebrow="Campus knowledge"
-        title="校园通知"
-        description="上传校园文件，基于检索证据搜索或问答。没有充分证据时，系统会明确说明无法确定。"
+        eyebrow="校园情报"
+        title="通知有变化，先看与你有关的部分"
+        description="从校园文件的原文证据中搜索、问答和核对版本；证据不充分时，系统会明确说明无法确定。"
         actions={
           <button type="button" onClick={() => setUploadOpen(true)} className="btn-primary">
             <Upload size={17} /> 上传文档

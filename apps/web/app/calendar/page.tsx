@@ -188,9 +188,9 @@ export default function CalendarPage() {
   return (
     <div>
       <PageHeader
-        eyebrow="Calendar"
-        title="日历"
-        description="按月或按周查看课程与学习安排。保存前检查时间冲突，写入后再次验证。"
+        eyebrow="我的日程"
+        title="日程"
+        description="按月或按周查看课程与校园安排。保存前检查时间冲突，写入后再次验证。"
         actions={
           <div className="flex flex-wrap gap-2">
             <button

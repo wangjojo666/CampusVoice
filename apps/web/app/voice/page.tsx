@@ -342,9 +342,9 @@ export default function VoicePage() {
   return (
     <div>
       <PageHeader
-        eyebrow="校园语音识别"
-        title="说出安排，确认后再执行"
-        description="实时识别校园术语并保留可编辑转写，再依次完成理解、风险检查、确认与数据库验证；涉及写入的数据不会只凭 AI 回答就宣告成功。"
+        eyebrow="问声程"
+        title="一句话，把校园安排接住"
+        description="说出 DDL、复习或日程，先核对转写和风险，再由你确认写入；系统会在数据库中复查结果，不会只凭 AI 回答就宣告成功。"
         actions={
           <div className="flex flex-wrap gap-2">
             <Link href="/settings" className="btn-secondary">
