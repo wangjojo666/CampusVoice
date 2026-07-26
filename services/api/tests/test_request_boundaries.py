@@ -99,6 +99,13 @@ def test_oidc_unsafe_requests_require_one_exact_allowlisted_origin(tmp_path: Pat
             client.post(
                 "/boundary-probe/json",
                 json={"value": 1},
+                headers={"Origin": f"{_ALLOWED_ORIGIN}:0"},
+            )
+        )
+        _assert_origin_rejected(
+            client.post(
+                "/boundary-probe/json",
+                json={"value": 1},
                 headers=[("Origin", _ALLOWED_ORIGIN), ("Origin", _ALLOWED_ORIGIN)],
             )
         )
