@@ -55,8 +55,12 @@ class SqlAlchemyAsrPersistence:
                 voice_session.status = VoiceSessionStatus.FAILED
                 voice_session.error_message = event.message or event.code
 
-    async def close(self, session_id: str) -> None:
+    async def close(self, session_id: str, completed: bool) -> None:
         async with self._session_factory() as session, session.begin():
             voice_session = await session.get(VoiceSession, session_id)
             if voice_session is not None and voice_session.status != VoiceSessionStatus.FAILED:
-                voice_session.status = VoiceSessionStatus.COMPLETED
+                if completed:
+                    voice_session.status = VoiceSessionStatus.COMPLETED
+                else:
+                    voice_session.status = VoiceSessionStatus.FAILED
+                    voice_session.error_message = "asr_session_interrupted"

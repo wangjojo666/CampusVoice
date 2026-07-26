@@ -35,7 +35,7 @@ async def test_asr_persistence_saves_timing_confidence_and_closes_session(client
         audio_duration_ms=1280.2,
     )
     await persistence.record_event(final_event)
-    await persistence.close(session_id)
+    await persistence.close(session_id, completed=True)
 
     async with factory() as session:
         voice_session = await session.get(VoiceSession, session_id)
@@ -53,3 +53,30 @@ async def test_asr_persistence_saves_timing_confidence_and_closes_session(client
     assert transcription.is_final is True
     assert transcription.confidence == 0.91
     assert transcription.latency_ms == 42
+
+
+async def test_asr_persistence_marks_abnormal_disconnect_as_failed(client: object) -> None:
+    app = client.app  # type: ignore[attr-defined]
+    factory: async_sessionmaker[AsyncSession] = app.state.session_factory
+    persistence = SqlAlchemyAsrPersistence(
+        factory,
+        user_id="user_demo",
+        model_name="test-model",
+    )
+    session_id = "voice-interrupted-test"
+    await persistence.record_event(
+        AsrServerEvent(
+            type="ready",
+            session_id=session_id,
+            sequence=0,
+            provider="test-only",
+        )
+    )
+    await persistence.close(session_id, completed=False)
+
+    async with factory() as session:
+        voice_session = await session.get(VoiceSession, session_id)
+
+    assert voice_session is not None
+    assert voice_session.status == VoiceSessionStatus.FAILED
+    assert voice_session.error_message == "asr_session_interrupted"

@@ -176,13 +176,15 @@ async def test_route_releases_connection_quota_when_session_cleanup_raises(
         def __init__(self, *args: object, **kwargs: object) -> None:
             del args, kwargs
             self.close_calls = 0
+            self.completion_states: list[bool] = []
 
         async def record_event(self, event: object) -> None:
             del event
 
-        async def close(self, session_id: str) -> None:
+        async def close(self, session_id: str, completed: bool) -> None:
             del session_id
             self.close_calls += 1
+            self.completion_states.append(completed)
             raise RuntimeError("persistence close failed")
 
     class DummySession:
@@ -256,6 +258,7 @@ async def test_route_releases_connection_quota_when_session_cleanup_raises(
     assert await registry.count("user-cleanup") == 0
     assert socket.adapter.close_calls == 1
     assert persistence.close_calls == 1
+    assert persistence.completion_states == [False]
     assert socket.sent[-1]["code"] == "session_cleanup_failed"
     assert socket.close_code == 1011
     errors = [

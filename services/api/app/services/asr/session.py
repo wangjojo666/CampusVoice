@@ -84,6 +84,7 @@ class _EventSender:
         self.session_id = session_id
         self.provider = provider
         self.sequence = 0
+        self.persistence_failed = False
         self.event_hook = event_hook
 
     async def send(
@@ -117,6 +118,7 @@ class _EventSender:
             except Exception:
                 # Recognition may continue, but the client must know the audit
                 # trail is unavailable. Disable the hook to avoid error floods.
+                self.persistence_failed = True
                 self.event_hook = None
                 persistence_error = AsrServerEvent(
                     type="error",
@@ -143,13 +145,30 @@ class _EventSender:
                 audio_duration_ms=result.audio_duration_ms,
             )
 
+    async def persist_transcripts(self, results: Sequence[TranscriptResult]) -> None:
+        if self.event_hook is None:
+            return
+        for result in results:
+            event = AsrServerEvent(
+                type="final" if result.is_final else "interim",
+                session_id=self.session_id,
+                sequence=self.sequence,
+                provider=self.provider,
+                text=result.text,
+                confidence=result.confidence,
+                latency_ms=result.latency_ms,
+                audio_duration_ms=result.audio_duration_ms,
+            )
+            await self.event_hook(event)
+            self.sequence += 1
+
 
 async def handle_asr_websocket(
     websocket: WebSocket,
     adapter_factory: Callable[[], AsrAdapter],
     *,
     event_hook: Callable[[AsrServerEvent], Awaitable[None]] | None = None,
-    close_hook: Callable[[str], Awaitable[None]] | None = None,
+    close_hook: Callable[[str, bool], Awaitable[None]] | None = None,
     additional_hotwords: Sequence[str] = (),
     accepted_subprotocol: str | None = None,
     max_frame_bytes: int = 131_072,
@@ -171,26 +190,29 @@ async def handle_asr_websocket(
     provider_vad_enabled = True
     vad_frame_bytes: int | None = None
     adapter_closed = False
+    adapter_finished = False
     persistence_closed = False
+    graceful_completion = False
+    client_disconnected = False
     opened_at = monotonic()
     audio_bytes_received = 0
 
-    async def close_resources() -> list[Exception]:
+    async def close_resources(*, completed: bool = False) -> list[BaseException]:
         """Attempt every cleanup exactly once, even when an earlier close fails."""
 
         nonlocal adapter_closed, persistence_closed
-        failures: list[Exception] = []
+        failures: list[BaseException] = []
         if adapter is not None and not adapter_closed:
             adapter_closed = True
             try:
                 await adapter.close()
-            except Exception as exc:
+            except BaseException as exc:
                 failures.append(exc)
         if close_hook is not None and not persistence_closed:
             persistence_closed = True
             try:
-                await close_hook(session_id)
-            except Exception as exc:
+                await close_hook(session_id, completed)
+            except BaseException as exc:
                 failures.append(exc)
         return failures
 
@@ -206,13 +228,13 @@ async def handle_asr_websocket(
         with suppress(Exception):
             await websocket.close(code=1011)
 
-    async def close_resources_or_raise() -> None:
-        failures = await close_resources()
+    async def close_resources_or_raise(*, completed: bool = False) -> None:
+        failures = await close_resources(completed=completed)
         if failures:
             await report_cleanup_failure()
             if len(failures) == 1:
                 raise failures[0]
-            raise ExceptionGroup("ASR session cleanup failed", failures)
+            raise BaseExceptionGroup("ASR session cleanup failed", failures)
 
     async def process_pcm_frame(pcm_frame: bytes) -> bool:
         """Process at most one 60 ms VAD frame; return True for a fatal provider error."""
@@ -287,6 +309,7 @@ async def handle_asr_websocket(
             speaking = False
         return fatal_error
 
+    primary_failure: BaseException | None = None
     try:
         try:
             adapter = adapter_factory()
@@ -338,6 +361,7 @@ async def handle_asr_websocket(
                 await websocket.close(code=1008)
                 return
             if message["type"] == "websocket.disconnect":
+                client_disconnected = True
                 break
             pcm = message.get("bytes")
             if pcm is not None:
@@ -490,9 +514,13 @@ async def handle_asr_websocket(
                     return
             elif isinstance(control, AsrStopMessage):
                 close_code = 1000
+                finish_succeeded = not started
                 if started:
+                    adapter_finished = True
                     try:
-                        await sender.transcripts(await adapter.finish())
+                        final_results = await adapter.finish()
+                        await sender.transcripts(final_results)
+                        finish_succeeded = True
                     except AsrProviderError as exc:
                         close_code = 1011
                         await sender.send(
@@ -511,13 +539,42 @@ async def handle_asr_websocket(
                     reset_provider_vad = getattr(adapter, "reset_vad", None)
                     if callable(reset_provider_vad):
                         await reset_provider_vad()
-                await close_resources_or_raise()
+                graceful_completion = finish_succeeded and not sender.persistence_failed
+                if sender.persistence_failed:
+                    close_code = 1011
+                await close_resources_or_raise(completed=graceful_completion)
                 await websocket.close(code=close_code)
                 return
     except WebSocketDisconnect:
-        pass
+        client_disconnected = True
+    except BaseException as exc:
+        primary_failure = exc
+        raise
     finally:
-        await close_resources_or_raise()
+        failures: list[BaseException] = []
+        if (
+            client_disconnected
+            and started
+            and adapter is not None
+            and sender is not None
+            and not adapter_finished
+        ):
+            adapter_finished = True
+            try:
+                await sender.persist_transcripts(await adapter.finish())
+            except BaseException as exc:
+                failures.append(exc)
+        failures.extend(await close_resources(completed=graceful_completion))
+        if failures:
+            await report_cleanup_failure()
+            if primary_failure is not None:
+                raise BaseExceptionGroup(
+                    "ASR session and cleanup failed",
+                    [primary_failure, *failures],
+                ) from None
+            if len(failures) == 1:
+                raise failures[0]
+            raise BaseExceptionGroup("ASR session cleanup failed", failures)
 
 
 def _merge_hotwords(*groups: Sequence[str], limit: int = 500) -> tuple[str, ...]:

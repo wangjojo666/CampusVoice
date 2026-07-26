@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from app.services.asr import AsrSessionConfig, TranscriptResult
+from app.services.asr import AsrProviderError, AsrSessionConfig, TranscriptResult
 from app.services.asr import adapters as asr_adapters
 from app.services.asr.adapters import FunAsrAdapter, _FunAsrModelHandle
 from app.services.asr.session import PcmEnergyVad, handle_asr_websocket
@@ -81,7 +81,14 @@ async def test_websocket_protocol_emits_interim_final_and_timing() -> None:
         ]
     )
 
-    await handle_asr_websocket(socket, lambda: adapter)  # type: ignore[arg-type]
+    completion_states: list[bool] = []
+
+    async def close_persistence(_session_id: str, completed: bool) -> None:
+        completion_states.append(completed)
+
+    await handle_asr_websocket(  # type: ignore[arg-type]
+        socket, lambda: adapter, close_hook=close_persistence
+    )
 
     assert socket.accepted
     assert socket.close_code == 1000
@@ -101,6 +108,94 @@ async def test_websocket_protocol_emits_interim_final_and_timing() -> None:
     assert interim["latency_ms"] == 15.5
     assert final["text"] == "机器学习"
     assert final["audio_duration_ms"] == 10.0
+    assert completion_states == [True]
+
+
+@pytest.mark.asyncio
+async def test_final_persistence_failure_does_not_mark_session_completed() -> None:
+    adapter = StubAsrAdapter()
+    socket = StubSocket(
+        [
+            {"type": "websocket.receive", "text": '{"type":"start"}'},
+            {"type": "websocket.receive", "text": '{"type":"stop"}'},
+        ]
+    )
+    completion_states: list[bool] = []
+
+    async def persist_event(event: Any) -> None:
+        if event.type == "final":
+            raise RuntimeError("final persistence failed")
+
+    async def close_persistence(_session_id: str, completed: bool) -> None:
+        completion_states.append(completed)
+
+    await handle_asr_websocket(  # type: ignore[arg-type]
+        socket,
+        lambda: adapter,
+        event_hook=persist_event,
+        close_hook=close_persistence,
+    )
+
+    assert completion_states == [False]
+    assert socket.close_code == 1011
+    assert [item["code"] for item in socket.sent if item["type"] == "error"] == [
+        "transcription_persistence_failed"
+    ]
+    assert socket.sent[-1]["type"] == "final"
+
+
+@pytest.mark.asyncio
+async def test_stop_before_start_is_persisted_as_completed() -> None:
+    adapter = StubAsrAdapter()
+    socket = StubSocket([{"type": "websocket.receive", "text": '{"type":"stop"}'}])
+    completion_states: list[bool] = []
+
+    async def close_persistence(_session_id: str, completed: bool) -> None:
+        completion_states.append(completed)
+
+    await handle_asr_websocket(  # type: ignore[arg-type]
+        socket,
+        lambda: adapter,
+        close_hook=close_persistence,
+    )
+
+    assert completion_states == [True]
+    assert socket.close_code == 1000
+    assert adapter.closed is True
+
+
+@pytest.mark.asyncio
+async def test_finish_failure_does_not_mark_session_completed() -> None:
+    failure = AsrProviderError(
+        "finish_failed",
+        "provider failed while finishing",
+        recoverable=True,
+    )
+
+    class FinishFailureAdapter(StubAsrAdapter):
+        async def finish(self) -> Sequence[TranscriptResult]:
+            raise failure
+
+    socket = StubSocket(
+        [
+            {"type": "websocket.receive", "text": '{"type":"start"}'},
+            {"type": "websocket.receive", "text": '{"type":"stop"}'},
+        ]
+    )
+    completion_states: list[bool] = []
+
+    async def close_persistence(_session_id: str, completed: bool) -> None:
+        completion_states.append(completed)
+
+    await handle_asr_websocket(  # type: ignore[arg-type]
+        socket,
+        FinishFailureAdapter,
+        close_hook=close_persistence,
+    )
+
+    assert completion_states == [False]
+    assert socket.close_code == 1011
+    assert socket.sent[-1]["code"] == "finish_failed"
 
 
 @pytest.mark.asyncio
@@ -249,7 +344,7 @@ async def test_adapter_and_persistence_cleanup_are_each_attempted_once_on_failur
     adapter = FailingCloseAdapter()
     persistence_close_calls = 0
 
-    async def close_persistence(_session_id: str) -> None:
+    async def close_persistence(_session_id: str, _completed: bool) -> None:
         nonlocal persistence_close_calls
         persistence_close_calls += 1
         raise RuntimeError("persistence close failed")
@@ -291,6 +386,140 @@ async def test_single_cleanup_failure_preserves_original_exception() -> None:
         )
 
     assert caught.value is failure
+    assert socket.sent[-1]["code"] == "session_cleanup_failed"
+    assert socket.close_code == 1011
+
+
+@pytest.mark.asyncio
+async def test_primary_failure_is_preserved_when_cleanup_also_fails() -> None:
+    finish_failure = RuntimeError("adapter finish failed")
+    close_failure = RuntimeError("adapter close failed")
+
+    class FinishAndCloseFailureAdapter(StubAsrAdapter):
+        async def finish(self) -> Sequence[TranscriptResult]:
+            raise finish_failure
+
+        async def close(self) -> None:
+            raise close_failure
+
+    socket = StubSocket(
+        [
+            {"type": "websocket.receive", "text": '{"type":"start"}'},
+            {"type": "websocket.receive", "text": '{"type":"stop"}'},
+        ]
+    )
+
+    with pytest.raises(ExceptionGroup, match="ASR session and cleanup failed") as caught:
+        await handle_asr_websocket(  # type: ignore[arg-type]
+            socket,
+            FinishAndCloseFailureAdapter,
+        )
+
+    assert caught.value.exceptions == (finish_failure, close_failure)
+    assert socket.sent[-1]["code"] == "session_cleanup_failed"
+    assert socket.close_code == 1011
+
+
+@pytest.mark.asyncio
+async def test_cancelled_adapter_cleanup_still_closes_persistence() -> None:
+    cancellation = asyncio.CancelledError("adapter close cancelled")
+
+    class CancelledCloseAdapter(StubAsrAdapter):
+        async def close(self) -> None:
+            raise cancellation
+
+    socket = StubSocket([{"type": "websocket.disconnect"}])
+    completion_states: list[bool] = []
+
+    async def close_persistence(_session_id: str, completed: bool) -> None:
+        completion_states.append(completed)
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await handle_asr_websocket(  # type: ignore[arg-type]
+            socket,
+            CancelledCloseAdapter,
+            close_hook=close_persistence,
+        )
+
+    assert caught.value is cancellation
+    assert completion_states == [False]
+    assert socket.close_code == 1011
+
+
+@pytest.mark.asyncio
+async def test_abnormal_disconnect_drains_tail_without_marking_session_completed() -> None:
+    adapter = StubAsrAdapter()
+    socket = StubSocket(
+        [
+            {"type": "websocket.receive", "text": '{"type":"start"}'},
+            {"type": "websocket.receive", "bytes": b"\xff\x7f" * 160},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+    persisted: list[Any] = []
+    close_calls: list[tuple[str, bool]] = []
+
+    async def record_event(event: Any) -> None:
+        persisted.append(event)
+
+    async def close_persistence(session_id: str, completed: bool) -> None:
+        close_calls.append((session_id, completed))
+
+    await handle_asr_websocket(  # type: ignore[arg-type]
+        socket,
+        lambda: adapter,
+        event_hook=record_event,
+        close_hook=close_persistence,
+    )
+
+    assert adapter.closed is True
+    assert [event.type for event in persisted] == ["ready", "speech_start", "interim", "final"]
+    assert persisted[-1].text
+    assert [item["type"] for item in socket.sent] == [
+        "ready",
+        "speech_start",
+        "interim",
+    ]
+    assert len(close_calls) == 1
+    assert close_calls[0][0] == persisted[0].session_id
+    assert close_calls[0][1] is False
+
+
+@pytest.mark.asyncio
+async def test_abnormal_disconnect_finish_failure_is_reported_and_not_completed() -> None:
+    failure = AsrProviderError(
+        "finish_failed",
+        "provider failed while draining the final transcript",
+        recoverable=False,
+    )
+
+    class FinishFailureAdapter(StubAsrAdapter):
+        async def finish(self) -> Sequence[TranscriptResult]:
+            raise failure
+
+    adapter = FinishFailureAdapter()
+    socket = StubSocket(
+        [
+            {"type": "websocket.receive", "text": '{"type":"start"}'},
+            {"type": "websocket.receive", "bytes": b"\xff\x7f" * 160},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+    completion_states: list[bool] = []
+
+    async def close_persistence(_session_id: str, completed: bool) -> None:
+        completion_states.append(completed)
+
+    with pytest.raises(AsrProviderError) as caught:
+        await handle_asr_websocket(  # type: ignore[arg-type]
+            socket,
+            lambda: adapter,
+            close_hook=close_persistence,
+        )
+
+    assert caught.value is failure
+    assert adapter.closed is True
+    assert completion_states == [False]
     assert socket.sent[-1]["code"] == "session_cleanup_failed"
     assert socket.close_code == 1011
 
