@@ -1,10 +1,21 @@
 import asyncio
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
+from sqlalchemy.dialects import postgresql
 
-from app.models.entities import ImpactMigrationPlan
+from app.models.entities import (
+    CalendarEvent,
+    Course,
+    ImpactMigrationItem,
+    ImpactMigrationPlan,
+    Task,
+    User,
+)
 from app.schemas.notice_radar import MigrationExecuteRequest, MigrationUndoRequest
 from app.services.errors import DomainError, NotFoundError
 from app.services.notices import NoticeRadarService
@@ -90,6 +101,49 @@ def _plan_record(client: TestClient, plan_id: str) -> dict[str, Any]:
             }
 
     return asyncio.run(read())
+
+
+def _set_legacy_course_reference(
+    client: TestClient,
+    *,
+    entity_type: str,
+    entity_id: str,
+) -> None:
+    factory = client.app.state.session_factory
+
+    async def write() -> None:
+        async with factory() as session, session.begin():
+            if await session.get(User, "legacy-course-owner") is None:
+                session.add(User(id="legacy-course-owner", display_name="Legacy Course Owner"))
+                await session.flush()
+                session.add(
+                    Course(
+                        id="legacy-foreign-course",
+                        user_id="legacy-course-owner",
+                        name="Foreign legacy course",
+                    )
+                )
+                await session.flush()
+            model = Task if entity_type == "task" else CalendarEvent
+            entity = await session.get(model, entity_id)
+            assert entity is not None
+            entity.course_id = "legacy-foreign-course"
+
+    asyncio.run(write())
+
+
+def _corrupt_plan_course_snapshot(client: TestClient, plan_id: str) -> None:
+    factory = client.app.state.session_factory
+
+    async def write() -> None:
+        async with factory() as session, session.begin():
+            item = await session.scalar(
+                select(ImpactMigrationItem).where(ImpactMigrationItem.plan_id == plan_id)
+            )
+            assert item is not None
+            item.before_snapshot = item.before_snapshot | {"course_id": ["malformed"]}
+
+    asyncio.run(write())
 
 
 def _create_de_scoped_chain(
@@ -761,3 +815,151 @@ def test_notice_plan_impacts_execution_and_receipts_are_user_isolated(
     record = _plan_record(client, plan["id"])
     assert record["status"] == "ready"
     assert record["execution_key"] is None
+
+
+def test_plan_build_rejects_legacy_foreign_course_reference(client: TestClient) -> None:
+    _v1, v2 = _create_demo_chain(client)
+    change_set = _change_set_for_document(client, v2["id"])
+    task_id = client.get("/api/tasks").json()["items"][0]["id"]
+    _set_legacy_course_reference(
+        client,
+        entity_type="task",
+        entity_id=task_id,
+    )
+
+    response = _challenged_write(
+        client,
+        "POST",
+        f"/api/notice-radar/changes/{change_set['id']}/migration-preview",
+        None,
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "migration_course_reference_invalid"
+
+
+def test_course_ownership_check_locks_rows_only_for_write_paths() -> None:
+    scalars = AsyncMock(return_value=["course-owned"])
+    session = SimpleNamespace(scalars=scalars)
+
+    asyncio.run(
+        NoticeRadarService._ensure_migration_course_references(
+            session,
+            "user_demo",
+            "task",
+            "task-owned",
+            "course-owned",
+            for_update=True,
+        )
+    )
+
+    statement = scalars.await_args.args[0]
+    sql = str(statement.compile(dialect=postgresql.dialect()))
+    assert "FOR UPDATE" in sql
+
+    scalars.reset_mock()
+    asyncio.run(
+        NoticeRadarService._ensure_migration_course_references(
+            session,
+            "user_demo",
+            "task",
+            "task-owned",
+            "course-owned",
+        )
+    )
+    statement = scalars.await_args.args[0]
+    sql = str(statement.compile(dialect=postgresql.dialect()))
+    assert "FOR UPDATE" not in sql
+
+
+def test_execute_rejects_malformed_course_reference_in_plan_snapshot(
+    client: TestClient,
+) -> None:
+    _v1, v2 = _create_demo_chain(client)
+    change_set = _change_set_for_document(client, v2["id"])
+    plan = _preview(client, change_set["id"])
+    _corrupt_plan_course_snapshot(client, plan["id"])
+
+    response = _challenged_write(
+        client,
+        "POST",
+        f"/api/notice-radar/migrations/{plan['id']}/execute",
+        _execute_body(plan, "malformed-course-snapshot"),
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "migration_course_reference_invalid"
+    assert _plan_record(client, plan["id"])["status"] == "ready"
+
+
+def test_verify_rejects_legacy_foreign_course_reference(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _v1, v2 = _create_demo_chain(client)
+    change_set = _change_set_for_document(client, v2["id"])
+    plan = _preview(client, change_set["id"])
+    service = NoticeRadarService(client.app.state.session_factory)
+    request = MigrationExecuteRequest(**_execute_body(plan, "course-verify-boundary"))
+    original_verify = service._verify
+
+    async def verifier_crash(_user_id: str, _plan_id: str, *, operation: str) -> Any:
+        raise RuntimeError(f"simulated crash before {operation} verification")
+
+    monkeypatch.setattr(service, "_verify", verifier_crash)
+    with pytest.raises(RuntimeError, match="execute verification"):
+        asyncio.run(_service_execute(service, client, plan["id"], request))
+    assert _plan_record(client, plan["id"])["status"] == "applied"
+
+    affected = plan["items"][0]
+    _set_legacy_course_reference(
+        client,
+        entity_type=affected["entity_type"],
+        entity_id=affected["entity_id"],
+    )
+    monkeypatch.setattr(service, "_verify", original_verify)
+
+    with pytest.raises(DomainError) as raised:
+        asyncio.run(service._verify("user_demo", plan["id"], operation="execute"))
+
+    assert raised.value.code == "migration_course_reference_invalid"
+    assert _plan_record(client, plan["id"])["status"] == "applied"
+
+
+def test_group_undo_rejects_legacy_foreign_course_reference(
+    client: TestClient,
+) -> None:
+    _v1, v2 = _create_demo_chain(client)
+    change_set = _change_set_for_document(client, v2["id"])
+    plan = _preview(client, change_set["id"])
+    execute_path = f"/api/notice-radar/migrations/{plan['id']}/execute"
+    executed = _challenged_write(
+        client,
+        "POST",
+        execute_path,
+        _execute_body(plan, "course-undo-execute"),
+    )
+    assert executed.status_code == 200, executed.text
+
+    affected = plan["items"][0]
+    _set_legacy_course_reference(
+        client,
+        entity_type=affected["entity_type"],
+        entity_id=affected["entity_id"],
+    )
+    current_plan = client.get(f"/api/notice-radar/migrations/{plan['id']}").json()
+
+    response = _challenged_write(
+        client,
+        "POST",
+        execute_path.replace("/execute", "/undo"),
+        {
+            "plan_version": current_plan["version"],
+            "idempotency_key": "course-undo-boundary",
+            "confirmation_stages": 2,
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "migration_course_reference_invalid"
+    assert _plan_record(client, plan["id"])["status"] == "verified"

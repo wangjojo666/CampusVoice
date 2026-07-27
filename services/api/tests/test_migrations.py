@@ -13,7 +13,7 @@ import sqlalchemy as sa
 
 API_ROOT = Path(__file__).resolve().parents[1]
 ALEMBIC_INI = API_ROOT / "alembic.ini"
-HEAD_REVISION = "0008_notice_current_and_receipt_repair"
+HEAD_REVISION = "0009_repair_legacy_course_ownership"
 
 V01_TABLES = {
     "action_logs",
@@ -1271,3 +1271,120 @@ def test_v07_backfills_safety_columns_and_enforces_generation_and_undo_keys(
             "SELECT recommended_action, requires_manual_review FROM impact_cases WHERE id = ?",
             ("impact-before-v07",),
         ).fetchone() == ("manual_review", 1)
+
+
+def test_v09_clears_only_invalid_course_ownership_and_downgrade_does_not_restore(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "v09-course-ownership.db"
+    _run_alembic(database_path, "upgrade", "0008_notice_current_and_receipt_repair")
+    timestamp = "2026-07-19T00:00:00"
+
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.executemany(
+            "INSERT INTO users (id, display_name, is_active, created_at, updated_at) "
+            "VALUES (?, ?, 1, ?, ?)",
+            [
+                ("course-owner", "Course Owner", timestamp, timestamp),
+                ("course-other", "Other Owner", timestamp, timestamp),
+            ],
+        )
+        connection.executemany(
+            "INSERT INTO courses "
+            "(id, user_id, name, is_active, created_at, updated_at) "
+            "VALUES (?, ?, ?, 1, ?, ?)",
+            [
+                ("course-owned", "course-owner", "Owned Course", timestamp, timestamp),
+                ("course-foreign", "course-other", "Foreign Course", timestamp, timestamp),
+            ],
+        )
+        connection.executemany(
+            "INSERT INTO tasks "
+            "(id, user_id, title, course_id, course, priority, status, source_type, "
+            "version, created_at, updated_at) "
+            "VALUES (?, 'course-owner', ?, ?, ?, 'medium', 'pending', 'manual', 1, ?, ?)",
+            [
+                ("task-owned", "Owned task", "course-owned", "Owned text", timestamp, timestamp),
+                (
+                    "task-foreign",
+                    "Foreign task",
+                    "course-foreign",
+                    "Foreign text",
+                    timestamp,
+                    timestamp,
+                ),
+                (
+                    "task-missing",
+                    "Missing task",
+                    "course-missing",
+                    "Missing text",
+                    timestamp,
+                    timestamp,
+                ),
+            ],
+        )
+        connection.executemany(
+            "INSERT INTO calendar_events "
+            "(id, user_id, title, course_id, course, start_at, end_at, reminder_minutes, "
+            "source_type, version, created_at, updated_at) "
+            "VALUES (?, 'course-owner', ?, ?, ?, ?, ?, 15, 'manual', 1, ?, ?)",
+            [
+                (
+                    "event-owned",
+                    "Owned event",
+                    "course-owned",
+                    "Owned text",
+                    "2026-07-20T09:00:00",
+                    "2026-07-20T10:00:00",
+                    timestamp,
+                    timestamp,
+                ),
+                (
+                    "event-foreign",
+                    "Foreign event",
+                    "course-foreign",
+                    "Foreign text",
+                    "2026-07-20T11:00:00",
+                    "2026-07-20T12:00:00",
+                    timestamp,
+                    timestamp,
+                ),
+                (
+                    "event-missing",
+                    "Missing event",
+                    "course-missing",
+                    "Missing text",
+                    "2026-07-20T13:00:00",
+                    "2026-07-20T14:00:00",
+                    timestamp,
+                    timestamp,
+                ),
+            ],
+        )
+        connection.commit()
+
+    _run_alembic(database_path, "upgrade", "head")
+    expected = [
+        ("foreign", None, "Foreign text"),
+        ("missing", None, "Missing text"),
+        ("owned", "course-owned", "Owned text"),
+    ]
+    with closing(sqlite3.connect(database_path)) as connection:
+        for table, prefix in (("tasks", "task"), ("calendar_events", "event")):
+            rows = connection.execute(
+                f"SELECT substr(id, instr(id, '-') + 1), course_id, course "
+                f"FROM {table} WHERE id LIKE ? ORDER BY id",
+                (f"{prefix}-%",),
+            ).fetchall()
+            assert rows == expected
+
+    _run_alembic(database_path, "downgrade", "0008_notice_current_and_receipt_repair")
+    assert _current_revision(database_path) == "0008_notice_current_and_receipt_repair"
+    with closing(sqlite3.connect(database_path)) as connection:
+        assert connection.execute(
+            "SELECT course_id FROM tasks WHERE id = 'task-foreign'"
+        ).fetchone() == (None,)
+        assert connection.execute(
+            "SELECT course_id FROM calendar_events WHERE id = 'event-missing'"
+        ).fetchone() == (None,)

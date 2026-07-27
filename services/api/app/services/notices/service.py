@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.db.types import utc_now
 from app.models.entities import (
     CalendarEvent,
+    Course,
     Document,
     DocumentChunk,
     ImpactCase,
@@ -591,6 +592,13 @@ class NoticeRadarService:
         conflicts: list[dict[str, Any]] = []
         for (entity_type, entity_id), impacts in grouped.items():
             entity = await self._owned_entity(session, user_id, entity_type, entity_id)
+            await self._ensure_migration_course_references(
+                session,
+                user_id,
+                entity_type,
+                entity_id,
+                entity.course_id,
+            )
             before = _snapshot(entity_type, entity)
             patch: dict[str, Any] = {}
             source_claim_ids: list[str] = []
@@ -638,6 +646,14 @@ class NoticeRadarService:
                 )
             source_claim_ids = sorted(set(source_claim_ids))
             after = _patched_snapshot(before, patch, source_claim_ids)
+            await self._ensure_migration_course_references(
+                session,
+                user_id,
+                entity_type,
+                entity_id,
+                before.get("course_id"),
+                after.get("course_id"),
+            )
             if entity_type == "event":
                 conflicts.extend(await self._event_conflicts(session, user_id, entity_id, after))
             prepared.append((entity_type, entity_id, before, patch, source_claim_ids))
@@ -815,6 +831,15 @@ class NoticeRadarService:
                     item.entity_id,
                     for_update=True,
                 )
+                await self._ensure_migration_course_references(
+                    session,
+                    user_id,
+                    item.entity_type,
+                    item.entity_id,
+                    entity.course_id,
+                    item.before_snapshot.get("course_id"),
+                    for_update=True,
+                )
                 actual_before = _snapshot(item.entity_type, entity)
                 if not _snapshots_match(item.before_snapshot, actual_before, ignore_version=False):
                     raise ConflictError(
@@ -824,6 +849,14 @@ class NoticeRadarService:
                     )
                 predicted = _patched_snapshot(
                     actual_before, item.proposed_patch, item.source_claim_ids
+                )
+                await self._ensure_migration_course_references(
+                    session,
+                    user_id,
+                    item.entity_type,
+                    item.entity_id,
+                    predicted.get("course_id"),
+                    for_update=True,
                 )
                 if item.entity_type == "event":
                     current_conflicts.extend(
@@ -942,6 +975,16 @@ class NoticeRadarService:
                     user_id,
                     item.entity_type,
                     item.entity_id,
+                    for_update=True,
+                )
+                await self._ensure_migration_course_references(
+                    session,
+                    user_id,
+                    item.entity_type,
+                    item.entity_id,
+                    entity.course_id,
+                    item.before_snapshot.get("course_id"),
+                    (item.after_snapshot or {}).get("course_id"),
                     for_update=True,
                 )
                 after_version = int((item.after_snapshot or {}).get("version", -1))
@@ -1541,8 +1584,16 @@ class NoticeRadarService:
                 entity = await self._owned_entity(
                     session, user_id, item.entity_type, item.entity_id
                 )
-                actual = _snapshot(item.entity_type, entity)
                 expected = item.after_snapshot if operation == "execute" else item.before_snapshot
+                await self._ensure_migration_course_references(
+                    session,
+                    user_id,
+                    item.entity_type,
+                    item.entity_id,
+                    entity.course_id,
+                    (expected or {}).get("course_id"),
+                )
+                actual = _snapshot(item.entity_type, entity)
                 verified = _snapshots_match(
                     expected or {}, actual, ignore_version=operation == "undo"
                 )
@@ -1848,6 +1899,41 @@ class NoticeRadarService:
         if row is None:
             raise NotFoundError("impact migration plan", plan_id)
         return row
+
+    @staticmethod
+    async def _ensure_migration_course_references(
+        session: AsyncSession,
+        user_id: str,
+        entity_type: str,
+        entity_id: str,
+        *course_ids: object,
+        for_update: bool = False,
+    ) -> None:
+        raw_references = [course_id for course_id in course_ids if course_id is not None]
+        if not raw_references:
+            return
+        if any(
+            not isinstance(course_id, str) or not course_id.strip() for course_id in raw_references
+        ):
+            raise ConflictError(
+                "migration_course_reference_invalid",
+                "An affected object contains an invalid course reference",
+                {"entity_type": entity_type, "entity_id": entity_id},
+            )
+        string_references = set(raw_references)
+        statement = select(Course.id).where(
+            Course.user_id == user_id,
+            Course.id.in_(string_references),
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        owned = set(await session.scalars(statement))
+        if owned != string_references:
+            raise ConflictError(
+                "migration_course_reference_invalid",
+                "An affected object references a course outside the migration owner boundary",
+                {"entity_type": entity_type, "entity_id": entity_id},
+            )
 
     async def _owned_entity(
         self,
