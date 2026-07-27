@@ -11,7 +11,17 @@ class FakeWorkletNode extends FakeAudioNode {
   static instance: FakeWorkletNode | null = null;
   readonly port = {
     onmessage: null as ((event: MessageEvent) => void) | null,
-    postMessage: vi.fn(),
+    postMessage: vi.fn((message: { type: string; requestId?: number }) => {
+      if (message.type !== "drain") return;
+      queueMicrotask(() => {
+        this.port.onmessage?.(
+          new MessageEvent("message", { data: { type: "audio", buffer: new ArrayBuffer(4) } }),
+        );
+        this.port.onmessage?.(
+          new MessageEvent("message", { data: { type: "drained", requestId: message.requestId } }),
+        );
+      });
+    }),
   };
 
   constructor(
@@ -33,8 +43,12 @@ class FakeAudioContext {
   readonly audioWorklet = { addModule: vi.fn().mockResolvedValue(undefined) };
   readonly createMediaStreamSource = vi.fn(() => this.source);
   readonly createGain = vi.fn(() => this.gain);
-  readonly resume = vi.fn().mockResolvedValue(undefined);
-  readonly suspend = vi.fn().mockResolvedValue(undefined);
+  readonly resume = vi.fn(async () => {
+    this.state = "running";
+  });
+  readonly suspend = vi.fn(async () => {
+    this.state = "suspended";
+  });
   readonly close = vi.fn(async () => {
     this.state = "closed";
   });
@@ -55,6 +69,7 @@ describe("PCM recorder lifecycle", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     if (originalMediaDevices) {
       Object.defineProperty(navigator, "mediaDevices", originalMediaDevices);
@@ -115,16 +130,80 @@ describe("PCM recorder lifecycle", () => {
 
     await recorder.pause();
     await recorder.resume();
-    expect(FakeAudioContext.instance?.suspend).toHaveBeenCalledOnce();
+    await recorder.pause();
+    expect(FakeAudioContext.instance?.suspend).toHaveBeenCalledTimes(2);
     expect(FakeAudioContext.instance?.resume).toHaveBeenCalledTimes(2);
 
     await Promise.all([recorder.stop(), recorder.stop()]);
 
-    expect(FakeWorkletNode.instance?.port.postMessage).toHaveBeenCalledWith({ type: "flush" });
+    expect(FakeWorkletNode.instance?.port.postMessage).toHaveBeenCalledOnce();
+    expect(FakeWorkletNode.instance?.port.postMessage).toHaveBeenCalledWith({
+      type: "drain",
+      requestId: 1,
+    });
+    expect(FakeAudioContext.instance?.resume).toHaveBeenCalledTimes(3);
+    expect((onChunk.mock.calls.at(-1)?.[0] as ArrayBuffer).byteLength).toBe(4);
+    expect(onChunk.mock.invocationCallOrder.at(-1)).toBeLessThan(
+      FakeWorkletNode.instance!.disconnect.mock.invocationCallOrder[0]!,
+    );
     expect(stopTrack).toHaveBeenCalledOnce();
     expect(FakeAudioContext.instance?.source.disconnect).toHaveBeenCalledOnce();
     expect(FakeWorkletNode.instance?.disconnect).toHaveBeenCalledOnce();
     expect(FakeAudioContext.instance?.gain.disconnect).toHaveBeenCalledOnce();
+    expect(FakeWorkletNode.instance?.port.onmessage).toBeNull();
+    expect(FakeAudioContext.instance?.close).toHaveBeenCalledOnce();
+  });
+
+  it("times out a missing drain acknowledgement and still releases every resource", async () => {
+    vi.useFakeTimers();
+    const stopTrack = vi.fn();
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: vi.fn().mockResolvedValue({ getTracks: () => [{ stop: stopTrack }] }),
+      },
+    });
+    const recorder = new PcmAudioRecorder();
+    await recorder.start({ onChunk: vi.fn(), onLevel: vi.fn() });
+    FakeWorkletNode.instance?.port.postMessage.mockImplementationOnce(() => undefined);
+
+    const stopped = expect(recorder.stop()).rejects.toThrow(
+      "AudioWorklet drain acknowledgement timed out",
+    );
+    await vi.advanceTimersByTimeAsync(2_000);
+    await stopped;
+
+    expect(stopTrack).toHaveBeenCalledOnce();
+    expect(FakeAudioContext.instance?.source.disconnect).toHaveBeenCalledOnce();
+    expect(FakeWorkletNode.instance?.disconnect).toHaveBeenCalledOnce();
+    expect(FakeAudioContext.instance?.gain.disconnect).toHaveBeenCalledOnce();
+    expect(FakeWorkletNode.instance?.port.onmessage).toBeNull();
+    expect(FakeAudioContext.instance?.close).toHaveBeenCalledOnce();
+    await expect(recorder.stop()).resolves.toBeUndefined();
+  });
+
+  it("releases resources when posting the drain request fails synchronously", async () => {
+    const stopTrack = vi.fn();
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: vi.fn().mockResolvedValue({ getTracks: () => [{ stop: stopTrack }] }),
+      },
+    });
+    const recorder = new PcmAudioRecorder();
+    await recorder.start({ onChunk: vi.fn(), onLevel: vi.fn() });
+    const failure = new DOMException("MessagePort is closed", "InvalidStateError");
+    FakeWorkletNode.instance?.port.postMessage.mockImplementationOnce(() => {
+      throw failure;
+    });
+
+    await expect(recorder.stop()).rejects.toBe(failure);
+
+    expect(stopTrack).toHaveBeenCalledOnce();
+    expect(FakeAudioContext.instance?.source.disconnect).toHaveBeenCalledOnce();
+    expect(FakeWorkletNode.instance?.disconnect).toHaveBeenCalledOnce();
+    expect(FakeAudioContext.instance?.gain.disconnect).toHaveBeenCalledOnce();
+    expect(FakeWorkletNode.instance?.port.onmessage).toBeNull();
     expect(FakeAudioContext.instance?.close).toHaveBeenCalledOnce();
   });
 

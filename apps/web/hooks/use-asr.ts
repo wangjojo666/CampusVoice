@@ -199,8 +199,11 @@ export function useAsr() {
     dispatch({ type: "STOP" });
     const recorder = recorderRef.current;
     recorderRef.current = null;
-    await recorder?.stop();
-    clientRef.current?.stop();
+    try {
+      await recorder?.stop();
+    } finally {
+      clientRef.current?.stop();
+    }
   }, [state.phase]);
 
   const reset = useCallback(async () => {

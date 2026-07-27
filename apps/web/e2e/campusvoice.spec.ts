@@ -484,11 +484,18 @@ async function installSyntheticAudioAndWebSocket(page: Page) {
       disconnect() {}
     }
 
-    type PortMessage = { data: { type: string; level?: number; buffer?: ArrayBuffer } };
+    type PortMessage = {
+      data: { type: string; level?: number; buffer?: ArrayBuffer; requestId?: number };
+    };
     const port = {
       onmessage: null as ((message: PortMessage) => void) | null,
-      postMessage: (message: { type?: string }) =>
-        telemetry.events.push(`worklet:${message.type ?? "message"}`),
+      postMessage: (message: { type?: string; requestId?: number }) => {
+        telemetry.events.push(`worklet:${message.type ?? "message"}`);
+        if (message.type === "drain")
+          queueMicrotask(() =>
+            port.onmessage?.({ data: { type: "drained", requestId: message.requestId } }),
+          );
+      },
     };
 
     class MockAudioWorkletNode extends ConnectableNode {

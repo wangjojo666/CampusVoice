@@ -381,6 +381,23 @@ describe("useAsr orchestration", () => {
     unmount();
   });
 
+  it("requests server stop even when draining the recorder fails", async () => {
+    const failure = new Error("recorder drain failed");
+    const { result, unmount } = renderHook(() => useAsr());
+
+    await act(async () => result.current.start());
+    expect(result.current.state.phase).toBe("recording");
+
+    mocks.recorderStop.mockRejectedValueOnce(failure);
+    await act(async () => {
+      await expect(result.current.stop()).rejects.toBe(failure);
+    });
+
+    expect(mocks.clientStop).toHaveBeenCalledOnce();
+    expect(result.current.state.phase).toBe("finalizing");
+    unmount();
+  });
+
   it("keeps only the latest start when two attempts race during cleanup", async () => {
     const { result, unmount } = renderHook(() => useAsr());
 
