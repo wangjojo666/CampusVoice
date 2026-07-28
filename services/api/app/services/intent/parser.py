@@ -692,7 +692,9 @@ class IntentParser:
         normalized = _without_reminder_phrases(re.sub(r"\s+", "", cleaned))
         signals = _intent_signals(normalized)
         deterministic_safety_conflict = (
-            _explicitly_negates_mutation(normalized) or signals.query_mutation_conflict
+            _explicitly_negates_mutation(normalized)
+            or signals.conflicting
+            or signals.query_mutation_conflict
         )
         if self._llm is None or deterministic_safety_conflict:
             fallback = _enrich_deterministically(

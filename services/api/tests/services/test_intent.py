@@ -160,6 +160,37 @@ async def test_conflicting_targets_or_mutations_fail_closed(
 @pytest.mark.parametrize(
     "text",
     [
+        "创建日程和待办：准备考试",
+        "创建日程，添加待办: 准备考试",
+        "删除任务A并创建待办B",
+    ],
+)
+@pytest.mark.parametrize("context", [(), ("创建日程：项目答辩",)])
+async def test_conflicting_targets_or_mutations_bypass_llm(
+    text: str,
+    context: tuple[str, ...],
+) -> None:
+    llm = RecordingMutationLlm()
+
+    result = await IntentParser(llm).parse(
+        text,
+        context=context,
+        now=datetime(2026, 7, 28, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert llm.extract_calls == 0
+    assert llm.repair_calls == 0
+    assert result.intent == IntentName.UNKNOWN
+    assert result.slots.model_dump(exclude_none=True) == {}
+    assert result.missing_fields == []
+    assert result.ambiguities == []
+    assert result.requires_confirmation is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
         "不要创建待办：整理资料",
         "不用更新任务: 论文草稿",
         "请别再删除任务：旧作业",
