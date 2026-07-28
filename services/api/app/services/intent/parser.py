@@ -324,6 +324,7 @@ class _IntentSignals(NamedTuple):
     create: bool
     update: bool
     delete: bool
+    query: bool
     explicit_event: bool
     explicit_task: bool
 
@@ -332,6 +333,10 @@ class _IntentSignals(NamedTuple):
         return sum((self.create, self.update, self.delete)) > 1 or (
             self.explicit_event and self.explicit_task
         )
+
+    @property
+    def query_mutation_conflict(self) -> bool:
+        return self.query and any((self.create, self.update, self.delete))
 
 
 _CREATE_SIGNALS = ("创建", "新建", "添加", "加到", "加入", "安排", "记一个")
@@ -350,6 +355,17 @@ _UPDATE_SIGNALS = (
     "完成",
 )
 _DELETE_SIGNALS = ("删除", "删掉", "移除", "取消")
+_QUERY_SIGNALS = (
+    "查询",
+    "查看",
+    "搜索",
+    "查找",
+    "查一下",
+    "找一下",
+    "什么时候",
+    "有哪些",
+    "有什么",
+)
 _MUTATION_SIGNAL_PATTERN = "|".join(
     re.escape(signal)
     for signal in sorted(
@@ -385,9 +401,10 @@ def _explicitly_negates_mutation(normalized: str) -> bool:
 def _intent_signals(normalized: str) -> _IntentSignals:
     target_scope = _explicit_target_scope(normalized)
     return _IntentSignals(
-        create=any(word in normalized for word in _CREATE_SIGNALS),
-        update=any(word in normalized for word in _UPDATE_SIGNALS),
-        delete=any(word in normalized for word in _DELETE_SIGNALS),
+        create=any(word in target_scope for word in _CREATE_SIGNALS),
+        update=any(word in target_scope for word in _UPDATE_SIGNALS),
+        delete=any(word in target_scope for word in _DELETE_SIGNALS),
+        query=any(word in target_scope for word in _QUERY_SIGNALS),
         explicit_event=any(word in target_scope for word in ("日历", "日程", "事件")),
         explicit_task=any(word in target_scope for word in ("待办", "任务")),
     )
@@ -403,22 +420,11 @@ def _classify_intent(text: str) -> IntentName:
     task_signal = any(word in normalized for word in ("待办", "任务", "作业", "复习"))
 
     notice_signal = any(word in normalized for word in ("通知", "公告", "报名", "奖学金", "教务"))
-    query_signal = any(
-        word in normalized
-        for word in (
-            "查询",
-            "查看",
-            "搜索",
-            "查找",
-            "查一下",
-            "找一下",
-            "什么时候",
-            "有哪些",
-            "有什么",
-        )
-    )
-
-    if _explicitly_negates_mutation(normalized) or signals.conflicting:
+    if (
+        _explicitly_negates_mutation(normalized)
+        or signals.conflicting
+        or signals.query_mutation_conflict
+    ):
         return IntentName.UNKNOWN
 
     # An explicitly named target type must outrank words in the title. For
@@ -444,9 +450,11 @@ def _classify_intent(text: str) -> IntentName:
         return IntentName.UPDATE_EVENT
     if signals.update and task_signal:
         return IntentName.UPDATE_TASK
-    if notice_signal and (query_signal or not (signals.create or signals.update or signals.delete)):
+    if notice_signal and (
+        signals.query or not (signals.create or signals.update or signals.delete)
+    ):
         return IntentName.SEARCH_NOTICE
-    if event_signal and query_signal:
+    if event_signal and signals.query:
         return IntentName.QUERY_SCHEDULE
     return IntentName.UNKNOWN
 
@@ -569,7 +577,12 @@ def _fallback_parse(text: str, now: datetime, context: Sequence[str] = ()) -> In
     if current.intent != IntentName.UNKNOWN:
         return current
     normalized = _without_reminder_phrases(re.sub(r"\s+", "", text))
-    if _explicitly_negates_mutation(normalized) or _intent_signals(normalized).conflicting:
+    signals = _intent_signals(normalized)
+    if (
+        _explicitly_negates_mutation(normalized)
+        or signals.conflicting
+        or signals.query_mutation_conflict
+    ):
         return current
     return _continue_from_context(text, context, now) or current
 
@@ -676,10 +689,12 @@ class IntentParser:
             current = now.replace(tzinfo=timezone)
         else:
             current = now.astimezone(timezone)
-        explicitly_negated_mutation = _explicitly_negates_mutation(
-            _without_reminder_phrases(re.sub(r"\s+", "", cleaned))
+        normalized = _without_reminder_phrases(re.sub(r"\s+", "", cleaned))
+        signals = _intent_signals(normalized)
+        deterministic_safety_conflict = (
+            _explicitly_negates_mutation(normalized) or signals.query_mutation_conflict
         )
-        if self._llm is None or explicitly_negated_mutation:
+        if self._llm is None or deterministic_safety_conflict:
             fallback = _enrich_deterministically(
                 _fallback_parse(cleaned, current, context), cleaned, current
             )

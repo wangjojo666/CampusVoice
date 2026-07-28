@@ -231,6 +231,101 @@ async def test_title_negation_does_not_block_positive_mutation(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "text",
+    [
+        "查看已完成日程",
+        "查询已完成任务",
+        "查看标记为完成的待办",
+        "查看删除的事件",
+        "搜索调整后的日程",
+        "查一下取消的任务",
+    ],
+)
+@pytest.mark.parametrize("context", [(), ("创建日程：项目答辩",)])
+async def test_query_mutation_conflicts_fail_closed(
+    text: str,
+    context: tuple[str, ...],
+) -> None:
+    result = await IntentParser().parse(
+        text,
+        context=context,
+        now=datetime(2026, 7, 28, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert result.intent == IntentName.UNKNOWN
+    assert result.slots.model_dump(exclude_none=True) == {}
+    assert result.missing_fields == []
+    assert result.ambiguities == []
+    assert result.requires_confirmation is False
+
+
+@pytest.mark.asyncio
+async def test_query_mutation_conflict_bypasses_llm() -> None:
+    llm = RecordingMutationLlm()
+
+    result = await IntentParser(llm).parse(
+        "查看已完成日程",
+        context=["创建日程：项目答辩"],
+        now=datetime(2026, 7, 28, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert llm.extract_calls == 0
+    assert llm.repair_calls == 0
+    assert result.intent == IntentName.UNKNOWN
+    assert result.slots.model_dump(exclude_none=True) == {}
+    assert result.missing_fields == []
+    assert result.requires_confirmation is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "expected_intent", "expected_title"),
+    [
+        ("创建待办：查看已完成日程", IntentName.CREATE_TASK, "查看已完成日程"),
+        ("创建日程：查询已完成任务", IntentName.CREATE_EVENT, "查询已完成任务"),
+    ],
+)
+async def test_title_query_mutation_words_do_not_pollute_positive_mutation(
+    text: str,
+    expected_intent: IntentName,
+    expected_title: str,
+) -> None:
+    result = await IntentParser().parse(
+        text,
+        now=datetime(2026, 7, 28, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert result.intent == expected_intent
+    assert result.slots.title == expected_title
+    assert result.requires_confirmation is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "expected_intent", "expected_title"),
+    [
+        ("查看明天的日程", IntentName.QUERY_SCHEDULE, None),
+        ("完成任务：机器学习作业", IntentName.UPDATE_TASK, "机器学习作业"),
+        ("删除事件：项目答辩", IntentName.DELETE_EVENT, "项目答辩"),
+    ],
+)
+async def test_non_conflicting_query_and_mutations_remain_supported(
+    text: str,
+    expected_intent: IntentName,
+    expected_title: str | None,
+) -> None:
+    result = await IntentParser().parse(
+        text,
+        now=datetime(2026, 7, 28, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert result.intent == expected_intent
+    assert result.slots.title == expected_title
+    assert result.requires_confirmation is (expected_intent != IntentName.QUERY_SCHEDULE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("reminder_text", "expected_minutes"),
     [
         ("提前半小时提醒我", 30),
