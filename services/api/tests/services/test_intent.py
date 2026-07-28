@@ -23,6 +23,30 @@ class InvalidThenValidLlm:
         return self.repaired
 
 
+class RecordingMutationLlm:
+    def __init__(self) -> None:
+        self.extract_calls = 0
+        self.repair_calls = 0
+
+    async def extract(self, text: str, context: Sequence[str]) -> str:
+        del text, context
+        self.extract_calls += 1
+        return """{
+          "intent":"delete_task",
+          "confidence":0.99,
+          "slots":{"title":"论文草稿"},
+          "missing_fields":[],
+          "ambiguities":[],
+          "source_text":"不要删除任务：论文草稿",
+          "requires_confirmation":true
+        }"""
+
+    async def repair(self, text: str, invalid_output: str, validation_error: str) -> str:
+        del text, invalid_output, validation_error
+        self.repair_calls += 1
+        return "{}"
+
+
 @pytest.mark.asyncio
 async def test_fallback_parses_create_event_and_computes_required_fields() -> None:
     parser = IntentParser()
@@ -130,6 +154,79 @@ async def test_conflicting_targets_or_mutations_fail_closed(
     assert result.slots.model_dump(exclude_none=True) == {}
     assert result.missing_fields == []
     assert result.requires_confirmation is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        "不要创建待办：整理资料",
+        "不用更新任务: 论文草稿",
+        "请别再删除任务：旧作业",
+        "无需创建日程：班会",
+        "不必更新事件：项目复盘",
+        "不要删除日历事件：答辩",
+        "不要标记任务完成",
+        "不需要删除任务：旧材料",
+    ],
+)
+@pytest.mark.parametrize("context", [(), ("创建日程：项目答辩",)])
+async def test_explicitly_negated_mutations_fail_closed(
+    text: str,
+    context: tuple[str, ...],
+) -> None:
+    result = await IntentParser().parse(
+        text,
+        context=context,
+        now=datetime(2026, 7, 28, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert result.intent == IntentName.UNKNOWN
+    assert result.slots.model_dump(exclude_none=True) == {}
+    assert result.missing_fields == []
+    assert result.ambiguities == []
+    assert result.requires_confirmation is False
+
+
+@pytest.mark.asyncio
+async def test_explicitly_negated_mutation_bypasses_llm() -> None:
+    llm = RecordingMutationLlm()
+
+    result = await IntentParser(llm).parse(
+        "不要删除任务：论文草稿",
+        context=["创建日程：项目答辩"],
+        now=datetime(2026, 7, 28, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert llm.extract_calls == 0
+    assert llm.repair_calls == 0
+    assert result.intent == IntentName.UNKNOWN
+    assert result.slots.model_dump(exclude_none=True) == {}
+    assert result.missing_fields == []
+    assert result.requires_confirmation is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "expected_intent", "expected_title"),
+    [
+        ("创建待办：不要忘记交作业", IntentName.CREATE_TASK, "不要忘记交作业"),
+        ("创建日程：别迟到", IntentName.CREATE_EVENT, "别迟到"),
+    ],
+)
+async def test_title_negation_does_not_block_positive_mutation(
+    text: str,
+    expected_intent: IntentName,
+    expected_title: str,
+) -> None:
+    result = await IntentParser().parse(
+        text,
+        now=datetime(2026, 7, 28, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert result.intent == expected_intent
+    assert result.slots.title == expected_title
+    assert result.requires_confirmation is True
 
 
 @pytest.mark.asyncio

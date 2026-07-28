@@ -334,6 +334,40 @@ class _IntentSignals(NamedTuple):
         )
 
 
+_CREATE_SIGNALS = ("创建", "新建", "添加", "加到", "加入", "安排", "记一个")
+_UPDATE_SIGNALS = (
+    "修改",
+    "更新",
+    "改为",
+    "改成",
+    "改到",
+    "调整",
+    "推迟",
+    "提前",
+    "改名",
+    "重命名",
+    "标记",
+    "完成",
+)
+_DELETE_SIGNALS = ("删除", "删掉", "移除", "取消")
+_MUTATION_SIGNAL_PATTERN = "|".join(
+    re.escape(signal)
+    for signal in sorted(
+        {*_CREATE_SIGNALS, *_UPDATE_SIGNALS, *_DELETE_SIGNALS},
+        key=len,
+        reverse=True,
+    )
+)
+_EXPLICITLY_NEGATED_MUTATION_PATTERN = re.compile(
+    rf"(?:不要|别|不用|无需|不必|不需要)"
+    rf"(?:再)?"
+    rf"(?:(?:请|帮我|替我|给我)(?:再)?)?"
+    rf"(?:把)?"
+    rf"(?:(?:这个|那个|上次的|之前的)?(?:待办|任务|日历事件|日程|事件))?"
+    rf"(?:{_MUTATION_SIGNAL_PATTERN})"
+)
+
+
 def _explicit_target_scope(normalized: str) -> str:
     colon_positions = [
         position for delimiter in ("：", ":") if (position := normalized.find(delimiter)) >= 0
@@ -343,31 +377,17 @@ def _explicit_target_scope(normalized: str) -> str:
     return re.split(r"[，,。.!！?？]", normalized, maxsplit=1)[0]
 
 
+def _explicitly_negates_mutation(normalized: str) -> bool:
+    target_scope = _explicit_target_scope(normalized)
+    return _EXPLICITLY_NEGATED_MUTATION_PATTERN.search(target_scope) is not None
+
+
 def _intent_signals(normalized: str) -> _IntentSignals:
     target_scope = _explicit_target_scope(normalized)
     return _IntentSignals(
-        create=any(
-            word in normalized
-            for word in ("创建", "新建", "添加", "加到", "加入", "安排", "记一个")
-        ),
-        update=any(
-            word in normalized
-            for word in (
-                "修改",
-                "更新",
-                "改为",
-                "改成",
-                "改到",
-                "调整",
-                "推迟",
-                "提前",
-                "改名",
-                "重命名",
-                "标记",
-                "完成",
-            )
-        ),
-        delete=any(word in normalized for word in ("删除", "删掉", "移除", "取消")),
+        create=any(word in normalized for word in _CREATE_SIGNALS),
+        update=any(word in normalized for word in _UPDATE_SIGNALS),
+        delete=any(word in normalized for word in _DELETE_SIGNALS),
         explicit_event=any(word in target_scope for word in ("日历", "日程", "事件")),
         explicit_task=any(word in target_scope for word in ("待办", "任务")),
     )
@@ -398,7 +418,7 @@ def _classify_intent(text: str) -> IntentName:
         )
     )
 
-    if signals.conflicting:
+    if _explicitly_negates_mutation(normalized) or signals.conflicting:
         return IntentName.UNKNOWN
 
     # An explicitly named target type must outrank words in the title. For
@@ -549,7 +569,7 @@ def _fallback_parse(text: str, now: datetime, context: Sequence[str] = ()) -> In
     if current.intent != IntentName.UNKNOWN:
         return current
     normalized = _without_reminder_phrases(re.sub(r"\s+", "", text))
-    if _intent_signals(normalized).conflicting:
+    if _explicitly_negates_mutation(normalized) or _intent_signals(normalized).conflicting:
         return current
     return _continue_from_context(text, context, now) or current
 
@@ -656,7 +676,10 @@ class IntentParser:
             current = now.replace(tzinfo=timezone)
         else:
             current = now.astimezone(timezone)
-        if self._llm is None:
+        explicitly_negated_mutation = _explicitly_negates_mutation(
+            _without_reminder_phrases(re.sub(r"\s+", "", cleaned))
+        )
+        if self._llm is None or explicitly_negated_mutation:
             fallback = _enrich_deterministically(
                 _fallback_parse(cleaned, current, context), cleaned, current
             )
