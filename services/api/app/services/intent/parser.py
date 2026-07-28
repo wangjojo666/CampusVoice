@@ -348,6 +348,8 @@ def _classify_intent(text: str) -> IntentName:
         for word in ("日历", "日程", "事件", "会议", "组会", "考试", "答辩", "讲座")
     )
     task_signal = any(word in normalized for word in ("待办", "任务", "作业", "复习"))
+    explicit_event_signal = any(word in normalized for word in ("日历", "日程", "事件"))
+    explicit_task_signal = any(word in normalized for word in ("待办", "任务"))
     notice_signal = any(word in normalized for word in ("通知", "公告", "报名", "奖学金", "教务"))
     query_signal = any(
         word in normalized
@@ -363,6 +365,18 @@ def _classify_intent(text: str) -> IntentName:
             "有什么",
         )
     )
+
+    # An explicitly named target type must outrank words in the title. For
+    # example, "创建待办：复习计算机考试" is a task even though "考试" is also
+    # a broad event signal. If both target types are named, keep the existing
+    # fail-closed behavior instead of guessing.
+    if explicit_event_signal != explicit_task_signal:
+        if create_signal:
+            return IntentName.CREATE_EVENT if explicit_event_signal else IntentName.CREATE_TASK
+        if update_signal:
+            return IntentName.UPDATE_EVENT if explicit_event_signal else IntentName.UPDATE_TASK
+        if delete_signal:
+            return IntentName.DELETE_EVENT if explicit_event_signal else IntentName.DELETE_TASK
 
     if delete_signal and event_signal:
         return IntentName.DELETE_EVENT

@@ -58,6 +58,37 @@ async def test_explicit_create_wins_over_reminder_wording() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("text", "expected_intent", "expected_title"),
+    [
+        (
+            "创建待办：明天下午四点复习计算机考试。",
+            IntentName.CREATE_TASK,
+            "复习计算机考试",
+        ),
+        (
+            "创建日程：明天下午四点完成计算机考试。",
+            IntentName.CREATE_EVENT,
+            "完成计算机考试",
+        ),
+    ],
+)
+async def test_explicit_target_type_wins_over_title_keywords(
+    text: str,
+    expected_intent: IntentName,
+    expected_title: str,
+) -> None:
+    result = await IntentParser().parse(
+        text,
+        now=datetime(2026, 7, 28, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert result.intent == expected_intent
+    assert result.slots.title == expected_title
+    assert result.requires_confirmation is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("reminder_text", "expected_minutes"),
     [
         ("提前半小时提醒我", 30),
