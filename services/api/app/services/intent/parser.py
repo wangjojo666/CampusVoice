@@ -2,7 +2,7 @@ import json
 import re
 from collections.abc import Sequence
 from datetime import date, datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -320,36 +320,68 @@ def _new_title(text: str) -> str | None:
     return match.group("title").strip() if match else None
 
 
+class _IntentSignals(NamedTuple):
+    create: bool
+    update: bool
+    delete: bool
+    explicit_event: bool
+    explicit_task: bool
+
+    @property
+    def conflicting(self) -> bool:
+        return sum((self.create, self.update, self.delete)) > 1 or (
+            self.explicit_event and self.explicit_task
+        )
+
+
+def _explicit_target_scope(normalized: str) -> str:
+    colon_positions = [
+        position for delimiter in ("：", ":") if (position := normalized.find(delimiter)) >= 0
+    ]
+    if colon_positions:
+        return normalized[: min(colon_positions)]
+    return re.split(r"[，,。.!！?？]", normalized, maxsplit=1)[0]
+
+
+def _intent_signals(normalized: str) -> _IntentSignals:
+    target_scope = _explicit_target_scope(normalized)
+    return _IntentSignals(
+        create=any(
+            word in normalized
+            for word in ("创建", "新建", "添加", "加到", "加入", "安排", "记一个")
+        ),
+        update=any(
+            word in normalized
+            for word in (
+                "修改",
+                "更新",
+                "改为",
+                "改成",
+                "改到",
+                "调整",
+                "推迟",
+                "提前",
+                "改名",
+                "重命名",
+                "标记",
+                "完成",
+            )
+        ),
+        delete=any(word in normalized for word in ("删除", "删掉", "移除", "取消")),
+        explicit_event=any(word in target_scope for word in ("日历", "日程", "事件")),
+        explicit_task=any(word in target_scope for word in ("待办", "任务")),
+    )
+
+
 def _classify_intent(text: str) -> IntentName:
     normalized = _without_reminder_phrases(re.sub(r"\s+", "", text))
-    create_signal = any(
-        word in normalized for word in ("创建", "新建", "添加", "加到", "加入", "安排", "记一个")
-    )
-    delete_signal = any(word in normalized for word in ("删除", "删掉", "移除", "取消"))
-    update_signal = any(
-        word in normalized
-        for word in (
-            "修改",
-            "更新",
-            "改为",
-            "改成",
-            "改到",
-            "调整",
-            "推迟",
-            "提前",
-            "改名",
-            "重命名",
-            "标记",
-            "完成",
-        )
-    )
+    signals = _intent_signals(normalized)
     event_signal = any(
         word in normalized
         for word in ("日历", "日程", "事件", "会议", "组会", "考试", "答辩", "讲座")
     )
     task_signal = any(word in normalized for word in ("待办", "任务", "作业", "复习"))
-    explicit_event_signal = any(word in normalized for word in ("日历", "日程", "事件"))
-    explicit_task_signal = any(word in normalized for word in ("待办", "任务"))
+
     notice_signal = any(word in normalized for word in ("通知", "公告", "报名", "奖学金", "教务"))
     query_signal = any(
         word in normalized
@@ -366,31 +398,33 @@ def _classify_intent(text: str) -> IntentName:
         )
     )
 
-    # An explicitly named target type must outrank words in the title. For
-    # example, "创建待办：复习计算机考试" is a task even though "考试" is also
-    # a broad event signal. If both target types are named, keep the existing
-    # fail-closed behavior instead of guessing.
-    if explicit_event_signal != explicit_task_signal:
-        if create_signal:
-            return IntentName.CREATE_EVENT if explicit_event_signal else IntentName.CREATE_TASK
-        if update_signal:
-            return IntentName.UPDATE_EVENT if explicit_event_signal else IntentName.UPDATE_TASK
-        if delete_signal:
-            return IntentName.DELETE_EVENT if explicit_event_signal else IntentName.DELETE_TASK
+    if signals.conflicting:
+        return IntentName.UNKNOWN
 
-    if delete_signal and event_signal:
+    # An explicitly named target type must outrank words in the title. For
+    # example, "创建待办：整理日程安排" is a task even though "日程" is also
+    # a broad event signal.
+    if signals.explicit_event != signals.explicit_task:
+        if signals.delete:
+            return IntentName.DELETE_EVENT if signals.explicit_event else IntentName.DELETE_TASK
+        if signals.create:
+            return IntentName.CREATE_EVENT if signals.explicit_event else IntentName.CREATE_TASK
+        if signals.update:
+            return IntentName.UPDATE_EVENT if signals.explicit_event else IntentName.UPDATE_TASK
+
+    if signals.delete and event_signal:
         return IntentName.DELETE_EVENT
-    if delete_signal and task_signal:
+    if signals.delete and task_signal:
         return IntentName.DELETE_TASK
-    if create_signal and event_signal:
+    if signals.create and event_signal:
         return IntentName.CREATE_EVENT
-    if create_signal and task_signal:
+    if signals.create and task_signal:
         return IntentName.CREATE_TASK
-    if update_signal and event_signal:
+    if signals.update and event_signal:
         return IntentName.UPDATE_EVENT
-    if update_signal and task_signal:
+    if signals.update and task_signal:
         return IntentName.UPDATE_TASK
-    if notice_signal and (query_signal or not (create_signal or update_signal or delete_signal)):
+    if notice_signal and (query_signal or not (signals.create or signals.update or signals.delete)):
         return IntentName.SEARCH_NOTICE
     if event_signal and query_signal:
         return IntentName.QUERY_SCHEDULE
@@ -513,6 +547,9 @@ def _continue_from_context(
 def _fallback_parse(text: str, now: datetime, context: Sequence[str] = ()) -> IntentResult:
     current = _fallback_parse_single(text, now)
     if current.intent != IntentName.UNKNOWN:
+        return current
+    normalized = _without_reminder_phrases(re.sub(r"\s+", "", text))
+    if _intent_signals(normalized).conflicting:
         return current
     return _continue_from_context(text, context, now) or current
 

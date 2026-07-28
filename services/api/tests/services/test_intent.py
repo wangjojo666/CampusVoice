@@ -61,18 +61,37 @@ async def test_explicit_create_wins_over_reminder_wording() -> None:
     ("text", "expected_intent", "expected_title"),
     [
         (
-            "创建待办：明天下午四点复习计算机考试。",
+            "创建待办：明天下午四点整理日程安排。",
             IntentName.CREATE_TASK,
-            "复习计算机考试",
+            "整理日程安排",
         ),
         (
-            "创建日程：明天下午四点完成计算机考试。",
-            IntentName.CREATE_EVENT,
-            "完成计算机考试",
+            "创建待办: 明天下午四点整理日程安排。",
+            IntentName.CREATE_TASK,
+            "整理日程安排",
         ),
+        (
+            "创建任务：明天下午四点记录异常事件。",
+            IntentName.CREATE_TASK,
+            "记录异常事件",
+        ),
+        ("更新待办：日程复盘", IntentName.UPDATE_TASK, "日程复盘"),
+        ("删除任务: 日历复盘", IntentName.DELETE_TASK, "日历复盘"),
+        (
+            "创建日程：明天下午四点安排任务复盘。",
+            IntentName.CREATE_EVENT,
+            "安排任务复盘",
+        ),
+        (
+            "创建日历事件: 明天下午四点清理待办清单。",
+            IntentName.CREATE_EVENT,
+            "清理待办清单",
+        ),
+        ("更新日程：任务复盘", IntentName.UPDATE_EVENT, "任务复盘"),
+        ("删除事件: 待办复盘", IntentName.DELETE_EVENT, "待办复盘"),
     ],
 )
-async def test_explicit_target_type_wins_over_title_keywords(
+async def test_explicit_target_scope_ignores_title_keywords(
     text: str,
     expected_intent: IntentName,
     expected_title: str,
@@ -85,6 +104,32 @@ async def test_explicit_target_type_wins_over_title_keywords(
     assert result.intent == expected_intent
     assert result.slots.title == expected_title
     assert result.requires_confirmation is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        "创建日程和待办：准备考试",
+        "创建日程，添加待办: 准备考试",
+        "删除任务A并创建待办B",
+    ],
+)
+@pytest.mark.parametrize("context", [(), ("创建日程：项目答辩",)])
+async def test_conflicting_targets_or_mutations_fail_closed(
+    text: str,
+    context: tuple[str, ...],
+) -> None:
+    result = await IntentParser().parse(
+        text,
+        context=context,
+        now=datetime(2026, 7, 28, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert result.intent == IntentName.UNKNOWN
+    assert result.slots.model_dump(exclude_none=True) == {}
+    assert result.missing_fields == []
+    assert result.requires_confirmation is False
 
 
 @pytest.mark.asyncio
