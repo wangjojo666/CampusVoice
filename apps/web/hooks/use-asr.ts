@@ -21,12 +21,64 @@ function microphoneError(reason: unknown) {
   return "无法启动麦克风，请检查设备与浏览器权限。";
 }
 
+type RecorderStopResult = { ok: true } | { ok: false; reason: unknown };
+
+interface StopOperation {
+  lifecycle: number;
+  client: AsrWebSocketClient | null;
+  promise: Promise<void>;
+}
+
+async function settleRecorderStop(recorder: PcmAudioRecorder | null): Promise<RecorderStopResult> {
+  try {
+    await recorder?.stop();
+    return { ok: true };
+  } catch (reason) {
+    return { ok: false, reason };
+  }
+}
+
+function closeClientSafely(client: AsrWebSocketClient | null) {
+  try {
+    client?.close();
+  } catch {
+    // Resource cleanup must remain best-effort and must not reject detached tasks.
+  }
+}
+
+async function settleOperation(operation: Promise<void> | null) {
+  try {
+    await operation;
+  } catch {
+    // A detached lifecycle cleanup must never surface an unhandled rejection.
+  }
+}
+
 export function useAsr() {
   const [state, dispatch] = useReducer(asrReducer, initialAsrState);
   const recorderRef = useRef<PcmAudioRecorder | null>(null);
   const clientRef = useRef<AsrWebSocketClient | null>(null);
   const mountedRef = useRef(true);
   const lifecycleRef = useRef(0);
+  const stopOperationRef = useRef<StopOperation | null>(null);
+  const resourceCleanupRef = useRef<Promise<void> | null>(null);
+
+  const registerResourceCleanup = useCallback(
+    (recorder: PcmAudioRecorder | null, stopOperation: Promise<void> | null) => {
+      const previousCleanup = resourceCleanupRef.current;
+      const operation = Promise.all([
+        settleOperation(previousCleanup),
+        settleRecorderStop(recorder),
+        settleOperation(stopOperation),
+      ]).then(() => undefined);
+      resourceCleanupRef.current = operation;
+      void operation.then(() => {
+        if (resourceCleanupRef.current === operation) resourceCleanupRef.current = null;
+      });
+      return operation;
+    },
+    [],
+  );
 
   const handleMessage = useCallback((message: AsrServerMessage) => {
     if (message.type === "ready") dispatch({ type: "SOCKET_READY", sessionId: message.session_id });
@@ -61,26 +113,31 @@ export function useAsr() {
   }, []);
 
   const terminateCurrent = useCallback(
-    async (client: AsrWebSocketClient, { closeClient }: { closeClient: boolean }) => {
-      if (clientRef.current !== client) return;
+    (client: AsrWebSocketClient, { closeClient }: { closeClient: boolean }) => {
+      if (clientRef.current !== client) return Promise.resolve();
       lifecycleRef.current += 1;
+      const pendingStop = stopOperationRef.current?.promise ?? null;
+      stopOperationRef.current = null;
       clientRef.current = null;
-      if (closeClient) client.close();
       const recorder = recorderRef.current;
       recorderRef.current = null;
-      await recorder?.stop();
+      if (closeClient) closeClientSafely(client);
+      return registerResourceCleanup(recorder, pendingStop);
     },
-    [],
+    [registerResourceCleanup],
   );
 
-  const cleanup = useCallback(async () => {
+  const cleanup = useCallback(() => {
     lifecycleRef.current += 1;
-    clientRef.current?.close();
-    clientRef.current = null;
+    const pendingStop = stopOperationRef.current?.promise ?? null;
+    stopOperationRef.current = null;
+    const client = clientRef.current;
     const recorder = recorderRef.current;
+    clientRef.current = null;
     recorderRef.current = null;
-    await recorder?.stop();
-  }, []);
+    closeClientSafely(client);
+    return registerResourceCleanup(recorder, pendingStop);
+  }, [registerResourceCleanup]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -108,7 +165,7 @@ export function useAsr() {
     const startWasCancelled = () => !mountedRef.current || lifecycleRef.current !== lifecycle;
     const releaseRecorder = async () => {
       if (recorderRef.current === recorder) recorderRef.current = null;
-      await recorder.stop();
+      await settleRecorderStop(recorder);
     };
     try {
       await recorder.start({
@@ -161,7 +218,7 @@ export function useAsr() {
       clientRef.current = client;
       await client.connect();
       if (startWasCancelled()) {
-        client.close();
+        closeClientSafely(client);
         if (clientRef.current === client) clientRef.current = null;
         await releaseRecorder();
       }
@@ -194,21 +251,57 @@ export function useAsr() {
     dispatch({ type: "RESUME" });
   }, [state.phase]);
 
-  const stop = useCallback(async () => {
-    if (!["recording", "paused"].includes(state.phase)) return;
+  const stop = useCallback((): Promise<void> => {
+    const lifecycle = lifecycleRef.current;
+    const client = clientRef.current;
+    const existing = stopOperationRef.current;
+    if (existing?.lifecycle === lifecycle && existing.client === client) return existing.promise;
+    if (!["recording", "paused"].includes(state.phase)) return Promise.resolve();
+
     dispatch({ type: "STOP" });
     const recorder = recorderRef.current;
-    recorderRef.current = null;
-    try {
-      await recorder?.stop();
-    } finally {
-      clientRef.current?.stop();
-    }
+    if (recorderRef.current === recorder) recorderRef.current = null;
+
+    const promise = (async () => {
+      const recorderResult = await settleRecorderStop(recorder);
+      if (
+        !mountedRef.current ||
+        lifecycleRef.current !== lifecycle ||
+        clientRef.current !== client
+      ) {
+        return;
+      }
+
+      if (!recorderResult.ok) {
+        dispatch({
+          type: "FAIL",
+          code: "audio_drain_failed",
+          message: "录音尾段未能完整发送，本次转写未完成，请重试。",
+          retryable: true,
+        });
+      }
+
+      try {
+        client?.stop();
+      } catch {
+        if (recorderResult.ok) {
+          dispatch({
+            type: "FAIL",
+            code: "asr_stop_failed",
+            message: "语音连接未能完成停止，本次转写未完成，请重试。",
+            retryable: true,
+          });
+        }
+      }
+    })();
+
+    stopOperationRef.current = { lifecycle, client, promise };
+    return promise;
   }, [state.phase]);
 
   const reset = useCallback(async () => {
     await cleanup();
-    dispatch({ type: "RESET" });
+    if (mountedRef.current) dispatch({ type: "RESET" });
   }, [cleanup]);
 
   const editTranscript = useCallback((text: string) => dispatch({ type: "EDIT", text }), []);

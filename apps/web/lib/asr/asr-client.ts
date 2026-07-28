@@ -153,8 +153,10 @@ export class AsrWebSocketClient {
   resume() {}
 
   stop() {
+    if (!this.sendControl({ type: "stop" })) {
+      throw new Error("ASR WebSocket is not open for stop");
+    }
     this.stopRequested = true;
-    this.sendControl({ type: "stop" });
   }
 
   close() {
@@ -164,6 +166,8 @@ export class AsrWebSocketClient {
   }
 
   private sendControl(message: AsrClientMessage) {
-    if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(message));
+    if (this.socket?.readyState !== WebSocket.OPEN) return false;
+    this.socket.send(JSON.stringify(message));
+    return true;
   }
 }

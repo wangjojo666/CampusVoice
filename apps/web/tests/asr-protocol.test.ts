@@ -4,8 +4,9 @@ import { AsrWebSocketClient } from "@/lib/asr/asr-client";
 
 class FakeWebSocket {
   static readonly OPEN = 1;
+  static readonly CLOSING = 2;
   static instance: FakeWebSocket | null = null;
-  readyState = FakeWebSocket.OPEN;
+  readyState: number = FakeWebSocket.OPEN;
   binaryType = "";
   sent: Array<string | ArrayBuffer> = [];
   onopen: (() => void) | null = null;
@@ -53,6 +54,31 @@ describe("ASR WebSocket protocol", () => {
     await connected;
     client.pause();
     expect(JSON.parse(String(socket?.sent[1]))).toEqual({ type: "flush" });
+  });
+
+  it("refuses to mark stop requested when the WebSocket is already closing", async () => {
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const onClose = vi.fn();
+    const client = new AsrWebSocketClient(
+      { onMessage: vi.fn(), onClose, onError: vi.fn() },
+      { url: "ws://localhost/ws/asr", ticket: "short-lived-ticket" },
+    );
+    const connected = client.connect();
+    const socket = FakeWebSocket.instance;
+    socket?.onopen?.();
+    socket?.onmessage?.({ data: JSON.stringify({ type: "ready", session_id: "voice-1" }) });
+    await connected;
+
+    if (socket) socket.readyState = FakeWebSocket.CLOSING;
+    expect(() => client.stop()).toThrow("ASR WebSocket is not open for stop");
+    socket?.onclose?.({ code: 1000, wasClean: true });
+
+    expect(onClose).toHaveBeenCalledWith({
+      stopRequested: false,
+      code: 1000,
+      wasClean: true,
+    });
+    expect(socket?.sent.some((message) => String(message).includes('"type":"stop"'))).toBe(false);
   });
 
   it("reports stop intent together with the actual WebSocket close result", async () => {

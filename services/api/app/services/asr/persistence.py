@@ -51,7 +51,11 @@ class SqlAlchemyAsrPersistence:
                 # The hook runs before the event is serialized, so the browser
                 # receives the exact durable row id that backs this transcript.
                 event.transcription_id = transcription.id
-            if event.type == "error" and event.recoverable is False:
+            if (
+                event.type == "error"
+                and event.recoverable is False
+                and voice_session.status != VoiceSessionStatus.FAILED
+            ):
                 voice_session.status = VoiceSessionStatus.FAILED
                 voice_session.error_message = event.message or event.code
 

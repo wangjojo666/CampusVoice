@@ -732,7 +732,8 @@ class NoticeRadarService:
                 .order_by(ImpactMigrationItem.entity_type, ImpactMigrationItem.entity_id)
             )
         )
-        return _plan_view(plan, items)
+        item_views = await self._public_migration_item_views(session, user_id, items)
+        return _plan_view(plan, items, item_views=item_views)
 
     async def execute(
         self,
@@ -817,7 +818,9 @@ class NoticeRadarService:
                 )
             items = list(
                 await session.scalars(
-                    select(ImpactMigrationItem).where(ImpactMigrationItem.plan_id == plan.id)
+                    select(ImpactMigrationItem)
+                    .where(ImpactMigrationItem.plan_id == plan.id)
+                    .order_by(ImpactMigrationItem.entity_type, ImpactMigrationItem.entity_id)
                 )
             )
             await self._ensure_plan_impacts_executable(session, user_id, plan.id)
@@ -965,7 +968,9 @@ class NoticeRadarService:
             plan.undo_idempotency_key = request.idempotency_key
             items = list(
                 await session.scalars(
-                    select(ImpactMigrationItem).where(ImpactMigrationItem.plan_id == plan.id)
+                    select(ImpactMigrationItem)
+                    .where(ImpactMigrationItem.plan_id == plan.id)
+                    .order_by(ImpactMigrationItem.entity_type, ImpactMigrationItem.entity_id)
                 )
             )
             locked: list[tuple[ImpactMigrationItem, Task | CalendarEvent]] = []
@@ -1046,20 +1051,15 @@ class NoticeRadarService:
                     .order_by(ImpactMigrationItem.entity_type, ImpactMigrationItem.entity_id)
                 )
             )
-            item_receipts = [
-                _operation_receipt(
-                    item.execute_verification_json
-                    if operation == "execute"
-                    else item.undo_verification_json,
-                    item.verification_json,
+            public_items = await self._public_migration_item_views(session, user_id, items)
+            item_views = []
+            for view in public_items:
+                item_receipt = _operation_receipt(
+                    view.execute_verification if operation == "execute" else view.undo_verification,
+                    view.verification,
                     operation,
                     receipt_type="item",
                 )
-                for item in items
-            ]
-            item_views = []
-            for item, item_receipt in zip(items, item_receipts, strict=True):
-                view = _migration_item_view(item)
                 item_views.append(view.model_copy(update={"verification": item_receipt}))
             return VerificationReceiptView(
                 plan_id=plan.id,
@@ -1071,6 +1071,38 @@ class NoticeRadarService:
                 items=item_views,
                 verified_at=datetime.fromisoformat(str(receipt["verified_at"])),
             )
+
+    @staticmethod
+    async def _public_migration_item_views(
+        session: AsyncSession,
+        user_id: str,
+        items: list[ImpactMigrationItem],
+    ) -> list[MigrationItemView]:
+        item_views = [_migration_item_view(item) for item in items]
+        references: set[str] = set()
+        for view in item_views:
+            for payload in (
+                view.before,
+                view.after,
+                view.verification,
+                view.execute_verification,
+                view.undo_verification,
+            ):
+                references.update(_course_reference_candidates(payload))
+
+        owned_course_ids: set[str] = set()
+        if references:
+            owned_course_ids = set(
+                await session.scalars(
+                    select(Course.id)
+                    .where(
+                        Course.user_id == user_id,
+                        Course.id.in_(references),
+                    )
+                    .order_by(Course.id)
+                )
+            )
+        return [_sanitize_migration_item_view(view, owned_course_ids) for view in item_views]
 
     async def radar(self, session: AsyncSession, user_id: str, *, limit: int) -> RadarView:
         change_sets = list(
@@ -1564,7 +1596,24 @@ class NoticeRadarService:
         operation: Literal["execute", "undo"],
     ) -> VerificationReceiptView:
         async with self._factory() as session:
-            plan = await self._owned_plan(session, user_id, plan_id)
+            # This no-op write is deliberately the first database statement. It
+            # serializes verification with execute/undo on PostgreSQL and reserves
+            # SQLite's single writer before any verification snapshot is read.
+            plan = (
+                await session.execute(
+                    update(ImpactMigrationPlan)
+                    .where(
+                        ImpactMigrationPlan.id == plan_id,
+                        ImpactMigrationPlan.user_id == user_id,
+                    )
+                    .values(updated_at=ImpactMigrationPlan.updated_at)
+                    .returning(ImpactMigrationPlan)
+                )
+            ).scalar_one_or_none()
+            if plan is None:
+                await session.rollback()
+                raise NotFoundError("impact migration plan", plan_id)
+
             existing_receipt = _operation_receipt(
                 plan.execute_receipt_json if operation == "execute" else plan.undo_receipt_json,
                 plan.verification_json,
@@ -1573,34 +1622,64 @@ class NoticeRadarService:
             )
             terminal_status = "verified" if operation == "execute" else "undone"
             if existing_receipt and plan.status == terminal_status:
+                await session.rollback()
                 return await self.receipt(user_id, plan_id, operation=operation)
+
+            allowed_statuses = (
+                {"applied", "verification_failed"}
+                if operation == "execute"
+                else {"undo_applied", "undo_verification_failed"}
+            )
+            if plan.status not in allowed_statuses:
+                current_status = plan.status
+                await session.rollback()
+                raise ConflictError(
+                    "migration_verification_state_conflict",
+                    "The migration state changed before verification could complete",
+                    {"operation": operation, "status": current_status},
+                )
+
             items = list(
                 await session.scalars(
-                    select(ImpactMigrationItem).where(ImpactMigrationItem.plan_id == plan.id)
+                    select(ImpactMigrationItem)
+                    .where(ImpactMigrationItem.plan_id == plan.id)
+                    .order_by(ImpactMigrationItem.entity_type, ImpactMigrationItem.entity_id)
                 )
             )
-            results: list[tuple[ImpactMigrationItem, bool, dict[str, Any]]] = []
+            results: list[tuple[ImpactMigrationItem, bool, dict[str, Any], str | None]] = []
             for item in items:
                 entity = await self._owned_entity(
-                    session, user_id, item.entity_type, item.entity_id
-                )
-                expected = item.after_snapshot if operation == "execute" else item.before_snapshot
-                await self._ensure_migration_course_references(
                     session,
                     user_id,
                     item.entity_type,
                     item.entity_id,
-                    entity.course_id,
-                    (expected or {}).get("course_id"),
+                    for_update=True,
                 )
+                expected = item.after_snapshot if operation == "execute" else item.before_snapshot
+                failure_reason: str | None = None
+                try:
+                    await self._ensure_migration_course_references(
+                        session,
+                        user_id,
+                        item.entity_type,
+                        item.entity_id,
+                        entity.course_id,
+                        (expected or {}).get("course_id"),
+                        for_update=True,
+                    )
+                except ConflictError as error:
+                    if error.code != "migration_course_reference_invalid":
+                        raise
+                    failure_reason = error.code
                 actual = _snapshot(item.entity_type, entity)
-                verified = _snapshots_match(
+                verified = failure_reason is None and _snapshots_match(
                     expected or {}, actual, ignore_version=operation == "undo"
                 )
-                results.append((item, verified, actual))
+                results.append((item, verified, actual, failure_reason))
+
             all_verified = bool(results) and all(result[1] for result in results)
             now = utc_now()
-            for item, verified, actual in results:
+            for item, verified, actual, failure_reason in results:
                 expected = item.after_snapshot if operation == "execute" else item.before_snapshot
                 item_receipt = {
                     "operation": operation,
@@ -1610,7 +1689,9 @@ class NoticeRadarService:
                     "database_snapshot": actual,
                 }
                 if not verified:
-                    item_receipt["reason"] = "database_snapshot_mismatch"
+                    item_receipt["reason"] = failure_reason or "database_snapshot_mismatch"
+                if failure_reason == "migration_course_reference_invalid":
+                    item_receipt = _redact_course_verification_receipt(item_receipt)
                 item.verification_json = item_receipt
                 if operation == "execute":
                     item.execute_verification_json = item_receipt
@@ -1619,7 +1700,7 @@ class NoticeRadarService:
             receipt = {
                 "operation": operation,
                 "verified": all_verified,
-                "verified_count": sum(1 for _, verified, _ in results if verified),
+                "verified_count": sum(1 for _, verified, _, _ in results if verified),
                 "total_count": len(results),
                 "verified_at": now.isoformat(),
             }
@@ -1648,11 +1729,15 @@ class NoticeRadarService:
         end = _as_datetime(after.get("end_at"))
         if start is None or end is None:
             return []
-        statement = select(CalendarEvent).where(
-            CalendarEvent.user_id == user_id,
-            CalendarEvent.id != event_id,
-            CalendarEvent.start_at < end,
-            CalendarEvent.end_at > start,
+        statement = (
+            select(CalendarEvent)
+            .where(
+                CalendarEvent.user_id == user_id,
+                CalendarEvent.id != event_id,
+                CalendarEvent.start_at < end,
+                CalendarEvent.end_at > start,
+            )
+            .order_by(CalendarEvent.id)
         )
         if for_update:
             statement = statement.with_for_update()
@@ -1921,12 +2006,16 @@ class NoticeRadarService:
                 {"entity_type": entity_type, "entity_id": entity_id},
             )
         string_references = set(raw_references)
-        statement = select(Course.id).where(
-            Course.user_id == user_id,
-            Course.id.in_(string_references),
+        statement = (
+            select(Course.id)
+            .where(
+                Course.user_id == user_id,
+                Course.id.in_(string_references),
+            )
+            .order_by(Course.id)
         )
         if for_update:
-            statement = statement.with_for_update()
+            statement = statement.with_for_update(read=True)
         owned = set(await session.scalars(statement))
         if owned != string_references:
             raise ConflictError(
@@ -2220,7 +2309,12 @@ def _restore_snapshot(entity: Task | CalendarEvent, snapshot: dict[str, Any]) ->
     entity.version += 1
 
 
-def _plan_view(plan: ImpactMigrationPlan, items: list[ImpactMigrationItem]) -> MigrationPlanView:
+def _plan_view(
+    plan: ImpactMigrationPlan,
+    items: list[ImpactMigrationItem],
+    *,
+    item_views: list[MigrationItemView] | None = None,
+) -> MigrationPlanView:
     return MigrationPlanView(
         id=plan.id,
         change_set_id=plan.change_set_id,
@@ -2228,7 +2322,13 @@ def _plan_view(plan: ImpactMigrationPlan, items: list[ImpactMigrationItem]) -> M
         risk_level=plan.risk_level,
         required_confirmations=_required_confirmations(plan),
         conflicts=plan.conflicts_json,
-        items=[_migration_item_view(item) for item in items],
+        items=(
+            item_views
+            if item_views is not None
+            else [
+                _sanitize_migration_item_view(_migration_item_view(item), set()) for item in items
+            ]
+        ),
         verification=plan.verification_json,
         execute_receipt=plan.execute_receipt_json,
         undo_receipt=plan.undo_receipt_json,
@@ -2254,6 +2354,54 @@ def _migration_item_view(item: ImpactMigrationItem) -> MigrationItemView:
         verification=item.verification_json,
         execute_verification=item.execute_verification_json,
         undo_verification=item.undo_verification_json,
+    )
+
+
+def _course_reference_candidates(value: Any) -> set[str]:
+    references: set[str] = set()
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if key == "course_id":
+                if isinstance(nested, str) and nested.strip():
+                    references.add(nested)
+            else:
+                references.update(_course_reference_candidates(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            references.update(_course_reference_candidates(nested))
+    return references
+
+
+def _sanitize_public_course_references(value: Any, owned_course_ids: set[str]) -> Any:
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, nested in value.items():
+            if key == "course_id":
+                if nested is None or (isinstance(nested, str) and nested in owned_course_ids):
+                    sanitized[key] = nested
+            else:
+                sanitized[key] = _sanitize_public_course_references(nested, owned_course_ids)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_public_course_references(nested, owned_course_ids) for nested in value]
+    return value
+
+
+def _sanitize_migration_item_view(
+    view: MigrationItemView, owned_course_ids: set[str]
+) -> MigrationItemView:
+    return view.model_copy(
+        update={
+            "before": _sanitize_public_course_references(view.before, owned_course_ids),
+            "after": _sanitize_public_course_references(view.after, owned_course_ids),
+            "verification": _sanitize_public_course_references(view.verification, owned_course_ids),
+            "execute_verification": _sanitize_public_course_references(
+                view.execute_verification, owned_course_ids
+            ),
+            "undo_verification": _sanitize_public_course_references(
+                view.undo_verification, owned_course_ids
+            ),
+        }
     )
 
 
@@ -2283,6 +2431,21 @@ def _normalize_title(value: str) -> str:
 
 def _content_hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _redact_course_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    redacted = dict(snapshot)
+    redacted.pop("course_id", None)
+    return redacted
+
+
+def _redact_course_verification_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
+    redacted = dict(receipt)
+    for key in ("expected_snapshot", "database_snapshot"):
+        snapshot = redacted.get(key)
+        if isinstance(snapshot, dict):
+            redacted[key] = _redact_course_snapshot(snapshot)
+    return redacted
 
 
 def _operation_receipt(

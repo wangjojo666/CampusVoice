@@ -156,6 +156,10 @@ def test_offline_postgresql_upgrade_renders_through_head(target: str) -> None:
     assert completed.stdout.count("UPDATE impact_migration_items") == 2
     assert "SELECT impact_migration_plans.id" not in completed.stdout
     assert "SELECT impact_migration_items.id" not in completed.stdout
+    assert completed.stdout.count("length(btrim(tasks.course_id") == 1
+    assert completed.stdout.count("length(btrim(calendar_events.course_id") == 1
+    assert "typeof(tasks.course_id)" not in completed.stdout
+    assert "typeof(calendar_events.course_id)" not in completed.stdout
     expected_targets = {
         "execute_receipt_json": "execute",
         "undo_receipt_json": "undo",
@@ -1297,6 +1301,20 @@ def test_v09_clears_only_invalid_course_ownership_and_downgrade_does_not_restore
             [
                 ("course-owned", "course-owner", "Owned Course", timestamp, timestamp),
                 ("course-foreign", "course-other", "Foreign Course", timestamp, timestamp),
+                (
+                    " \t\n\v\f\r",
+                    "course-owner",
+                    "Blank identifier course",
+                    timestamp,
+                    timestamp,
+                ),
+                (
+                    sqlite3.Binary(b"course-blob"),
+                    "course-owner",
+                    "Blob identifier course",
+                    timestamp,
+                    timestamp,
+                ),
             ],
         )
         connection.executemany(
@@ -1322,6 +1340,23 @@ def test_v09_clears_only_invalid_course_ownership_and_downgrade_does_not_restore
                     timestamp,
                     timestamp,
                 ),
+                (
+                    "task-blank",
+                    "Blank task",
+                    " \t\n\v\f\r",
+                    "Blank text",
+                    timestamp,
+                    timestamp,
+                ),
+                (
+                    "task-blob",
+                    "Blob task",
+                    sqlite3.Binary(b"course-blob"),
+                    "Blob text",
+                    timestamp,
+                    timestamp,
+                ),
+                ("task-null", "Null task", None, "Null text", timestamp, timestamp),
             ],
         )
         connection.executemany(
@@ -1360,17 +1395,60 @@ def test_v09_clears_only_invalid_course_ownership_and_downgrade_does_not_restore
                     timestamp,
                     timestamp,
                 ),
+                (
+                    "event-blank",
+                    "Blank event",
+                    " \t\n\v\f\r",
+                    "Blank text",
+                    "2026-07-20T15:00:00",
+                    "2026-07-20T16:00:00",
+                    timestamp,
+                    timestamp,
+                ),
+                (
+                    "event-blob",
+                    "Blob event",
+                    sqlite3.Binary(b"course-blob"),
+                    "Blob text",
+                    "2026-07-20T17:00:00",
+                    "2026-07-20T18:00:00",
+                    timestamp,
+                    timestamp,
+                ),
+                (
+                    "event-null",
+                    "Null event",
+                    None,
+                    "Null text",
+                    "2026-07-20T19:00:00",
+                    "2026-07-20T20:00:00",
+                    timestamp,
+                    timestamp,
+                ),
             ],
         )
         connection.commit()
+        for table, prefix in (("tasks", "task"), ("calendar_events", "event")):
+            assert connection.execute(
+                f"SELECT typeof(course_id) FROM {table} WHERE id = ?",
+                (f"{prefix}-blank",),
+            ).fetchone() == ("text",)
+            assert connection.execute(
+                f"SELECT typeof(course_id) FROM {table} WHERE id = ?",
+                (f"{prefix}-blob",),
+            ).fetchone() == ("blob",)
 
     _run_alembic(database_path, "upgrade", "head")
     expected = [
+        ("blank", None, "Blank text"),
+        ("blob", None, "Blob text"),
         ("foreign", None, "Foreign text"),
         ("missing", None, "Missing text"),
+        ("null", None, "Null text"),
         ("owned", "course-owned", "Owned text"),
     ]
-    with closing(sqlite3.connect(database_path)) as connection:
+
+    def assert_repaired_course_references(connection: sqlite3.Connection) -> None:
         for table, prefix in (("tasks", "task"), ("calendar_events", "event")):
             rows = connection.execute(
                 f"SELECT substr(id, instr(id, '-') + 1), course_id, course "
@@ -1379,12 +1457,15 @@ def test_v09_clears_only_invalid_course_ownership_and_downgrade_does_not_restore
             ).fetchall()
             assert rows == expected
 
+    with closing(sqlite3.connect(database_path)) as connection:
+        assert_repaired_course_references(connection)
+
     _run_alembic(database_path, "downgrade", "0008_notice_current_and_receipt_repair")
     assert _current_revision(database_path) == "0008_notice_current_and_receipt_repair"
     with closing(sqlite3.connect(database_path)) as connection:
-        assert connection.execute(
-            "SELECT course_id FROM tasks WHERE id = 'task-foreign'"
-        ).fetchone() == (None,)
-        assert connection.execute(
-            "SELECT course_id FROM calendar_events WHERE id = 'event-missing'"
-        ).fetchone() == (None,)
+        assert_repaired_course_references(connection)
+
+    _run_alembic(database_path, "upgrade", "head")
+    assert _current_revision(database_path) == HEAD_REVISION
+    with closing(sqlite3.connect(database_path)) as connection:
+        assert_repaired_course_references(connection)

@@ -8,6 +8,7 @@ Create Date: 2026-07-19
 from collections.abc import Sequence
 
 import sqlalchemy as sa
+from alembic.util import CommandError
 
 from alembic import op
 
@@ -16,19 +17,36 @@ down_revision: str | None = "0008_notice_current_and_receipt_repair"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
+_SUPPORTED_DIALECTS = {"postgresql", "sqlite"}
 
-def _clear_invalid_course_references(table: str) -> None:
+
+def _malformed_course_reference(table: str, dialect: str) -> str:
+    if dialect == "sqlite":
+        whitespace = "char(9) || char(10) || char(11) || char(12) || char(13) || ' '"
+        return (
+            f"typeof({table}.course_id) <> 'text' "
+            f"OR length(trim({table}.course_id, {whitespace})) = 0"
+        )
+    whitespace = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || ' '"
+    return f"length(btrim({table}.course_id, {whitespace})) = 0"
+
+
+def _clear_invalid_course_references(table: str, dialect: str) -> None:
+    malformed = _malformed_course_reference(table, dialect)
     op.execute(
         sa.text(
             f"""
             UPDATE {table}
             SET course_id = NULL
             WHERE course_id IS NOT NULL
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM courses
-                  WHERE courses.id = {table}.course_id
-                    AND courses.user_id = {table}.user_id
+              AND (
+                  {malformed}
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM courses
+                      WHERE courses.id = {table}.course_id
+                        AND courses.user_id = {table}.user_id
+                  )
               )
             """
         )
@@ -36,8 +54,13 @@ def _clear_invalid_course_references(table: str) -> None:
 
 
 def upgrade() -> None:
+    dialect = op.get_context().dialect.name
+    if dialect not in _SUPPORTED_DIALECTS:
+        raise CommandError(
+            f"Revision 0009 supports only SQLite and PostgreSQL; received dialect {dialect!r}"
+        )
     for table in ("tasks", "calendar_events"):
-        _clear_invalid_course_references(table)
+        _clear_invalid_course_references(table, dialect)
 
 
 def downgrade() -> None:

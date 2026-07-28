@@ -1,7 +1,6 @@
 import asyncio
 import json
 from collections.abc import Awaitable, Callable, Sequence
-from contextlib import suppress
 from time import monotonic
 from uuid import uuid4
 
@@ -162,6 +161,21 @@ class _EventSender:
             await self.event_hook(event)
             self.sequence += 1
 
+    async def persist_terminal_error(self, error: AsrProviderError) -> None:
+        if self.event_hook is None:
+            return
+        event = AsrServerEvent(
+            type="error",
+            session_id=self.session_id,
+            sequence=self.sequence,
+            provider=self.provider,
+            code=error.code,
+            message=error.message,
+            recoverable=False,
+        )
+        await self.event_hook(event)
+        self.sequence += 1
+
 
 async def handle_asr_websocket(
     websocket: WebSocket,
@@ -216,22 +230,38 @@ async def handle_asr_websocket(
                 failures.append(exc)
         return failures
 
-    async def report_cleanup_failure() -> None:
+    async def report_cleanup_failure() -> list[BaseException]:
+        failures: list[BaseException] = []
+        if client_disconnected:
+            return failures
         if sender is not None:
-            with suppress(Exception):
+            try:
                 await sender.send(
                     "error",
                     code="session_cleanup_failed",
                     message="语音识别会话资源清理失败。",
                     recoverable=False,
                 )
-        with suppress(Exception):
+            except Exception:
+                pass
+            except BaseExceptionGroup as exc:
+                failures.append(exc)
+            except asyncio.CancelledError as exc:
+                failures.append(exc)
+        try:
             await websocket.close(code=1011)
+        except Exception:
+            pass
+        except BaseExceptionGroup as exc:
+            failures.append(exc)
+        except asyncio.CancelledError as exc:
+            failures.append(exc)
+        return failures
 
     async def close_resources_or_raise(*, completed: bool = False) -> None:
         failures = await close_resources(completed=completed)
         if failures:
-            await report_cleanup_failure()
+            failures.extend(await report_cleanup_failure())
             if len(failures) == 1:
                 raise failures[0]
             raise BaseExceptionGroup("ASR session cleanup failed", failures)
@@ -527,7 +557,7 @@ async def handle_asr_websocket(
                             "error",
                             code=exc.code,
                             message=exc.message,
-                            recoverable=exc.recoverable,
+                            recoverable=False,
                         )
                         reset_utterance = getattr(adapter, "reset_utterance", None)
                         if callable(reset_utterance):
@@ -561,12 +591,23 @@ async def handle_asr_websocket(
         ):
             adapter_finished = True
             try:
-                await sender.persist_transcripts(await adapter.finish())
+                final_results = await adapter.finish()
+            except AsrProviderError as exc:
+                failures.append(exc)
+                try:
+                    await sender.persist_terminal_error(exc)
+                except BaseException as persistence_exc:
+                    failures.append(persistence_exc)
             except BaseException as exc:
                 failures.append(exc)
+            else:
+                try:
+                    await sender.persist_transcripts(final_results)
+                except BaseException as persistence_exc:
+                    failures.append(persistence_exc)
         failures.extend(await close_resources(completed=graceful_completion))
         if failures:
-            await report_cleanup_failure()
+            failures.extend(await report_cleanup_failure())
             if primary_failure is not None:
                 raise BaseExceptionGroup(
                     "ASR session and cleanup failed",
