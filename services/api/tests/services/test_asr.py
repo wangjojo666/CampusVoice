@@ -183,6 +183,10 @@ async def test_finish_failure_does_not_mark_session_completed() -> None:
         ]
     )
     completion_states: list[bool] = []
+    persisted: list[Any] = []
+
+    async def record_event(event: Any) -> None:
+        persisted.append(event)
 
     async def close_persistence(_session_id: str, completed: bool) -> None:
         completion_states.append(completed)
@@ -190,12 +194,15 @@ async def test_finish_failure_does_not_mark_session_completed() -> None:
     await handle_asr_websocket(  # type: ignore[arg-type]
         socket,
         FinishFailureAdapter,
+        event_hook=record_event,
         close_hook=close_persistence,
     )
 
     assert completion_states == [False]
     assert socket.close_code == 1011
     assert socket.sent[-1]["code"] == "finish_failed"
+    assert persisted[-1].code == "finish_failed"
+    assert persisted[-1].recoverable is False
 
 
 @pytest.mark.asyncio
@@ -365,8 +372,8 @@ async def test_adapter_and_persistence_cleanup_are_each_attempted_once_on_failur
     ]
     assert adapter.close_calls == 1
     assert persistence_close_calls == 1
-    assert socket.sent[-1]["code"] == "session_cleanup_failed"
-    assert socket.close_code == 1011
+    assert [item["type"] for item in socket.sent] == ["ready"]
+    assert socket.close_code is None
 
 
 @pytest.mark.asyncio
@@ -386,8 +393,8 @@ async def test_single_cleanup_failure_preserves_original_exception() -> None:
         )
 
     assert caught.value is failure
-    assert socket.sent[-1]["code"] == "session_cleanup_failed"
-    assert socket.close_code == 1011
+    assert [item["type"] for item in socket.sent] == ["ready"]
+    assert socket.close_code is None
 
 
 @pytest.mark.asyncio
@@ -421,6 +428,91 @@ async def test_primary_failure_is_preserved_when_cleanup_also_fails() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cleanup_report_cancellation_preserves_primary_and_close_failures() -> None:
+    finish_failure = RuntimeError("adapter finish failed")
+    close_failure = RuntimeError("adapter close failed")
+    report_cancellation = asyncio.CancelledError("cleanup report cancelled")
+
+    class FailingAdapter(StubAsrAdapter):
+        async def finish(self) -> Sequence[TranscriptResult]:
+            raise finish_failure
+
+        async def close(self) -> None:
+            raise close_failure
+
+    class CancelledCleanupReportSocket(StubSocket):
+        async def send_json(self, payload: dict[str, Any]) -> None:
+            if payload.get("code") == "session_cleanup_failed":
+                raise report_cancellation
+            await super().send_json(payload)
+
+    socket = CancelledCleanupReportSocket(
+        [
+            {"type": "websocket.receive", "text": '{"type":"start"}'},
+            {"type": "websocket.receive", "text": '{"type":"stop"}'},
+        ]
+    )
+
+    with pytest.raises(BaseExceptionGroup, match="ASR session and cleanup failed") as caught:
+        await handle_asr_websocket(  # type: ignore[arg-type]
+            socket,
+            FailingAdapter,
+        )
+
+    assert caught.value.exceptions == (
+        finish_failure,
+        close_failure,
+        report_cancellation,
+    )
+    assert socket.close_code == 1011
+
+
+@pytest.mark.asyncio
+async def test_cleanup_report_exception_group_preserves_existing_failures() -> None:
+    finish_failure = RuntimeError("adapter finish failed")
+    close_failure = RuntimeError("adapter close failed")
+    report_cancellation = asyncio.CancelledError("cleanup report cancelled")
+    report_failure = RuntimeError("cleanup report failed")
+    report_group = BaseExceptionGroup(
+        "cleanup report failures",
+        [report_cancellation, report_failure],
+    )
+
+    class FailingAdapter(StubAsrAdapter):
+        async def finish(self) -> Sequence[TranscriptResult]:
+            raise finish_failure
+
+        async def close(self) -> None:
+            raise close_failure
+
+    class GroupedCleanupReportSocket(StubSocket):
+        async def send_json(self, payload: dict[str, Any]) -> None:
+            if payload.get("code") == "session_cleanup_failed":
+                raise report_group
+            await super().send_json(payload)
+
+    socket = GroupedCleanupReportSocket(
+        [
+            {"type": "websocket.receive", "text": '{"type":"start"}'},
+            {"type": "websocket.receive", "text": '{"type":"stop"}'},
+        ]
+    )
+
+    with pytest.raises(BaseExceptionGroup, match="ASR session and cleanup failed") as caught:
+        await handle_asr_websocket(  # type: ignore[arg-type]
+            socket,
+            FailingAdapter,
+        )
+
+    assert caught.value.exceptions == (
+        finish_failure,
+        close_failure,
+        report_group,
+    )
+    assert socket.close_code == 1011
+
+
+@pytest.mark.asyncio
 async def test_cancelled_adapter_cleanup_still_closes_persistence() -> None:
     cancellation = asyncio.CancelledError("adapter close cancelled")
 
@@ -443,7 +535,8 @@ async def test_cancelled_adapter_cleanup_still_closes_persistence() -> None:
 
     assert caught.value is cancellation
     assert completion_states == [False]
-    assert socket.close_code == 1011
+    assert [item["type"] for item in socket.sent] == ["ready"]
+    assert socket.close_code is None
 
 
 @pytest.mark.asyncio
@@ -486,6 +579,41 @@ async def test_abnormal_disconnect_drains_tail_without_marking_session_completed
 
 
 @pytest.mark.asyncio
+async def test_abnormal_disconnect_persistence_error_is_not_reclassified() -> None:
+    persistence_failure = AsrProviderError(
+        "persistence_failed",
+        "persistence hook used the provider error type",
+        recoverable=False,
+    )
+    adapter = StubAsrAdapter()
+    socket = StubSocket(
+        [
+            {"type": "websocket.receive", "text": '{"type":"start"}'},
+            {"type": "websocket.receive", "bytes": b"\xff\x7f" * 160},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+    persisted: list[Any] = []
+
+    async def record_event(event: Any) -> None:
+        if event.type == "final":
+            raise persistence_failure
+        persisted.append(event)
+
+    with pytest.raises(AsrProviderError) as caught:
+        await handle_asr_websocket(  # type: ignore[arg-type]
+            socket,
+            lambda: adapter,
+            event_hook=record_event,
+        )
+
+    assert caught.value is persistence_failure
+    assert all(event.type != "error" for event in persisted)
+    assert [item["type"] for item in socket.sent] == ["ready", "speech_start", "interim"]
+    assert socket.close_code is None
+
+
+@pytest.mark.asyncio
 async def test_abnormal_disconnect_finish_failure_is_reported_and_not_completed() -> None:
     failure = AsrProviderError(
         "finish_failed",
@@ -506,6 +634,10 @@ async def test_abnormal_disconnect_finish_failure_is_reported_and_not_completed(
         ]
     )
     completion_states: list[bool] = []
+    persisted: list[Any] = []
+
+    async def record_event(event: Any) -> None:
+        persisted.append(event)
 
     async def close_persistence(_session_id: str, completed: bool) -> None:
         completion_states.append(completed)
@@ -514,14 +646,17 @@ async def test_abnormal_disconnect_finish_failure_is_reported_and_not_completed(
         await handle_asr_websocket(  # type: ignore[arg-type]
             socket,
             lambda: adapter,
+            event_hook=record_event,
             close_hook=close_persistence,
         )
 
     assert caught.value is failure
     assert adapter.closed is True
     assert completion_states == [False]
-    assert socket.sent[-1]["code"] == "session_cleanup_failed"
-    assert socket.close_code == 1011
+    assert persisted[-1].code == "finish_failed"
+    assert persisted[-1].recoverable is False
+    assert [item["type"] for item in socket.sent] == ["ready", "speech_start", "interim"]
+    assert socket.close_code is None
 
 
 def test_energy_vad_reports_real_speech_boundaries() -> None:

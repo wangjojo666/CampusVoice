@@ -80,3 +80,52 @@ async def test_asr_persistence_marks_abnormal_disconnect_as_failed(client: objec
     assert voice_session is not None
     assert voice_session.status == VoiceSessionStatus.FAILED
     assert voice_session.error_message == "asr_session_interrupted"
+
+
+async def test_asr_persistence_preserves_first_terminal_failure(client: object) -> None:
+    app = client.app  # type: ignore[attr-defined]
+    factory: async_sessionmaker[AsyncSession] = app.state.session_factory
+    persistence = SqlAlchemyAsrPersistence(
+        factory,
+        user_id="user_demo",
+        model_name="test-model",
+    )
+    session_id = "voice-first-failure-test"
+    await persistence.record_event(
+        AsrServerEvent(
+            type="ready",
+            session_id=session_id,
+            sequence=0,
+            provider="test-only",
+        )
+    )
+    await persistence.record_event(
+        AsrServerEvent(
+            type="error",
+            session_id=session_id,
+            sequence=1,
+            provider="test-only",
+            code="finish_failed",
+            message="provider failed while finishing",
+            recoverable=False,
+        )
+    )
+    await persistence.record_event(
+        AsrServerEvent(
+            type="error",
+            session_id=session_id,
+            sequence=2,
+            provider="test-only",
+            code="session_cleanup_failed",
+            message="session cleanup also failed",
+            recoverable=False,
+        )
+    )
+    await persistence.close(session_id, completed=False)
+
+    async with factory() as session:
+        voice_session = await session.get(VoiceSession, session_id)
+
+    assert voice_session is not None
+    assert voice_session.status == VoiceSessionStatus.FAILED
+    assert voice_session.error_message == "provider failed while finishing"
