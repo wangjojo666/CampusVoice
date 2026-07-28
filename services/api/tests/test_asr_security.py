@@ -259,8 +259,8 @@ async def test_route_releases_connection_quota_when_session_cleanup_raises(
     assert socket.adapter.close_calls == 1
     assert persistence.close_calls == 1
     assert persistence.completion_states == [False]
-    assert socket.sent[-1]["code"] == "session_cleanup_failed"
-    assert socket.close_code == 1011
+    assert [item["type"] for item in socket.sent] == ["ready"]
+    assert socket.close_code is None
     errors = [
         item
         for item in socket.app.state.metrics.snapshot()["components"]

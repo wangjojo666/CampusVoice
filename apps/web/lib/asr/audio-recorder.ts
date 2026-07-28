@@ -3,6 +3,38 @@ export interface RecorderHandlers {
   onLevel: (level: number) => void;
 }
 
+const DRAIN_TIMEOUT_MS = 2_000;
+const CONTEXT_CLOSE_TIMEOUT_MS = 1_000;
+
+interface RecorderResources {
+  context: AudioContext | null;
+  stream: MediaStream | null;
+  source: MediaStreamAudioSourceNode | null;
+  worklet: AudioWorkletNode | null;
+  mutedOutput: GainNode | null;
+}
+
+function withTimeout<T>(label: string, timeoutMs: number, operation: () => Promise<T>): Promise<T> {
+  let timeoutId: number | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = window.setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs);
+  });
+  return Promise.race([Promise.resolve().then(operation), timeout]).finally(() => {
+    if (timeoutId !== undefined) window.clearTimeout(timeoutId);
+  });
+}
+
+function settled<T>(operation: Promise<T>): Promise<PromiseSettledResult<T>> {
+  return operation.then(
+    (value) => ({ status: "fulfilled", value }),
+    (reason: unknown) => ({ status: "rejected", reason }),
+  );
+}
+
+function startCancelled() {
+  return new DOMException("麦克风启动已取消。", "AbortError");
+}
+
 export class PcmAudioRecorder {
   private context: AudioContext | null = null;
   private stream: MediaStream | null = null;
@@ -15,12 +47,20 @@ export class PcmAudioRecorder {
     requestId: number;
     complete: () => void;
   } | null = null;
+  private lifecycle = 0;
 
   async start(handlers: RecorderHandlers) {
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new DOMException("当前浏览器不支持麦克风采集。", "NotSupportedError");
     }
-    this.stream = await navigator.mediaDevices.getUserMedia({
+    const lifecycle = this.lifecycle + 1;
+    this.lifecycle = lifecycle;
+    const previousStop = this.stopPromise;
+    this.stopPromise = null;
+    await previousStop?.catch(() => undefined);
+    if (this.lifecycle !== lifecycle) throw startCancelled();
+
+    const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
         echoCancellation: true,
@@ -29,15 +69,24 @@ export class PcmAudioRecorder {
       },
       video: false,
     });
-    this.context = new AudioContext({ latencyHint: "interactive" });
-    await this.context.audioWorklet.addModule("/audio-processor.js");
-    this.source = this.context.createMediaStreamSource(this.stream);
-    this.worklet = new AudioWorkletNode(this.context, "campusvoice-pcm-processor", {
+    if (this.lifecycle !== lifecycle) {
+      for (const track of stream.getTracks()) track.stop();
+      throw startCancelled();
+    }
+    this.stream = stream;
+    const context = new AudioContext({ latencyHint: "interactive" });
+    this.context = context;
+    await context.audioWorklet.addModule("/audio-processor.js");
+    if (this.lifecycle !== lifecycle || this.context !== context || this.stream !== stream) {
+      throw startCancelled();
+    }
+    this.source = context.createMediaStreamSource(stream);
+    this.worklet = new AudioWorkletNode(context, "campusvoice-pcm-processor", {
       numberOfInputs: 1,
       numberOfOutputs: 1,
       outputChannelCount: [1],
     });
-    this.mutedOutput = this.context.createGain();
+    this.mutedOutput = context.createGain();
     this.mutedOutput.gain.value = 0;
     this.worklet.port.onmessage = (
       event: MessageEvent<{
@@ -58,8 +107,11 @@ export class PcmAudioRecorder {
         this.pendingDrain.complete();
       }
     };
-    this.source.connect(this.worklet).connect(this.mutedOutput).connect(this.context.destination);
-    await this.context.resume();
+    this.source.connect(this.worklet).connect(this.mutedOutput).connect(context.destination);
+    await context.resume();
+    if (this.lifecycle !== lifecycle || this.context !== context || this.stream !== stream) {
+      throw startCancelled();
+    }
   }
 
   private waitForDrain(worklet: AudioWorkletNode) {
@@ -68,7 +120,7 @@ export class PcmAudioRecorder {
       const timeoutId = window.setTimeout(() => {
         if (this.pendingDrain?.requestId === requestId) this.pendingDrain = null;
         reject(new Error("AudioWorklet drain acknowledgement timed out"));
-      }, 2_000);
+      }, DRAIN_TIMEOUT_MS);
 
       this.pendingDrain = {
         requestId,
@@ -97,43 +149,97 @@ export class PcmAudioRecorder {
     await this.context?.resume();
   }
 
-  async stop() {
+  stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
-
-    const operation = this.stopResources();
-    this.stopPromise = operation;
-    try {
-      await operation;
-    } finally {
-      if (this.stopPromise === operation) this.stopPromise = null;
-    }
+    this.lifecycle += 1;
+    this.stopPromise = this.stopResources(this.takeResources());
+    return this.stopPromise;
   }
 
-  private async stopResources() {
-    const context = this.context;
-    const stream = this.stream;
-    const source = this.source;
-    const worklet = this.worklet;
-    const mutedOutput = this.mutedOutput;
-
+  private takeResources(): RecorderResources {
+    const resources = {
+      context: this.context,
+      stream: this.stream,
+      source: this.source,
+      worklet: this.worklet,
+      mutedOutput: this.mutedOutput,
+    };
     this.context = null;
     this.stream = null;
     this.source = null;
     this.worklet = null;
     this.mutedOutput = null;
+    return resources;
+  }
 
-    try {
-      stream?.getTracks().forEach((track) => track.stop());
-      source?.disconnect();
-      if (worklet && context && context.state !== "closed") {
-        if (context.state === "suspended") await context.resume();
-        await this.waitForDrain(worklet);
+  private async stopResources({
+    context,
+    stream,
+    source,
+    worklet,
+    mutedOutput,
+  }: RecorderResources) {
+    const errors: unknown[] = [];
+
+    if (worklet) {
+      if (!context || context.state === "closed") {
+        errors.push(new Error("AudioWorklet cannot drain because its AudioContext is closed"));
+      } else {
+        const drainResultPromise = settled(this.waitForDrain(worklet));
+        const resumeResultPromise =
+          context.state === "running"
+            ? Promise.resolve<PromiseSettledResult<void>>({
+                status: "fulfilled",
+                value: undefined,
+              })
+            : settled(withTimeout("AudioContext resume", DRAIN_TIMEOUT_MS, () => context.resume()));
+        const drainResult = await drainResultPromise;
+        if (drainResult.status === "rejected") {
+          errors.push(drainResult.reason);
+          const resumeResult = await resumeResultPromise;
+          if (resumeResult.status === "rejected") errors.push(resumeResult.reason);
+        } else {
+          void resumeResultPromise;
+        }
       }
-    } finally {
-      if (worklet) worklet.port.onmessage = null;
-      worklet?.disconnect();
-      mutedOutput?.disconnect();
-      if (context && context.state !== "closed") await context.close();
+    }
+
+    const capture = (operation: () => void) => {
+      try {
+        operation();
+      } catch (reason) {
+        errors.push(reason);
+      }
+    };
+
+    if (worklet) {
+      capture(() => {
+        worklet.port.onmessage = null;
+      });
+    }
+    let tracks: MediaStreamTrack[] = [];
+    if (stream) {
+      capture(() => {
+        tracks = stream.getTracks();
+      });
+    }
+    for (const track of tracks) capture(() => track.stop());
+    if (source) capture(() => source.disconnect());
+    if (worklet) capture(() => worklet.disconnect());
+    if (mutedOutput) capture(() => mutedOutput.disconnect());
+    if (context && context.state !== "closed") {
+      try {
+        await withTimeout("AudioContext close", CONTEXT_CLOSE_TIMEOUT_MS, () => context.close());
+      } catch (reason) {
+        errors.push(reason);
+      }
+    }
+
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) {
+      throw new AggregateError(errors, "PCM recorder stop completed with multiple failures", {
+        cause: errors[0],
+      });
     }
   }
 }
