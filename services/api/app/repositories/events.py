@@ -33,7 +33,7 @@ class EventRepository:
         result = await session.scalars(
             select(CalendarEvent)
             .where(*filters)
-            .order_by(CalendarEvent.start_at.asc())
+            .order_by(CalendarEvent.start_at.asc(), CalendarEvent.id.asc())
             .limit(limit)
             .offset(offset)
         )

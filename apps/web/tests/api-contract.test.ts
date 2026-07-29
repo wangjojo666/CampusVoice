@@ -54,6 +54,39 @@ describe("API wire contract adapters", () => {
     });
   });
 
+  it("reads authoritative pending-action state without browser caching", async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      jsonResponse({
+        id: "action-reconcile",
+        action_type: "delete_task",
+        entity_type: "task",
+        target_id: "task-1",
+        payload: {},
+        state: "executing",
+        risk_level: "high",
+        risk_factors: ["deletes_data"],
+        missing_fields: [],
+        ambiguities: [],
+        blocking_reasons: [],
+        diagnostics: {},
+        required_confirmations: 2,
+        confirmations_received: 2,
+        expires_at: "2026-07-12T12:00:00Z",
+        attempt_count: 1,
+        max_attempts: 2,
+        last_error: null,
+      }),
+    );
+
+    await expect(api.actions.get("action-reconcile")).resolves.toMatchObject({
+      id: "action-reconcile",
+      status: "executing",
+    });
+    expect(fetch).toHaveBeenCalledWith(
+      expect.stringContaining("/api/actions/action-reconcile"),
+      expect.objectContaining({ cache: "no-store" }),
+    );
+  });
   it("surfaces the backend domain error message instead of a false success", async () => {
     vi.mocked(fetch).mockResolvedValue(
       jsonResponse(
@@ -351,7 +384,8 @@ describe("API wire contract adapters", () => {
       }),
     );
 
-    const log = (await api.actionLogs.list()).items[0];
+    const log = (await api.actionLogs.list(500, 500)).items[0];
+    expect(String(vi.mocked(fetch).mock.calls[0]?.[0])).toContain("limit=500&offset=500");
     expect(log).toMatchObject({
       voice_session_id: "voice-1",
       transcription_id: "trn-1",

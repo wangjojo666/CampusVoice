@@ -2,7 +2,7 @@
 
 import type { PendingAction, Task, TaskCreate, TaskUpdate } from "@campusvoice/shared-types";
 import { Check, ChevronDown, Clock3, Edit3, Plus, RotateCcw, Search, Trash2 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { VerifiedFinish } from "@/components/actions/verified-finish";
 import { PageHeader } from "@/components/layout/page-header";
@@ -11,9 +11,14 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { ErrorState } from "@/components/ui/error-state";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Modal } from "@/components/ui/modal";
+import {
+  confirmActionAndReconcile,
+  isActionExecutionRecoveryStatus,
+} from "@/lib/action-confirmation";
 import { ApiError, api } from "@/lib/api-client";
 import { latestUndoableTaskAction } from "@/lib/calendar/undo";
 import { formatDateTime } from "@/lib/format";
+import { collectAllPages } from "@/lib/pagination";
 import { useUserSettings } from "@/lib/user-settings";
 import { createVerifiedFinishEvent, type VerifiedFinishEvent } from "@/lib/verified-finish";
 
@@ -41,23 +46,43 @@ export default function TasksPage() {
   const [deleting, setDeleting] = useState<Task | null>(null);
   const [deleteText, setDeleteText] = useState("");
   const [pendingDelete, setPendingDelete] = useState<PendingAction | null>(null);
+  const [deleteRetryBlocked, setDeleteRetryBlocked] = useState(false);
+  const deleteCanResumeExecution = isActionExecutionRecoveryStatus(pendingDelete?.status);
+  const deleteNeedsExecutionRecovery =
+    pendingDelete?.status === "executing" || pendingDelete?.status === "executed";
+  const deleteCancellationBlocked = !deleteRetryBlocked && deleteNeedsExecutionRecovery;
+  const loadGenerationRef = useRef(0);
+  const deleteGenerationRef = useRef(0);
 
   const load = useCallback(async () => {
+    const generation = ++loadGenerationRef.current;
     setLoading(true);
+    setError(null);
+    setTasks([]);
     try {
-      const response = await api.tasks.list();
-      setTasks(response.items);
-      setError(null);
+      const items = await collectAllPages(
+        ({ limit, offset }) => api.tasks.list({ limit, offset }),
+        {
+          getKey: (task) => task.id,
+          shouldContinue: () => generation === loadGenerationRef.current,
+        },
+      );
+      if (generation !== loadGenerationRef.current) return;
+      setTasks(items);
     } catch (reason) {
+      if (generation !== loadGenerationRef.current) return;
       setError(reason instanceof ApiError ? reason.userMessage : "无法加载待办。");
     } finally {
-      setLoading(false);
+      if (generation === loadGenerationRef.current) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
     const timer = window.setTimeout(() => void load(), 0);
-    return () => window.clearTimeout(timer);
+    return () => {
+      window.clearTimeout(timer);
+      loadGenerationRef.current += 1;
+    };
   }, [load]);
 
   const courses = useMemo(
@@ -145,46 +170,132 @@ export default function TasksPage() {
     }
   };
 
+  const setDeleteTarget = useCallback((target: Task | null) => {
+    deleteGenerationRef.current += 1;
+    setDeleting(target);
+    setDeleteText("");
+    setPendingDelete(null);
+    setDeleteRetryBlocked(false);
+  }, []);
+
+  const dismissDeleteForReview = async () => {
+    const actionId = pendingDelete?.id;
+    setNotice(
+      actionId
+        ? `删除操作 ${actionId} 已停止自动重试，请核对当前数据。`
+        : "删除操作已停止自动重试，请核对当前数据。",
+    );
+    setBusy(false);
+    setDeleteTarget(null);
+    await load();
+  };
+
+  const cancelDelete = async () => {
+    const action = pendingDelete;
+    if (!action) {
+      setDeleteTarget(null);
+      return;
+    }
+    const generation = deleteGenerationRef.current;
+    const isCurrent = () => generation === deleteGenerationRef.current;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.actions.cancel(action.id);
+      if (!isCurrent()) return;
+      setBusy(false);
+      setDeleteTarget(null);
+    } catch (reason) {
+      if (!isCurrent()) return;
+      try {
+        const current = await api.actions.get(action.id);
+        if (!isCurrent()) return;
+        setPendingDelete(current);
+        if (current.status === "executing" || current.status === "executed") {
+          setError("删除已进入执行或验证恢复阶段，无法取消。请恢复同一操作并获取权威结果。");
+          return;
+        }
+        if (["cancelled", "expired", "undone"].includes(current.status)) {
+          setNotice("删除操作已结束，已重新加载当前数据。");
+          setBusy(false);
+          setDeleteTarget(null);
+          await load();
+          return;
+        }
+      } catch {
+        // Keep the original cancellation error when authoritative state cannot be read.
+      }
+      setError(reason instanceof ApiError ? reason.userMessage : "取消删除失败，请重试。");
+    } finally {
+      if (isCurrent()) setBusy(false);
+    }
+  };
+
   const remove = async () => {
-    if (!deleting || deleteText !== deleting.title) return;
+    const target = deleting;
+    if (!target || (!deleteCanResumeExecution && deleteText !== target.title)) return;
+    const generation = deleteGenerationRef.current;
+    const isCurrent = () => generation === deleteGenerationRef.current;
     setBusy(true);
     setError(null);
     setNotice(null);
     setVerifiedFinish(null);
     try {
-      const action = pendingDelete ?? (await api.tasks.remove(deleting.id));
-      const isFirstConfirmation = action.status === "awaiting_confirmation";
-      if (!isFirstConfirmation && action.status !== "awaiting_second_confirmation") {
-        throw new ApiError("删除操作不在可确认状态，请重新发起。", {
-          status: 409,
-          details: action,
-        });
+      let action = pendingDelete;
+      if (!action) {
+        action = await api.tasks.remove(target.id);
+        if (!isCurrent()) return;
+        setPendingDelete(action);
       }
 
-      if (pendingDelete === null) setPendingDelete(action);
-      const updated = await api.actions.confirm(action.id, true);
-      setPendingDelete(updated);
+      if (!isActionExecutionRecoveryStatus(action.status)) {
+        const isFirstConfirmation = action.status === "awaiting_confirmation";
+        if (!isFirstConfirmation && action.status !== "awaiting_second_confirmation") {
+          throw new ApiError("删除操作不在可确认状态，请重新发起。", {
+            status: 409,
+            details: action,
+          });
+        }
 
-      if (isFirstConfirmation) {
-        if (updated.status !== "awaiting_second_confirmation") {
+        const outcome = await confirmActionAndReconcile(action.id);
+        if (!isCurrent()) return;
+        const updated = outcome.action;
+
+        if (isFirstConfirmation) {
+          if (updated.status === "awaiting_second_confirmation") {
+            setPendingDelete(updated);
+            setDeleteText("");
+            setNotice("第一次确认已记录。请重新输入标题并完成第二次确认。");
+            return;
+          }
+          if (outcome.confirmationError) throw outcome.confirmationError;
           throw new ApiError("第一次确认后的状态不安全，未执行删除。", {
             status: 409,
             details: updated,
           });
         }
-        setDeleteText("");
-        setNotice("第一次确认已记录。请重新输入标题并完成第二次确认。");
-        return;
+
+        setPendingDelete(updated);
+        if (updated.status !== "ready" && updated.status !== "failed") {
+          if (outcome.confirmationError) throw outcome.confirmationError;
+          throw new ApiError("删除操作尚未获得全部确认，未执行。", {
+            status: 409,
+            details: updated,
+          });
+        }
+        action = updated;
       }
 
-      if (updated.status !== "ready") {
-        throw new ApiError("删除操作尚未获得全部确认，未执行。", {
-          status: 409,
-          details: updated,
-        });
+      const result = await api.actions.execute(action.id);
+      if (!isCurrent()) return;
+      if (!result.success) {
+        if (result.retryable === false) {
+          setDeleteRetryBlocked(true);
+          setError(`${result.message} 自动重试已停止，请人工核对当前数据。`);
+          return;
+        }
+        throw new ApiError(result.message, { status: 409, details: result });
       }
-      const result = await api.actions.execute(updated.id);
-      if (!result.success) throw new ApiError(result.message, { status: 409, details: result });
       setNotice(result.message);
       setVerifiedFinish(createVerifiedFinishEvent(result, "execute"));
       setDeleting(null);
@@ -192,9 +303,15 @@ export default function TasksPage() {
       setPendingDelete(null);
       await load();
     } catch (reason) {
+      if (!isCurrent()) return;
+      if (reason instanceof ApiError && reason.code === "retry_limit_reached") {
+        setDeleteRetryBlocked(true);
+        setError(`${reason.userMessage} 自动重试已停止，请人工核对当前数据。`);
+        return;
+      }
       setError(reason instanceof ApiError ? reason.userMessage : "删除失败。");
     } finally {
-      setBusy(false);
+      if (isCurrent()) setBusy(false);
     }
   };
 
@@ -204,8 +321,14 @@ export default function TasksPage() {
     setNotice(null);
     setVerifiedFinish(null);
     try {
-      const logs = await api.actionLogs.list(30);
-      const target = latestUndoableTaskAction(logs.items);
+      const logs = await collectAllPages(
+        ({ limit, offset }) => api.actionLogs.list(limit, offset),
+        {
+          getKey: (log) => log.id,
+          shouldStop: (page) => Boolean(latestUndoableTaskAction(page)),
+        },
+      );
+      const target = latestUndoableTaskAction(logs);
       if (!target?.action_id) {
         setNotice("没有可撤销的最近操作。");
         return;
@@ -319,7 +442,7 @@ export default function TasksPage() {
 
       {loading ? (
         <LoadingState rows={5} />
-      ) : filtered.length === 0 ? (
+      ) : error ? null : filtered.length === 0 ? (
         <EmptyState
           title={tasks.length === 0 ? "还没有待办" : "没有符合条件的待办"}
           description={
@@ -393,11 +516,8 @@ export default function TasksPage() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => {
-                    setDeleting(task);
-                    setDeleteText("");
-                    setPendingDelete(null);
-                  }}
+                  disabled={busy}
+                  onClick={() => setDeleteTarget(task)}
                   className="btn-ghost !size-9 !min-h-0 !p-0 text-coral-600"
                   aria-label={`删除${task.title}`}
                 >
@@ -428,15 +548,20 @@ export default function TasksPage() {
         open={Boolean(deleting)}
         title="高风险：删除待办"
         description={
-          pendingDelete?.status === "awaiting_second_confirmation"
-            ? "第一次确认已记录。请重新核对目标，并通过独立的第二次交互确认删除。"
-            : "删除会改变数据。请输入完整标题并完成第一次确认。"
+          deleteRetryBlocked
+            ? `自动重试已停止。请人工核对当前数据；操作编号：${pendingDelete?.id ?? "未知"}。`
+            : deleteNeedsExecutionRecovery
+              ? "删除已进入执行或验证恢复阶段，无法取消。请恢复同一操作并获取权威结果。"
+              : pendingDelete?.status === "ready" || pendingDelete?.status === "failed"
+                ? "删除已完成两次确认，但执行或结果回传未成功。可安全重试同一操作。"
+                : pendingDelete?.status === "awaiting_second_confirmation"
+                  ? "第一次确认已记录。请重新核对目标，并通过独立的第二次交互确认删除。"
+                  : "删除会改变数据。请输入完整标题并完成第一次确认。"
         }
         onClose={() => {
-          if (!busy) {
-            setDeleting(null);
-            setDeleteText("");
-            setPendingDelete(null);
+          if (!busy && !deleteCancellationBlocked) {
+            if (deleteRetryBlocked) void dismissDeleteForReview();
+            else void cancelDelete();
           }
         }}
       >
@@ -447,13 +572,16 @@ export default function TasksPage() {
             </div>
             <label className="mt-4 block">
               <span className="mb-1.5 block text-sm font-bold text-ink-700">
-                {pendingDelete?.status === "awaiting_second_confirmation"
-                  ? "重新输入完整标题进行第二次确认"
-                  : "输入完整标题进行第一次确认"}
+                {deleteCanResumeExecution
+                  ? "该操作已完成确认，无需再次输入标题"
+                  : pendingDelete?.status === "awaiting_second_confirmation"
+                    ? "重新输入完整标题进行第二次确认"
+                    : "输入完整标题进行第一次确认"}
               </span>
               <input
                 autoFocus
                 value={deleteText}
+                disabled={busy || deleteRetryBlocked || deleteCanResumeExecution}
                 onChange={(event) => setDeleteText(event.target.value)}
                 className="field"
                 placeholder={deleting.title}
@@ -467,29 +595,40 @@ export default function TasksPage() {
             <div className="mt-5 flex justify-end gap-2">
               <button
                 type="button"
-                onClick={() => {
-                  setDeleting(null);
-                  setDeleteText("");
-                  setPendingDelete(null);
-                }}
+                disabled={busy || deleteCancellationBlocked}
+                onClick={() =>
+                  deleteRetryBlocked ? void dismissDeleteForReview() : void cancelDelete()
+                }
                 className="btn-secondary"
               >
-                取消
+                {deleteRetryBlocked ? "关闭并重新加载" : "取消"}
               </button>
               <button
                 type="button"
-                disabled={busy || deleteText !== deleting.title}
+                disabled={
+                  busy ||
+                  deleteRetryBlocked ||
+                  (!deleteCanResumeExecution && deleteText !== deleting.title)
+                }
                 onClick={() => void remove()}
                 className="btn-danger"
               >
                 <Trash2 size={16} />
                 {busy
-                  ? pendingDelete?.status === "awaiting_second_confirmation"
-                    ? "正在删除并验证"
-                    : "正在记录第一次确认"
-                  : pendingDelete?.status === "awaiting_second_confirmation"
-                    ? "第二次确认并删除"
-                    : "第一次确认删除"}
+                  ? deleteNeedsExecutionRecovery
+                    ? "正在恢复删除并验证"
+                    : pendingDelete?.status === "ready" || pendingDelete?.status === "failed"
+                      ? "正在重试删除并验证"
+                      : pendingDelete?.status === "awaiting_second_confirmation"
+                        ? "正在删除并验证"
+                        : "正在记录第一次确认"
+                  : deleteNeedsExecutionRecovery
+                    ? "恢复删除并验证"
+                    : pendingDelete?.status === "ready" || pendingDelete?.status === "failed"
+                      ? "重试删除并验证"
+                      : pendingDelete?.status === "awaiting_second_confirmation"
+                        ? "第二次确认并删除"
+                        : "第一次确认删除"}
               </button>
             </div>
           </div>

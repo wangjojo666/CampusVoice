@@ -60,6 +60,20 @@ def _undo_persistence(
     return asyncio.run(read())
 
 
+def test_pending_action_state_reads_are_not_cacheable(client: TestClient) -> None:
+    prepared = client.post(
+        "/api/actions/prepare",
+        json={"action": "create_task", "payload": {"title": "核对权威状态"}},
+    )
+    assert prepared.status_code == 201
+
+    response = client.get(f"/api/actions/{prepared.json()['id']}")
+
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["Pragma"] == "no-cache"
+
+
 def test_completeness_and_low_confidence_risk_are_deterministic(client: TestClient) -> None:
     incomplete = client.post(
         "/api/actions/prepare",
