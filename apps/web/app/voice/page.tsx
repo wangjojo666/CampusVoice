@@ -2,7 +2,6 @@
 
 import type {
   AsrTranscriptReference,
-  CalendarEvent,
   CorrectionResult,
   IntentResult,
   PendingAction,
@@ -17,7 +16,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import Link from "next/link";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ConfirmationCard } from "@/components/actions/confirmation-card";
 import { ExecutionResult } from "@/components/actions/execution-result";
@@ -27,6 +26,11 @@ import { AsrRecorder } from "@/components/voice/asr-recorder";
 import { ClarificationCard } from "@/components/voice/clarification-card";
 import { CorrectionDiff } from "@/components/voice/correction-diff";
 import { ApiError, api } from "@/lib/api-client";
+import {
+  addLocalDays,
+  firstValidInstantOfExactLocalDay,
+  firstValidInstantOfLocalDay,
+} from "@/lib/dashboard/local-days";
 import { formatDateTime } from "@/lib/format";
 import { useUserSettings } from "@/lib/user-settings";
 import { createVerifiedFinishEvent, type VerifiedFinishEvent } from "@/lib/verified-finish";
@@ -60,6 +64,21 @@ function slotText(value: unknown) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
+function localDayQueryWindow(dateKey: string, timezone: string) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
+    throw new RangeError("Schedule date must use YYYY-MM-DD");
+  }
+  const parsed = new Date(`${dateKey}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== dateKey) {
+    throw new RangeError("Schedule date must be a real calendar date");
+  }
+  const startMs = firstValidInstantOfExactLocalDay(dateKey, timezone);
+  if (startMs === null) throw new RangeError("Schedule date does not exist in this timezone");
+  const endMs = firstValidInstantOfLocalDay(addLocalDays(dateKey, 1), timezone);
+  if (endMs <= startMs) throw new RangeError("Schedule date window must be increasing");
+  return { start: new Date(startMs).toISOString(), end: new Date(endMs).toISOString() };
+}
+
 function targetCandidates(action: PendingAction | null) {
   const value = action?.diagnostics?.target_candidates;
   if (!Array.isArray(value)) return [];
@@ -75,39 +94,81 @@ function targetCandidates(action: PendingAction | null) {
 export default function VoicePage() {
   const store = useAssistantStore();
   const userSettings = useUserSettings();
-  const [scheduleResults, setScheduleResults] = useState<CalendarEvent[] | null>(null);
+
   const [voiceSessionId, setVoiceSessionId] = useState<string | null>(null);
   const [transcriptionId, setTranscriptionId] = useState<string | null>(null);
   const [originalTranscript, setOriginalTranscript] = useState("");
   const [asrConfidence, setAsrConfidence] = useState<number | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [verifiedFinish, setVerifiedFinish] = useState<VerifiedFinishEvent | null>(null);
-  const busy = ["analyzing", "preparing", "confirming", "executing"].includes(store.workflowStatus);
+  const [undoing, setUndoing] = useState(false);
+  const undoInFlight = useRef(false);
+  const mounted = useRef(true);
+  const startOperation = useCallback(() => {
+    const operationId = crypto.randomUUID();
+    const currentStore = useAssistantStore.getState();
+    currentStore.setActiveOperationId(operationId);
+    currentStore.setUndoRecoveryActionId(null);
+    undoInFlight.current = false;
+    setUndoing(false);
+    return operationId;
+  }, []);
+  const isOperationCurrent = useCallback(
+    (operationId: string) => useAssistantStore.getState().activeOperationId === operationId,
+    [],
+  );
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      undoInFlight.current = false;
+    };
+  }, []);
+
+  const undoBusy =
+    undoing ||
+    (store.workflowStatus === "executing" &&
+      Boolean(store.undoRecoveryActionId) &&
+      store.undoRecoveryActionId === store.lastExecutedActionId);
+  const busy =
+    ["analyzing", "preparing", "confirming", "executing"].includes(store.workflowStatus) ||
+    undoBusy;
 
   const execute = useCallback(
-    async (action: PendingAction) => {
-      setVerifiedFinish(null);
+    async (action: PendingAction, generation = startOperation()) => {
+      if (!isOperationCurrent(generation)) return;
+      if (mounted.current) setVerifiedFinish(null);
+      store.setError(null);
       store.setWorkflowStatus("executing");
       try {
         const result = await api.actions.execute(action.id);
+        if (!isOperationCurrent(generation)) return;
         store.setExecution(result);
         store.setLastExecutedActionId(result.success ? action.id : null);
         store.setPendingAction(result.success ? null : action);
         store.setWorkflowStatus(result.success ? "succeeded" : "error");
         if (result.success) {
           store.setSourceDocumentId(null);
-          setVerifiedFinish(createVerifiedFinishEvent(result, "execute"));
+          if (mounted.current) setVerifiedFinish(createVerifiedFinishEvent(result, "execute"));
         } else store.setError(result.message);
       } catch (reason) {
+        if (!isOperationCurrent(generation)) return;
         store.setWorkflowStatus("error");
         store.setError(reason instanceof ApiError ? reason.userMessage : "执行失败，请重试。");
       }
     },
-    [store],
+    [isOperationCurrent, startOperation, store],
   );
 
   const prepareIntent = useCallback(
-    async (intent: IntentResult, audit?: { sourceText: string; correctedText: string }) => {
+    async (
+      intent: IntentResult,
+      audit?: { sourceText: string; correctedText: string },
+      generation?: string,
+    ) => {
+      const activeGeneration = generation ?? startOperation();
+      if (!isOperationCurrent(activeGeneration)) return;
       if (intent.intent === "unknown") {
         store.setWorkflowStatus("error");
         store.setError("我还不能确定你想做什么。请换一种说法，并说明是待办、日历还是校园通知。");
@@ -119,10 +180,12 @@ export default function VoicePage() {
           const answer = await api.knowledge.ask(
             slotText(intent.slots.query) ?? intent.source_text,
           );
+          if (!isOperationCurrent(activeGeneration)) return;
           store.setKnowledgeAnswer(answer);
           store.setWorkflowStatus("succeeded");
           store.setSourceDocumentId(null);
         } catch (reason) {
+          if (!isOperationCurrent(activeGeneration)) return;
           store.setWorkflowStatus("error");
           store.setError(reason instanceof ApiError ? reason.userMessage : "校园通知查询失败。");
         }
@@ -131,11 +194,17 @@ export default function VoicePage() {
       if (intent.intent === "query_schedule") {
         store.setWorkflowStatus("executing");
         try {
-          const response = await api.events.list();
-          setScheduleResults(response.items);
+          const requestedDate = slotText(intent.slots.date);
+          const window = requestedDate
+            ? localDayQueryWindow(requestedDate, userSettings.timezone)
+            : null;
+          const response = await api.events.list(window ? { ...window, limit: 8 } : { limit: 8 });
+          if (!isOperationCurrent(activeGeneration)) return;
+          store.setScheduleResults(response.items);
           store.setWorkflowStatus("succeeded");
           store.setSourceDocumentId(null);
         } catch (reason) {
+          if (!isOperationCurrent(activeGeneration)) return;
           store.setWorkflowStatus("error");
           store.setError(reason instanceof ApiError ? reason.userMessage : "日程查询失败。");
         }
@@ -168,10 +237,12 @@ export default function VoicePage() {
           voice_session_id: voiceSessionId ?? undefined,
           transcription_id: transcriptionId ?? undefined,
         });
+        if (!isOperationCurrent(activeGeneration)) return;
         store.setPendingAction(action);
-        if (action.status === "ready") await execute(action);
+        if (action.status === "ready") await execute(action, activeGeneration);
         else store.setWorkflowStatus("idle");
       } catch (reason) {
+        if (!isOperationCurrent(activeGeneration)) return;
         store.setWorkflowStatus("error");
         store.setError(reason instanceof ApiError ? reason.userMessage : "无法准备操作，请重试。");
       }
@@ -179,7 +250,9 @@ export default function VoicePage() {
     [
       asrConfidence,
       execute,
+      isOperationCurrent,
       originalTranscript,
+      startOperation,
       store,
       transcriptionId,
       userSettings,
@@ -188,11 +261,13 @@ export default function VoicePage() {
   );
 
   const analyze = useCallback(
-    async (text = store.transcript) => {
+    async (text = store.transcript, operationId?: string) => {
       if (!text.trim()) return;
-      setVerifiedFinish(null);
+      if (operationId && !isOperationCurrent(operationId)) return;
+      if (mounted.current) setVerifiedFinish(null);
       store.clearResult();
-      setScheduleResults(null);
+      const generation = operationId ?? startOperation();
+      if (operationId) store.setActiveOperationId(operationId);
       store.setTranscript(text.trim());
       store.setWorkflowStatus("analyzing");
       try {
@@ -201,6 +276,7 @@ export default function VoicePage() {
           asrConfidence ?? 1,
           transcriptionId ?? undefined,
         );
+        if (!isOperationCurrent(generation)) return;
         store.setCorrection(correction);
         if (correction.requires_user_input) {
           store.setWorkflowStatus("idle");
@@ -213,28 +289,45 @@ export default function VoicePage() {
           asrConfidence ?? undefined,
           conversationId ?? undefined,
         )) as IntentWithCorrection;
-        setConversationId(parsed.conversation_id ?? conversationId);
+        if (!isOperationCurrent(generation)) return;
+        if (mounted.current) setConversationId(parsed.conversation_id ?? conversationId);
         store.setIntent(parsed);
-        await prepareIntent(parsed, {
-          sourceText: originalTranscript.trim() || correction.original_text,
-          correctedText: correction.corrected_text || text.trim(),
-        });
+        await prepareIntent(
+          parsed,
+          {
+            sourceText: originalTranscript.trim() || correction.original_text,
+            correctedText: correction.corrected_text || text.trim(),
+          },
+          generation,
+        );
       } catch (reason) {
+        if (!isOperationCurrent(generation)) return;
         store.setWorkflowStatus("error");
         store.setError(
           reason instanceof ApiError ? reason.userMessage : "无法理解这条指令，请重试。",
         );
       }
     },
-    [asrConfidence, conversationId, originalTranscript, prepareIntent, store, transcriptionId],
+    [
+      asrConfidence,
+      conversationId,
+      isOperationCurrent,
+      originalTranscript,
+      prepareIntent,
+      startOperation,
+      store,
+      transcriptionId,
+    ],
   );
 
   const selectTarget = async (targetId: string) => {
     const pending = store.pendingAction;
     if (!pending) return;
+    const generation = startOperation();
     store.setWorkflowStatus("preparing");
     try {
       await api.actions.cancel(pending.id);
+      if (!isOperationCurrent(generation)) return;
       const prepared = await api.actions.prepare({
         action: pending.action,
         target_id: targetId,
@@ -247,9 +340,11 @@ export default function VoicePage() {
         voice_session_id: voiceSessionId ?? undefined,
         transcription_id: transcriptionId ?? undefined,
       });
+      if (!isOperationCurrent(generation)) return;
       store.setPendingAction(prepared);
       store.setWorkflowStatus("idle");
     } catch (reason) {
+      if (!isOperationCurrent(generation)) return;
       store.setWorkflowStatus("error");
       store.setError(reason instanceof ApiError ? reason.userMessage : "无法选择目标，请重试。");
     }
@@ -259,14 +354,17 @@ export default function VoicePage() {
     const correction = store.correction;
     const change = correction?.changes[changeIndex];
     if (!correction || !change) return;
+    const generation = startOperation();
     const selected = `${correction.original_text.slice(0, change.start)}${value}${correction.original_text.slice(change.end)}`;
     try {
       await api.correction.decide(correction.record_id, selected, true);
+      if (!isOperationCurrent(generation)) return;
       store.setError(null);
       store.setCorrection(null);
       store.setTranscript(selected);
-      await analyze(selected);
+      await analyze(selected, generation);
     } catch (reason) {
+      if (!isOperationCurrent(generation)) return;
       store.setWorkflowStatus("error");
       store.setError(
         reason instanceof ApiError ? reason.userMessage : "无法保存术语确认结果，请重试。",
@@ -277,13 +375,16 @@ export default function VoicePage() {
   const confirm = async () => {
     const action = store.pendingAction;
     if (!action) return;
+    const generation = startOperation();
     store.setWorkflowStatus("confirming");
     try {
       const updated = await api.actions.confirm(action.id, true);
+      if (!isOperationCurrent(generation)) return;
       store.setPendingAction(updated);
-      if (updated.status === "ready") await execute(updated);
+      if (updated.status === "ready") await execute(updated, generation);
       else store.setWorkflowStatus("idle");
     } catch (reason) {
+      if (!isOperationCurrent(generation)) return;
       store.setWorkflowStatus("error");
       store.setError(reason instanceof ApiError ? reason.userMessage : "确认失败，请重试。");
     }
@@ -292,48 +393,63 @@ export default function VoicePage() {
   const cancel = async () => {
     const action = store.pendingAction;
     if (!action) return;
+    const generation = startOperation();
     setVerifiedFinish(null);
     store.setWorkflowStatus("confirming");
     try {
       await api.actions.cancel(action.id);
+      if (!isOperationCurrent(generation)) return;
       store.setPendingAction(null);
       store.setWorkflowStatus("idle");
       store.setSourceDocumentId(null);
     } catch (reason) {
+      if (!isOperationCurrent(generation)) return;
       store.setWorkflowStatus("error");
       store.setError(reason instanceof ApiError ? reason.userMessage : "取消失败，请重试。");
     }
   };
 
-  const undo = async () => {
-    setVerifiedFinish(null);
-    const actionId = store.lastExecutedActionId ?? store.pendingAction?.id;
-    if (!actionId) {
-      try {
-        const logs = await api.actionLogs.list(10);
-        const latest = logs.items.find(
-          (log) => log.undoable && !log.undone && (log.action_id || log.id),
-        );
-        if (!latest) {
-          store.setError("没有可撤销的最近操作。");
-          return;
-        }
-        const result = await api.actions.undo(latest.action_id ?? latest.id);
-        store.setExecution(result);
-        if (result.success) {
-          store.setLastExecutedActionId(null);
-          setVerifiedFinish(createVerifiedFinishEvent(result, "undo"));
-        }
-      } catch (reason) {
-        store.setError(reason instanceof ApiError ? reason.userMessage : "撤销失败，请重试。");
-      }
+  const undo = async (retryActionId?: string) => {
+    const currentState = useAssistantStore.getState();
+    const currentActionId = currentState.lastExecutedActionId;
+    if (!currentActionId || (retryActionId && retryActionId !== currentActionId)) return;
+    if (
+      undoInFlight.current ||
+      (currentState.workflowStatus === "executing" &&
+        currentState.undoRecoveryActionId === currentActionId)
+    ) {
       return;
     }
-    const result = await api.actions.undo(actionId);
-    store.setExecution(result);
-    if (result.success) {
-      store.setLastExecutedActionId(null);
-      setVerifiedFinish(createVerifiedFinishEvent(result, "undo"));
+
+    const actionId = retryActionId ?? currentActionId;
+    const generation = startOperation();
+    store.setUndoRecoveryActionId(actionId);
+    undoInFlight.current = true;
+    setUndoing(true);
+    setVerifiedFinish(null);
+    store.setError(null);
+    store.setWorkflowStatus("executing");
+    try {
+      const result = await api.actions.undo(actionId);
+      if (!isOperationCurrent(generation)) return;
+      if (useAssistantStore.getState().lastExecutedActionId !== actionId) return;
+      store.setUndoRecoveryActionId(!result.success && result.retryable ? actionId : null);
+      store.setExecution(result);
+      if (result.success) {
+        store.setLastExecutedActionId(null);
+        if (mounted.current) setVerifiedFinish(createVerifiedFinishEvent(result, "undo"));
+      }
+      store.setWorkflowStatus(result.success ? "succeeded" : "error");
+    } catch (reason) {
+      if (!isOperationCurrent(generation)) return;
+      if (useAssistantStore.getState().lastExecutedActionId !== actionId) return;
+      store.setWorkflowStatus("error");
+      store.setError(reason instanceof ApiError ? reason.userMessage : "撤销失败，请重试。");
+    } finally {
+      if (isOperationCurrent(generation)) {
+        undoInFlight.current = false;
+        if (mounted.current) setUndoing(false);
+      }
     }
   };
 
@@ -369,8 +485,9 @@ export default function VoicePage() {
                 type="button"
                 onClick={() => {
                   store.reset();
+                  undoInFlight.current = false;
+                  setUndoing(false);
                   setConversationId(null);
-                  setScheduleResults(null);
                   setVoiceSessionId(null);
                   setTranscriptionId(null);
                   setOriginalTranscript("");
@@ -402,6 +519,8 @@ export default function VoicePage() {
               setAsrConfidence(null);
               setConversationId(null);
               setVerifiedFinish(null);
+              undoInFlight.current = false;
+              setUndoing(false);
               store.reset();
             }}
           />
@@ -461,7 +580,13 @@ export default function VoicePage() {
             <ErrorState
               title="流程暂未完成"
               message={store.error}
-              onRetry={store.transcript ? () => void analyze() : undefined}
+              onRetry={
+                store.undoRecoveryActionId
+                  ? () => void undo(store.undoRecoveryActionId ?? undefined)
+                  : !store.execution && store.transcript
+                    ? () => void analyze()
+                    : undefined
+              }
             />
           ) : null}
         </div>
@@ -556,12 +681,22 @@ export default function VoicePage() {
             <ExecutionResult
               result={store.execution}
               verifiedFinish={verifiedFinish}
+              undoBusy={undoBusy}
               onRetry={
-                store.execution.retryable
-                  ? () => store.pendingAction && void execute(store.pendingAction)
+                store.execution.retryable && store.undoRecoveryActionId
+                  ? () => void undo(store.undoRecoveryActionId ?? undefined)
+                  : store.execution.retryable && store.pendingAction
+                    ? () => {
+                        const action = store.pendingAction;
+                        if (action) void execute(action);
+                      }
+                    : undefined
+              }
+              onUndo={
+                store.execution.success && store.lastExecutedActionId
+                  ? () => void undo()
                   : undefined
               }
-              onUndo={store.execution.success ? () => void undo() : undefined}
             />
           ) : null}
           {store.knowledgeAnswer ? (
@@ -587,12 +722,12 @@ export default function VoicePage() {
               </div>
             </section>
           ) : null}
-          {scheduleResults !== null ? (
+          {store.scheduleResults !== null ? (
             <section className="surface p-5">
               <p className="text-xs font-bold tracking-wider text-teal-600 uppercase">日程查询</p>
-              {scheduleResults.length > 0 ? (
+              {store.scheduleResults.length > 0 ? (
                 <div className="mt-3 space-y-2">
-                  {scheduleResults.slice(0, 8).map((event) => (
+                  {store.scheduleResults.slice(0, 8).map((event) => (
                     <div key={event.id} className="rounded-xl bg-mist-50 p-3">
                       <p className="text-sm font-bold text-ink-800">{event.title}</p>
                       <p className="mt-1 text-xs text-ink-400">

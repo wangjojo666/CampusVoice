@@ -315,6 +315,9 @@ describe("verification presentation", () => {
     await user.click(screen.getByRole("button", { name: "撤销本次操作" }));
     expect(onUndo).toHaveBeenCalledOnce();
 
+    rerender(<ExecutionResult result={success} onUndo={onUndo} undoBusy />);
+    expect(screen.getByRole("button", { name: "正在撤销" })).toBeDisabled();
+
     const onRetry = vi.fn();
     rerender(
       <ExecutionResult

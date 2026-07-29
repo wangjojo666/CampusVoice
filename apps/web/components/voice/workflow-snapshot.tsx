@@ -11,7 +11,7 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import Link from "next/link";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { ExecutionResult } from "@/components/actions/execution-result";
 import { ApiError, api } from "@/lib/api-client";
@@ -39,6 +39,17 @@ function stateTone(ready: boolean) {
 export function WorkflowSnapshot() {
   const store = useAssistantStore();
   const [verifiedFinish, setVerifiedFinish] = useState<VerifiedFinishEvent | null>(null);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  const undoBusy =
+    store.workflowStatus === "executing" &&
+    Boolean(store.undoRecoveryActionId) &&
+    store.undoRecoveryActionId === store.lastExecutedActionId;
   const correctionReady = Boolean(store.correction);
   const intentReady = Boolean(store.intent);
   const confirmationReady = Boolean(store.pendingAction || store.execution?.success);
@@ -52,21 +63,43 @@ export function WorkflowSnapshot() {
     ...(store.pendingAction?.risk_reasons ?? []),
   ];
 
-  const undo = async () => {
-    const actionId = store.lastExecutedActionId;
-    if (!actionId) return;
+  const undo = async (retryActionId?: string) => {
+    const currentState = useAssistantStore.getState();
+    const currentActionId = currentState.lastExecutedActionId;
+    if (!currentActionId || (retryActionId && retryActionId !== currentActionId)) return;
+    if (
+      currentState.workflowStatus === "executing" &&
+      currentState.undoRecoveryActionId === currentActionId
+    ) {
+      return;
+    }
+
+    const actionId = retryActionId ?? currentActionId;
+    const operationId = crypto.randomUUID();
+    currentState.setActiveOperationId(operationId);
+    currentState.setUndoRecoveryActionId(actionId);
     setVerifiedFinish(null);
+    store.setError(null);
     store.setWorkflowStatus("executing");
     try {
       const result = await api.actions.undo(actionId);
+      const latest = useAssistantStore.getState();
+      if (latest.activeOperationId !== operationId || latest.lastExecutedActionId !== actionId) {
+        return;
+      }
+      store.setUndoRecoveryActionId(!result.success && result.retryable ? actionId : null);
       store.setExecution(result);
       if (result.success) {
         store.setLastExecutedActionId(null);
-        setVerifiedFinish(createVerifiedFinishEvent(result, "undo"));
+        if (mounted.current) setVerifiedFinish(createVerifiedFinishEvent(result, "undo"));
       }
       store.setWorkflowStatus(result.success ? "succeeded" : "error");
       if (!result.success) store.setError(result.message);
     } catch (reason) {
+      const latest = useAssistantStore.getState();
+      if (latest.activeOperationId !== operationId || latest.lastExecutedActionId !== actionId) {
+        return;
+      }
       store.setWorkflowStatus("error");
       store.setError(reason instanceof ApiError ? reason.userMessage : "撤销失败，请重试。");
     }
@@ -177,6 +210,12 @@ export function WorkflowSnapshot() {
           <ExecutionResult
             result={store.execution}
             verifiedFinish={verifiedFinish}
+            undoBusy={undoBusy}
+            onRetry={
+              store.execution.retryable && store.undoRecoveryActionId
+                ? () => void undo(store.undoRecoveryActionId ?? undefined)
+                : undefined
+            }
             onUndo={
               store.execution.success && store.lastExecutedActionId ? () => void undo() : undefined
             }

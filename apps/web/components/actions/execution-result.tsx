@@ -27,11 +27,13 @@ export function ExecutionResult({
   result,
   onRetry,
   onUndo,
+  undoBusy = false,
   verifiedFinish,
 }: Readonly<{
   result: VerificationResult;
   onRetry?: () => void;
   onUndo?: () => void;
+  undoBusy?: boolean;
   verifiedFinish?: VerifiedFinishEvent | null;
 }>) {
   const record = result.record ?? null;
@@ -143,8 +145,14 @@ export function ExecutionResult({
             </button>
           ) : null}
           {result.success && onUndo ? (
-            <button type="button" onClick={onUndo} className="btn-secondary">
-              <RotateCcw size={16} /> 撤销本次操作
+            <button
+              type="button"
+              onClick={onUndo}
+              disabled={undoBusy}
+              aria-busy={undoBusy || undefined}
+              className="btn-secondary"
+            >
+              <RotateCcw size={16} /> {undoBusy ? "正在撤销" : "撤销本次操作"}
             </button>
           ) : null}
         </div>

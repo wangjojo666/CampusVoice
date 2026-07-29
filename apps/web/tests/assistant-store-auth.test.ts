@@ -68,6 +68,8 @@ describe("assistant workflow state", () => {
     store.setPendingAction(pendingAction);
     store.setExecution(execution);
     store.setLastExecutedActionId("action-1");
+    store.setActiveOperationId("operation-1");
+    store.setUndoRecoveryActionId("action-1");
     store.setKnowledgeAnswer(knowledgeAnswer);
     store.setSourceDocumentId("document-1");
     store.setError("等待用户确认");
@@ -80,6 +82,8 @@ describe("assistant workflow state", () => {
       pendingAction,
       execution,
       lastExecutedActionId: "action-1",
+      activeOperationId: "operation-1",
+      undoRecoveryActionId: "action-1",
       knowledgeAnswer,
       sourceDocumentId: "document-1",
       error: "等待用户确认",
@@ -92,6 +96,8 @@ describe("assistant workflow state", () => {
     useAssistantStore.getState().setIntent(intent);
     useAssistantStore.getState().setPendingAction(pendingAction);
     useAssistantStore.getState().setWorkflowStatus("error");
+    useAssistantStore.getState().setActiveOperationId("operation-2");
+    useAssistantStore.getState().setUndoRecoveryActionId("action-2");
     useAssistantStore.getState().setError("服务繁忙");
 
     useAssistantStore.getState().clearResult();
@@ -102,6 +108,9 @@ describe("assistant workflow state", () => {
       workflowStatus: "idle",
       intent: null,
       pendingAction: null,
+      activeOperationId: null,
+      undoRecoveryActionId: null,
+      scheduleResults: null,
       error: null,
     });
   });

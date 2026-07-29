@@ -384,6 +384,66 @@ describe("dashboard business states", () => {
     expect(useAssistantStore.getState().lastExecutedActionId).toBeNull();
   });
 
+  it("keeps an in-flight Voice undo disabled after navigating to Home", () => {
+    const store = useAssistantStore.getState();
+    store.setTranscript("创建机器学习考试日程");
+    store.setExecution({
+      success: true,
+      action: "create_event",
+      record_id: "event-verified",
+      verified_fields: { title: true },
+      side_effects: [],
+      message: "日程已写入并复验",
+    });
+    store.setLastExecutedActionId("action-verified");
+    store.setUndoRecoveryActionId("action-verified");
+    store.setActiveOperationId("undo-in-flight");
+    store.setWorkflowStatus("executing");
+
+    render(<HomePage />);
+
+    const busyUndo = screen.getByRole("button", { name: "正在撤销" });
+    expect(busyUndo).toBeDisabled();
+    fireEvent.click(busyUndo);
+    expect(mocks.undoAction).not.toHaveBeenCalled();
+  });
+
+  it("retries a recoverable undo verification failure from Home with the same action id", async () => {
+    mocks.undoAction.mockResolvedValue({
+      success: true,
+      action: "undo_create_event",
+      record_id: "event-verified",
+      verified_fields: { deleted: true },
+      side_effects: [],
+      message: "日程已撤销并复验",
+      retryable: false,
+    });
+    const store = useAssistantStore.getState();
+    store.setTranscript("创建机器学习考试日程");
+    store.setExecution({
+      success: false,
+      action: "undo_create_event",
+      record_id: "event-verified",
+      verified_fields: { deleted: false },
+      side_effects: [],
+      message: "撤销后的数据库复验失败",
+      retryable: true,
+    });
+    store.setLastExecutedActionId("action-verified");
+    store.setUndoRecoveryActionId("action-verified");
+    store.setWorkflowStatus("error");
+
+    render(<HomePage />);
+    fireEvent.click(screen.getByRole("button", { name: "重试一次" }));
+
+    expect(mocks.undoAction).toHaveBeenCalledWith("action-verified");
+    expect(await screen.findByText("日程已撤销并复验")).toBeInTheDocument();
+    expect(useAssistantStore.getState()).toMatchObject({
+      lastExecutedActionId: null,
+      undoRecoveryActionId: null,
+      error: null,
+    });
+  });
   it("shows upcoming work, progressively discloses verification records, and continues voice", async () => {
     const user = userEvent.setup();
     mocks.listTasks.mockResolvedValue({

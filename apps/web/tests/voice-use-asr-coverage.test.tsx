@@ -1,10 +1,19 @@
 import type { AsrServerMessage, AsrTranscriptReference } from "@campusvoice/shared-types";
-import { act, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import type { ReactNode } from "react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import VoicePage from "@/app/voice/page";
 import { useAsr } from "@/hooks/use-asr";
+import { DEFAULT_USER_SETTINGS, setCurrentUserSettings } from "@/lib/user-settings";
 import { useAssistantStore } from "@/stores/assistant-store";
 
 interface RecorderHandlers {
@@ -172,7 +181,31 @@ vi.mock("@/components/actions/confirmation-card", () => ({
 }));
 
 vi.mock("@/components/actions/execution-result", () => ({
-  ExecutionResult: ({ result }: { result: { message: string } }) => <div>{result.message}</div>,
+  ExecutionResult: ({
+    result,
+    onRetry,
+    onUndo,
+    undoBusy,
+  }: {
+    result: { message: string; retryable?: boolean };
+    onRetry?: () => void;
+    onUndo?: () => void;
+    undoBusy?: boolean;
+  }) => (
+    <div>
+      {result.message}
+      {result.retryable && onRetry ? (
+        <button type="button" onClick={onRetry}>
+          重试一次
+        </button>
+      ) : null}
+      {onUndo ? (
+        <button type="button" disabled={undoBusy} onClick={onUndo}>
+          {undoBusy ? "正在撤销" : "撤销本次操作"}
+        </button>
+      ) : null}
+    </div>
+  ),
 }));
 
 vi.mock("@/components/ui/error-state", () => ({
@@ -208,7 +241,13 @@ function resetMock(mock: ReturnType<typeof vi.fn>) {
   mock.mockReset();
 }
 
+afterEach(() => {
+  cleanup();
+  setCurrentUserSettings(DEFAULT_USER_SETTINGS);
+});
+
 beforeEach(() => {
+  setCurrentUserSettings(DEFAULT_USER_SETTINGS);
   useAssistantStore.getState().reset();
   mocks.recorderHandlers = null;
   mocks.clientHandlers = null;
@@ -666,5 +705,469 @@ describe("VoicePage ASR lineage", () => {
       workflowStatus: "idle",
     });
     expect(screen.queryByLabelText("待解析的转写文字")).not.toBeInTheDocument();
+  });
+
+  it("uses the requested local date as the schedule query window", async () => {
+    mocks.previewCorrection.mockResolvedValueOnce({
+      record_id: "correction-schedule-1",
+      original_text: "查询 2026-07-18 日程",
+      corrected_text: "查询 2026-07-18 日程",
+      changes: [],
+      requires_user_input: false,
+    });
+    mocks.parseIntent.mockResolvedValueOnce({
+      intent: "query_schedule",
+      confidence: 0.99,
+      slots: { date: "2026-07-18" },
+      missing_fields: [],
+      ambiguities: [],
+      source_text: "查询 2026-07-18 日程",
+      requires_confirmation: false,
+      conversation_id: "conversation-schedule-1",
+    });
+    mocks.listEvents.mockResolvedValueOnce({ items: [], total: 0 });
+    useAssistantStore.getState().setTranscript("查询 2026-07-18 日程");
+    useAssistantStore.getState().setInputMode("text_demo");
+    render(<VoicePage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "解析并检查" }));
+
+    await waitFor(() =>
+      expect(mocks.listEvents).toHaveBeenCalledWith({
+        start: "2026-07-17T16:00:00.000Z",
+        end: "2026-07-18T16:00:00.000Z",
+        limit: 8,
+      }),
+    );
+    expect(await screen.findByText("当前没有日程记录。")).toBeInTheDocument();
+  });
+
+  it("binds undo only to the current executed action and blocks duplicate requests", async () => {
+    const undoResponse = {
+      success: true,
+      action: "undo_create_task",
+      record_id: "task-current",
+      verified_fields: { deleted: true },
+      side_effects: [],
+      message: "当前操作已撤销并复验",
+    };
+    let resolveUndo!: (value: typeof undoResponse) => void;
+    mocks.undoAction.mockImplementationOnce(
+      () =>
+        new Promise<typeof undoResponse>((resolve) => {
+          resolveUndo = resolve;
+        }),
+    );
+    const store = useAssistantStore.getState();
+    store.setExecution({
+      success: true,
+      action: "create_task",
+      record_id: "task-current",
+      verified_fields: { title: true },
+      side_effects: [],
+      message: "当前操作已写入并复验",
+    });
+    store.setLastExecutedActionId("action-current");
+    store.setWorkflowStatus("succeeded");
+    const view = render(<VoicePage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "撤销本次操作" }));
+    const busyButton = screen.getByRole("button", { name: "正在撤销" });
+    expect(busyButton).toBeDisabled();
+    fireEvent.click(busyButton);
+
+    expect(mocks.undoAction).toHaveBeenCalledTimes(1);
+    expect(mocks.undoAction).toHaveBeenCalledWith("action-current");
+    expect(mocks.listActionLogs).not.toHaveBeenCalled();
+
+    view.unmount();
+    render(<VoicePage />);
+    const remountedBusyButton = screen.getByRole("button", { name: "正在撤销" });
+    expect(remountedBusyButton).toBeDisabled();
+    fireEvent.click(remountedBusyButton);
+    expect(mocks.undoAction).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveUndo(undoResponse);
+      await Promise.resolve();
+    });
+
+    expect(await screen.findByText("当前操作已撤销并复验")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "撤销本次操作" })).not.toBeInTheDocument(),
+    );
+    expect(useAssistantStore.getState().lastExecutedActionId).toBeNull();
+  });
+  it("retries a failed undo with the same current action id", async () => {
+    const failedUndo = {
+      success: false,
+      action: "undo_create_task",
+      record_id: "task-current",
+      verified_fields: { deleted: false },
+      side_effects: [],
+      message: "撤销后的数据库复验失败",
+      retryable: true,
+    };
+    const successfulUndo = {
+      ...failedUndo,
+      success: true,
+      verified_fields: { deleted: true },
+      message: "当前操作已撤销并复验",
+      retryable: false,
+    };
+    mocks.undoAction.mockResolvedValueOnce(failedUndo).mockResolvedValueOnce(successfulUndo);
+    const store = useAssistantStore.getState();
+    store.setExecution({
+      success: true,
+      action: "create_task",
+      record_id: "task-current",
+      verified_fields: { title: true },
+      side_effects: [],
+      message: "当前操作已写入并复验",
+    });
+    store.setLastExecutedActionId("action-current");
+    store.setWorkflowStatus("succeeded");
+    const view = render(<VoicePage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "撤销本次操作" }));
+
+    expect(await screen.findByText("撤销后的数据库复验失败")).toBeInTheDocument();
+    view.unmount();
+    render(<VoicePage />);
+    expect(screen.getByText("撤销后的数据库复验失败")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重试一次" }));
+
+    await waitFor(() => expect(mocks.undoAction).toHaveBeenCalledTimes(2));
+    expect(mocks.undoAction).toHaveBeenNthCalledWith(1, "action-current");
+    expect(mocks.undoAction).toHaveBeenNthCalledWith(2, "action-current");
+    expect(await screen.findByText("当前操作已撤销并复验")).toBeInTheDocument();
+    expect(useAssistantStore.getState().lastExecutedActionId).toBeNull();
+  });
+  it("rejects invalid calendar dates without querying another day", async () => {
+    mocks.previewCorrection.mockResolvedValueOnce({
+      record_id: "correction-invalid-date",
+      original_text: "查询 2026-02-30 日程",
+      corrected_text: "查询 2026-02-30 日程",
+      changes: [],
+      requires_user_input: false,
+    });
+    mocks.parseIntent.mockResolvedValueOnce({
+      intent: "query_schedule",
+      confidence: 0.99,
+      slots: { date: "2026-02-30" },
+      missing_fields: [],
+      ambiguities: [],
+      source_text: "查询 2026-02-30 日程",
+      requires_confirmation: false,
+      conversation_id: "conversation-invalid-date",
+    });
+    useAssistantStore.getState().setTranscript("查询 2026-02-30 日程");
+    render(<VoicePage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "解析并检查" }));
+
+    expect(await screen.findByText("日程查询失败。")).toBeInTheDocument();
+    expect(mocks.listEvents).not.toHaveBeenCalled();
+    expect(useAssistantStore.getState().scheduleResults).toBeNull();
+  });
+
+  it("does not refill a reset workflow from a stale schedule response", async () => {
+    mocks.previewCorrection.mockResolvedValueOnce({
+      record_id: "correction-stale-schedule",
+      original_text: "查询 2026-07-18 日程",
+      corrected_text: "查询 2026-07-18 日程",
+      changes: [],
+      requires_user_input: false,
+    });
+    mocks.parseIntent.mockResolvedValueOnce({
+      intent: "query_schedule",
+      confidence: 0.99,
+      slots: { date: "2026-07-18" },
+      missing_fields: [],
+      ambiguities: [],
+      source_text: "查询 2026-07-18 日程",
+      requires_confirmation: false,
+      conversation_id: "conversation-stale-schedule",
+    });
+    let resolveEvents!: (value: { items: []; total: number }) => void;
+    mocks.listEvents.mockImplementationOnce(
+      () =>
+        new Promise<{ items: []; total: number }>((resolve) => {
+          resolveEvents = resolve;
+        }),
+    );
+    const store = useAssistantStore.getState();
+    store.setTranscript("查询 2026-07-18 日程");
+    store.setInputMode("text_demo");
+    render(<VoicePage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "解析并检查" }));
+    await waitFor(() => expect(mocks.listEvents).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("button", { name: "新指令" }));
+
+    await act(async () => {
+      resolveEvents({ items: [], total: 0 });
+      await Promise.resolve();
+    });
+
+    expect(useAssistantStore.getState()).toMatchObject({
+      transcript: "",
+      workflowStatus: "idle",
+      activeOperationId: null,
+      scheduleResults: null,
+    });
+    expect(screen.queryByText("当前没有日程记录。")).not.toBeInTheDocument();
+  });
+
+  it("does not let a stale undo response overwrite a reset workflow or newer action", async () => {
+    const staleUndo = {
+      success: true,
+      action: "undo_create_task",
+      record_id: "task-old",
+      verified_fields: { deleted: true },
+      side_effects: [],
+      message: "旧操作已撤销",
+    };
+    let resolveUndo!: (value: typeof staleUndo) => void;
+    mocks.undoAction.mockImplementationOnce(
+      () =>
+        new Promise<typeof staleUndo>((resolve) => {
+          resolveUndo = resolve;
+        }),
+    );
+    const store = useAssistantStore.getState();
+    store.setExecution({
+      success: true,
+      action: "create_task",
+      record_id: "task-old",
+      verified_fields: { title: true },
+      side_effects: [],
+      message: "旧操作已写入",
+    });
+    store.setLastExecutedActionId("action-old");
+    store.setWorkflowStatus("succeeded");
+    render(<VoicePage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "撤销本次操作" }));
+    fireEvent.click(screen.getByRole("button", { name: "重置录音" }));
+    act(() => {
+      const current = useAssistantStore.getState();
+      current.setActiveOperationId("operation-new");
+      current.setExecution({
+        success: true,
+        action: "create_task",
+        record_id: "task-new",
+        verified_fields: { title: true },
+        side_effects: [],
+        message: "新操作已写入",
+      });
+      current.setLastExecutedActionId("action-new");
+      current.setWorkflowStatus("succeeded");
+    });
+
+    await act(async () => {
+      resolveUndo(staleUndo);
+      await Promise.resolve();
+    });
+
+    expect(useAssistantStore.getState()).toMatchObject({
+      activeOperationId: "operation-new",
+      lastExecutedActionId: "action-new",
+      execution: expect.objectContaining({ record_id: "task-new", message: "新操作已写入" }),
+      undoRecoveryActionId: null,
+    });
+    expect(screen.queryByText("旧操作已撤销")).not.toBeInTheDocument();
+  });
+
+  it("keeps a transport-failed undo recoverable after unmount and remount", async () => {
+    const successfulUndo = {
+      success: true,
+      action: "undo_create_task",
+      record_id: "task-current",
+      verified_fields: { deleted: true },
+      side_effects: [],
+      message: "当前操作已撤销并复验",
+      retryable: false,
+    };
+    mocks.undoAction.mockRejectedValueOnce(new Error("network unavailable"));
+    mocks.undoAction.mockResolvedValueOnce(successfulUndo);
+    const store = useAssistantStore.getState();
+    store.setTranscript("创建当前待办");
+    store.setExecution({
+      success: true,
+      action: "create_task",
+      record_id: "task-current",
+      verified_fields: { title: true },
+      side_effects: [],
+      message: "当前操作已写入并复验",
+    });
+    store.setLastExecutedActionId("action-current");
+    store.setWorkflowStatus("succeeded");
+    const view = render(<VoicePage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "撤销本次操作" }));
+    expect(await screen.findByText("撤销失败，请重试。")).toBeInTheDocument();
+    expect(useAssistantStore.getState().undoRecoveryActionId).toBe("action-current");
+
+    view.unmount();
+    render(<VoicePage />);
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+
+    await waitFor(() => expect(mocks.undoAction).toHaveBeenCalledTimes(2));
+    expect(mocks.undoAction).toHaveBeenNthCalledWith(1, "action-current");
+    expect(mocks.undoAction).toHaveBeenNthCalledWith(2, "action-current");
+    expect(mocks.previewCorrection).not.toHaveBeenCalled();
+    expect(await screen.findByText("当前操作已撤销并复验")).toBeInTheDocument();
+    expect(useAssistantStore.getState()).toMatchObject({
+      lastExecutedActionId: null,
+      undoRecoveryActionId: null,
+      error: null,
+    });
+  });
+  it("rejects a civil date that does not exist in the user's timezone", async () => {
+    setCurrentUserSettings({ ...DEFAULT_USER_SETTINGS, timezone: "Pacific/Apia" });
+    mocks.previewCorrection.mockResolvedValueOnce({
+      record_id: "correction-missing-day",
+      original_text: "查询 2011-12-30 日程",
+      corrected_text: "查询 2011-12-30 日程",
+      changes: [],
+      requires_user_input: false,
+    });
+    mocks.parseIntent.mockResolvedValueOnce({
+      intent: "query_schedule",
+      confidence: 0.99,
+      slots: { date: "2011-12-30" },
+      missing_fields: [],
+      ambiguities: [],
+      source_text: "查询 2011-12-30 日程",
+      requires_confirmation: false,
+      conversation_id: "conversation-missing-day",
+    });
+    useAssistantStore.getState().setTranscript("查询 2011-12-30 日程");
+    render(<VoicePage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "解析并检查" }));
+
+    expect(await screen.findByText("日程查询失败。")).toBeInTheDocument();
+    expect(mocks.listEvents).not.toHaveBeenCalled();
+  });
+
+  it("finishes a schedule query in the shared store after unmount and remount", async () => {
+    mocks.previewCorrection.mockResolvedValueOnce({
+      record_id: "correction-remount-schedule",
+      original_text: "查询 2026-07-18 日程",
+      corrected_text: "查询 2026-07-18 日程",
+      changes: [],
+      requires_user_input: false,
+    });
+    mocks.parseIntent.mockResolvedValueOnce({
+      intent: "query_schedule",
+      confidence: 0.99,
+      slots: { date: "2026-07-18" },
+      missing_fields: [],
+      ambiguities: [],
+      source_text: "查询 2026-07-18 日程",
+      requires_confirmation: false,
+      conversation_id: "conversation-remount-schedule",
+    });
+    let resolveEvents!: (value: { items: []; total: number }) => void;
+    mocks.listEvents.mockImplementationOnce(
+      () =>
+        new Promise<{ items: []; total: number }>((resolve) => {
+          resolveEvents = resolve;
+        }),
+    );
+    const store = useAssistantStore.getState();
+    store.setTranscript("查询 2026-07-18 日程");
+    const view = render(<VoicePage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "解析并检查" }));
+    await waitFor(() => expect(mocks.listEvents).toHaveBeenCalledOnce());
+    view.unmount();
+    render(<VoicePage />);
+    expect(useAssistantStore.getState().workflowStatus).toBe("executing");
+
+    await act(async () => {
+      resolveEvents({ items: [], total: 0 });
+      await Promise.resolve();
+    });
+
+    expect(await screen.findByText("当前没有日程记录。")).toBeInTheDocument();
+    expect(useAssistantStore.getState()).toMatchObject({
+      workflowStatus: "succeeded",
+      scheduleResults: [],
+    });
+  });
+
+  it("does not offer analyze as a retry for a non-retryable undo failure", () => {
+    const store = useAssistantStore.getState();
+    store.setTranscript("创建当前待办");
+    store.setExecution({
+      success: false,
+      action: "undo_create_task",
+      record_id: "task-current",
+      verified_fields: { deleted: false },
+      side_effects: [],
+      message: "当前撤销无法安全重试",
+      retryable: false,
+    });
+    store.setLastExecutedActionId("action-current");
+    store.setError("当前撤销无法安全重试");
+    store.setWorkflowStatus("error");
+
+    render(<VoicePage />);
+
+    expect(screen.getByRole("alert")).toHaveTextContent("当前撤销无法安全重试");
+    expect(screen.queryByRole("button", { name: "重试" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "重试一次" })).not.toBeInTheDocument();
+    expect(mocks.previewCorrection).not.toHaveBeenCalled();
+  });
+  it("clears a failed execution error when its exact pending action retry succeeds", async () => {
+    mocks.executeAction.mockResolvedValueOnce({
+      success: true,
+      action: "create_task",
+      record_id: "task-current",
+      verified_fields: { title: true },
+      side_effects: [],
+      message: "当前操作已写入并复验",
+      retryable: false,
+    });
+    const store = useAssistantStore.getState();
+    store.setTranscript("创建当前待办");
+    store.setPendingAction({
+      id: "action-current",
+      action: "create_task",
+      risk_level: "medium",
+      risk_reasons: ["writes_data"],
+      payload: { title: "当前待办" },
+      status: "ready",
+      confirmation_count: 1,
+      confirmations_required: 1,
+    });
+    store.setExecution({
+      success: false,
+      action: "create_task",
+      record_id: "task-current",
+      verified_fields: { title: false },
+      side_effects: [],
+      message: "首次数据库复验失败",
+      retryable: true,
+    });
+    store.setError("首次数据库复验失败");
+    store.setWorkflowStatus("error");
+    render(<VoicePage />);
+
+    expect(screen.getByRole("alert")).toHaveTextContent("首次数据库复验失败");
+    fireEvent.click(screen.getByRole("button", { name: "重试一次" }));
+
+    expect(mocks.executeAction).toHaveBeenCalledWith("action-current");
+    expect(await screen.findByText("当前操作已写入并复验")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(useAssistantStore.getState()).toMatchObject({
+      workflowStatus: "succeeded",
+      pendingAction: null,
+      lastExecutedActionId: "action-current",
+      error: null,
+    });
   });
 });
