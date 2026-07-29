@@ -73,7 +73,18 @@ class SqlAlchemyKnowledgeRepository:
                 session.add(entity)
                 session.add_all(chunk_entities)
         except IntegrityError as exc:
-            raise DuplicateDocumentError("document content already exists for this user") from exc
+            async with self._session_factory() as conflict_session:
+                duplicate = await conflict_session.scalar(
+                    select(Document.id).where(
+                        Document.user_id == self._user_id,
+                        Document.content_sha256 == document.content_sha256,
+                    )
+                )
+            if duplicate is not None:
+                raise DuplicateDocumentError(
+                    "document content already exists for this user"
+                ) from exc
+            raise KnowledgePersistenceError("document write failed") from exc
 
         # A new session proves the committed state rather than trusting ORM in-memory objects.
         async with self._session_factory() as verification_session:
@@ -100,12 +111,8 @@ class SqlAlchemyKnowledgeRepository:
 
     async def list_documents(self) -> list[DocumentRecord]:
         async with self._session_factory() as session:
-            entities = await self._documents.list(session, self._user_id)
-            records: list[DocumentRecord] = []
-            for entity in entities:
-                chunks = await self._documents.chunks(session, self._user_id, entity.id)
-                records.append(self._to_record(entity, len(chunks)))
-            return records
+            rows = await self._documents.list_with_chunk_counts(session, self._user_id)
+            return [self._to_record(entity, chunk_count) for entity, chunk_count in rows]
 
     async def list_chunks(self) -> list[DocumentChunk]:
         async with self._session_factory() as session:

@@ -1,22 +1,46 @@
 import io
 from collections.abc import Sequence
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pytest
 from docx import Document as DocxDocument
+from sqlalchemy import event
 
 from app.db.base import Base
 from app.db.session import create_database_engine, create_session_factory
 from app.models.entities import User
-from app.schemas.knowledge import DocumentFileType, DocumentMetadata, KnowledgeCitation
+from app.schemas.knowledge import (
+    DocumentChunk,
+    DocumentFileType,
+    DocumentMetadata,
+    DocumentRecord,
+    KnowledgeCitation,
+)
 from app.services.knowledge import (
     DuplicateDocumentError,
     GroundedAnswer,
     InMemoryKnowledgeRepository,
+    KnowledgePersistenceError,
     KnowledgeService,
     SqlAlchemyKnowledgeRepository,
 )
 from app.services.knowledge import parser as document_parser
+
+
+def test_document_title_is_normalized_before_length_validation() -> None:
+    normalized_title = "x" * 500
+
+    metadata = DocumentMetadata(
+        title=f"  {normalized_title}  ",
+        file_type=DocumentFileType.TXT,
+    )
+
+    assert metadata.title == normalized_title
+    with pytest.raises(ValueError):
+        DocumentMetadata(
+            title=f"  {normalized_title}x  ",
+            file_type=DocumentFileType.TXT,
+        )
 
 
 @pytest.mark.asyncio
@@ -249,4 +273,92 @@ async def test_sqlalchemy_repository_is_user_scoped_and_rejects_duplicate_conten
             metadata=metadata,
             content="暑假7月20日开始".encode(),
         )
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_nonduplicate_chunk_integrity_error_is_not_reported_as_duplicate() -> None:
+    engine = create_database_engine("sqlite+aiosqlite:///:memory:")
+    factory = create_session_factory(engine)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    async with factory() as session, session.begin():
+        session.add(User(id="user_demo", display_name="Demo"))
+
+    repository = SqlAlchemyKnowledgeRepository(factory, "user_demo")
+    record = DocumentRecord(
+        id="doc_nonduplicate_integrity",
+        user_id="user_demo",
+        metadata=DocumentMetadata(
+            title="Nonduplicate integrity failure",
+            file_type=DocumentFileType.TXT,
+        ),
+        content_sha256="a" * 64,
+        status="ready",
+        chunk_count=2,
+        created_at=datetime.now(UTC),
+    )
+    chunks = [
+        DocumentChunk(
+            id="chunk_nonduplicate_integrity_1",
+            document_id=record.id,
+            ordinal=0,
+            content="first",
+        ),
+        DocumentChunk(
+            id="chunk_nonduplicate_integrity_2",
+            document_id=record.id,
+            ordinal=0,
+            content="second",
+        ),
+    ]
+
+    with pytest.raises(KnowledgePersistenceError, match="document write failed"):
+        await repository.save(record, chunks)
+    assert await repository.list_documents() == []
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_document_list_uses_one_query_for_all_chunk_counts() -> None:
+    engine = create_database_engine("sqlite+aiosqlite:///:memory:")
+    factory = create_session_factory(engine)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    async with factory() as session, session.begin():
+        session.add(User(id="user_demo", display_name="Demo"))
+
+    service = KnowledgeService(SqlAlchemyKnowledgeRepository(factory, "user_demo"))
+    for index in range(3):
+        await service.ingest(
+            user_id="user_demo",
+            metadata=DocumentMetadata(
+                title=f"Document {index}",
+                file_type=DocumentFileType.TXT,
+            ),
+            content=f"document body {index}".encode(),
+        )
+
+    select_statements: list[str] = []
+
+    def count_selects(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: object,
+    ) -> None:
+        if statement.lstrip().upper().startswith("SELECT"):
+            select_statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count_selects)
+    try:
+        documents = await service.list_documents()
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count_selects)
+
+    assert len(documents) == 3
+    assert [document.chunk_count for document in documents] == [1, 1, 1]
+    assert len(select_statements) == 1
     await engine.dispose()

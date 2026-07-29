@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
 
 class _StrictModel(BaseModel):
@@ -23,6 +23,16 @@ class DocumentMetadata(_StrictModel):
     source_url: HttpUrl | None = None
     version: str | None = Field(default=None, max_length=100)
     file_type: DocumentFileType
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def title_must_not_be_blank(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("title must not be blank")
+        return normalized
 
 
 class DocumentRecord(_StrictModel):
