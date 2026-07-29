@@ -22,7 +22,7 @@ import {
   Volume2,
   WandSparkles,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { PageHeader } from "@/components/layout/page-header";
 import { EmptyState } from "@/components/ui/empty-state";
@@ -50,6 +50,11 @@ const categoryLabel = {
 
 export default function SettingsPage() {
   const [settings, setSettings] = useState<UserSettings>(blankSettings);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const loadGeneration = useRef(0);
+  const loadInFlight = useRef(false);
+  const settingsWriteInFlight = useRef(false);
+  const settingsEditGeneration = useRef(0);
   const [hotwords, setHotwords] = useState<Hotword[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -69,37 +74,60 @@ export default function SettingsPage() {
   } | null>(null);
 
   const load = useCallback(async () => {
+    if (loadInFlight.current || settingsWriteInFlight.current) return;
+    loadInFlight.current = true;
+    const generation = ++loadGeneration.current;
     setLoading(true);
-    const [settingsResult, hotwordsResult] = await Promise.allSettled([
-      api.settings.get(),
-      api.hotwords.list(),
-    ]);
-    const failures: string[] = [];
-    if (settingsResult.status === "fulfilled") {
-      setSettings(settingsResult.value);
-      setCurrentUserSettings(settingsResult.value);
-    } else
-      failures.push(
-        settingsResult.reason instanceof ApiError
-          ? settingsResult.reason.userMessage
-          : "设置加载失败",
-      );
-    if (hotwordsResult.status === "fulfilled") setHotwords(hotwordsResult.value.items);
-    else
-      failures.push(
-        hotwordsResult.reason instanceof ApiError
-          ? hotwordsResult.reason.userMessage
-          : "热词加载失败",
-      );
-    setError(failures.length ? [...new Set(failures)].join(" ") : null);
-    setLoading(false);
+    setSettingsLoaded(false);
+    setError(null);
+    try {
+      const [settingsResult, hotwordsResult] = await Promise.allSettled([
+        api.settings.get(),
+        api.hotwords.list(),
+      ]);
+      if (generation !== loadGeneration.current) return;
+      const failures: string[] = [];
+      if (settingsResult.status === "fulfilled") {
+        settingsEditGeneration.current = 0;
+        setSettings(settingsResult.value);
+        setCurrentUserSettings(settingsResult.value);
+        setSettingsLoaded(true);
+      } else
+        failures.push(
+          settingsResult.reason instanceof ApiError
+            ? settingsResult.reason.userMessage
+            : "设置加载失败",
+        );
+      if (hotwordsResult.status === "fulfilled") setHotwords(hotwordsResult.value.items);
+      else
+        failures.push(
+          hotwordsResult.reason instanceof ApiError
+            ? hotwordsResult.reason.userMessage
+            : "热词加载失败",
+        );
+      setError(failures.length ? [...new Set(failures)].join(" ") : null);
+    } finally {
+      if (generation === loadGeneration.current) {
+        loadInFlight.current = false;
+        setLoading(false);
+      }
+    }
   }, []);
   useEffect(() => {
     const timer = window.setTimeout(() => void load(), 0);
     return () => window.clearTimeout(timer);
   }, [load]);
 
+  const editSettings = useCallback((update: (current: UserSettings) => UserSettings) => {
+    settingsEditGeneration.current += 1;
+    setSettings(update);
+  }, []);
+
   const saveSettings = async () => {
+    if (!settingsLoaded || loadInFlight.current || settingsWriteInFlight.current) return;
+    settingsWriteInFlight.current = true;
+    loadGeneration.current += 1;
+    const submittedEditGeneration = settingsEditGeneration.current;
     setBusy(true);
     setError(null);
     setNotice(null);
@@ -113,12 +141,21 @@ export default function SettingsPage() {
         timezone: settings.timezone,
       };
       const saved = await api.settings.update(update);
-      setSettings(saved);
+      const hasNewerDraft = settingsEditGeneration.current !== submittedEditGeneration;
+      if (!hasNewerDraft) {
+        settingsEditGeneration.current = 0;
+        setSettings(saved);
+      }
       setCurrentUserSettings(saved);
-      setNotice("设置已保存，后续日期解析、显示和新建日程会使用最新配置。");
+      setNotice(
+        hasNewerDraft
+          ? "设置已保存；保存期间的新修改仍保留在当前草稿中，请再次保存。"
+          : "设置已保存，后续日期解析、显示和新建日程会使用最新配置。",
+      );
     } catch (reason) {
       setError(reason instanceof ApiError ? reason.userMessage : "设置保存失败。");
     } finally {
+      settingsWriteInFlight.current = false;
       setBusy(false);
     }
   };
@@ -218,7 +255,7 @@ export default function SettingsPage() {
   const addCourse = () => {
     const value = courseInput.trim();
     if (!value || settings.current_courses.some((course) => course.name === value)) return;
-    setSettings((current) => ({
+    editSettings((current) => ({
       ...current,
       current_courses: [...current.current_courses, { name: value }],
     }));
@@ -227,7 +264,7 @@ export default function SettingsPage() {
   const addTeacher = () => {
     const value = teacherInput.trim();
     if (!value || settings.teacher_names.includes(value)) return;
-    setSettings((current) => ({
+    editSettings((current) => ({
       ...current,
       teacher_names: [...current.teacher_names, value],
     }));
@@ -247,7 +284,7 @@ export default function SettingsPage() {
     }
   };
   const applySyntheticPreset = () => {
-    setSettings((current) => ({
+    editSettings((current) => ({
       ...current,
       major: "人工智能",
       grade: "2024 级",
@@ -273,7 +310,7 @@ export default function SettingsPage() {
         actions={
           <button
             type="button"
-            disabled={busy || loading}
+            disabled={busy || loading || !settingsLoaded}
             onClick={() => void saveSettings()}
             className="btn-primary"
           >
@@ -284,7 +321,11 @@ export default function SettingsPage() {
       />
       {error ? (
         <div className="mb-5">
-          <ErrorState message={error} onRetry={() => void load()} compact />
+          <ErrorState
+            message={error}
+            onRetry={!settingsLoaded && !loading && !busy ? () => void load() : undefined}
+            compact
+          />
         </div>
       ) : null}
       {notice ? (
@@ -298,7 +339,7 @@ export default function SettingsPage() {
       ) : null}
       {loading ? (
         <LoadingState rows={6} />
-      ) : (
+      ) : !settingsLoaded ? null : (
         <>
           <section className="surface mb-6 overflow-hidden" aria-labelledby="settings-impact-title">
             <div className="border-b border-mist-100 p-5 sm:p-6">
@@ -453,7 +494,9 @@ export default function SettingsPage() {
                     <span className="mb-1.5 block text-sm font-bold text-ink-700">专业</span>
                     <input
                       value={settings.major ?? ""}
-                      onChange={(input) => setSettings({ ...settings, major: input.target.value })}
+                      onChange={(input) =>
+                        editSettings((current) => ({ ...current, major: input.target.value }))
+                      }
                       className="field"
                       placeholder="例如：人工智能"
                     />
@@ -462,7 +505,9 @@ export default function SettingsPage() {
                     <span className="mb-1.5 block text-sm font-bold text-ink-700">年级</span>
                     <input
                       value={settings.grade ?? ""}
-                      onChange={(input) => setSettings({ ...settings, grade: input.target.value })}
+                      onChange={(input) =>
+                        editSettings((current) => ({ ...current, grade: input.target.value }))
+                      }
                       className="field"
                       placeholder="例如：2024 级"
                     />
@@ -506,7 +551,7 @@ export default function SettingsPage() {
                             type="button"
                             aria-label={`移除课程${label}`}
                             onClick={() =>
-                              setSettings((current) => ({
+                              editSettings((current) => ({
                                 ...current,
                                 current_courses: current.current_courses.filter(
                                   (_, courseIndex) => courseIndex !== index,
@@ -558,7 +603,7 @@ export default function SettingsPage() {
                           type="button"
                           aria-label={`移除教师${teacher}`}
                           onClick={() =>
-                            setSettings((current) => ({
+                            editSettings((current) => ({
                               ...current,
                               teacher_names: current.teacher_names.filter(
                                 (item) => item !== teacher,
@@ -594,7 +639,10 @@ export default function SettingsPage() {
                     <select
                       value={settings.timezone}
                       onChange={(input) =>
-                        setSettings({ ...settings, timezone: input.target.value })
+                        editSettings((current) => ({
+                          ...current,
+                          timezone: input.target.value,
+                        }))
                       }
                       className="field"
                     >
@@ -607,10 +655,10 @@ export default function SettingsPage() {
                     <select
                       value={settings.default_reminder_minutes}
                       onChange={(input) =>
-                        setSettings({
-                          ...settings,
+                        editSettings((current) => ({
+                          ...current,
                           default_reminder_minutes: Number(input.target.value),
-                        })
+                        }))
                       }
                       className="field"
                     >
