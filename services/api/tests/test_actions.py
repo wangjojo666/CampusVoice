@@ -1,10 +1,11 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
+from sqlalchemy.dialects import postgresql
 
 from app.models.entities import ActionLog, PendingAction, Task, UndoRecord
 from app.models.enums import PendingActionState
@@ -1279,3 +1280,70 @@ def test_expired_undo_window_is_durably_rejected(client: TestClient) -> None:
     unavailable = client.post(f"/api/actions/{action_id}/undo")
     assert unavailable.status_code == 409
     assert unavailable.json()["error"]["code"] == "undo_unavailable"
+
+
+def test_task_repository_get_for_update_compiles_postgresql_row_lock() -> None:
+    async def compile_statement() -> str:
+        session = AsyncMock()
+        session.scalar.return_value = None
+
+        await TaskRepository().get_for_update(session, "user_demo", "task-id")
+
+        assert session.scalar.await_count == 1
+        assert session.scalar.await_args is not None
+        statement = session.scalar.await_args.args[0]
+        return str(statement.compile(dialect=postgresql.dialect()))
+
+    sql = asyncio.run(compile_statement())
+    where_clause = sql.split("WHERE", maxsplit=1)[1].split("FOR UPDATE", maxsplit=1)[0]
+
+    assert "FROM tasks" in sql
+    assert "tasks.id =" in where_clause
+    assert "tasks.user_id =" in where_clause
+    assert "FOR UPDATE" in sql
+
+
+def test_actions_prepared_from_same_task_version_reject_stale_second_write(
+    client: TestClient,
+) -> None:
+    task_id = confirmed_write(
+        client,
+        "POST",
+        "/api/tasks",
+        {"title": "Versioned target", "priority": "low"},
+    ).json()["record_id"]
+    prepared = [
+        client.post(
+            "/api/actions/prepare",
+            json={
+                "action": "update_task",
+                "target_id": task_id,
+                "payload": payload,
+            },
+        ).json()
+        for payload in (
+            {"title": "First accepted title"},
+            {"priority": "high"},
+        )
+    ]
+    assert [item["payload"]["expected_version"] for item in prepared] == [1, 1]
+    for item in prepared:
+        confirm_action(client, item["id"])
+
+    winner = client.post(f"/api/actions/{prepared[0]['id']}/execute")
+    stale = client.post(f"/api/actions/{prepared[1]['id']}/execute")
+
+    assert winner.status_code == 200
+    assert winner.json()["success"] is True
+    assert winner.json()["action_id"] == prepared[0]["id"]
+    assert winner.json()["record_id"] == task_id
+    assert stale.status_code == 409
+    assert stale.json()["error"]["code"] == "version_conflict"
+    current = client.get("/api/tasks").json()["items"][0]
+    assert (current["title"], current["priority"], current["version"]) == (
+        "First accepted title",
+        "low",
+        2,
+    )
+    assert client.get(f"/api/actions/{prepared[0]['id']}").json()["state"] == "executed"
+    assert client.get(f"/api/actions/{prepared[1]['id']}").json()["state"] == "ready"
