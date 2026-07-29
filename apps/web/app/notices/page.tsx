@@ -9,7 +9,7 @@ import type {
 } from "@campusvoice/shared-types";
 import { AlertTriangle, Check, FileSearch, FileText, Search, Upload } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { PageHeader } from "@/components/layout/page-header";
 import { EvidenceCard } from "@/components/notices/evidence-card";
@@ -40,6 +40,8 @@ export default function NoticesPage() {
   const [mode, setMode] = useState<"ask" | "search">("ask");
   const [loading, setLoading] = useState(true);
   const [searching, setSearching] = useState(false);
+  const [hasSearched, setHasSearched] = useState(false);
+  const searchGeneration = useRef(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -64,34 +66,53 @@ export default function NoticesPage() {
 
   const search = async () => {
     if (!query.trim()) return;
+    const generation = ++searchGeneration.current;
+    const submittedMode = mode;
     setSearching(true);
     setError(null);
     setAnswer(null);
     setEvidence([]);
     setVersionConflicts([]);
     setApplicabilityConflicts([]);
+    setHasSearched(false);
     try {
       const filters = {
         version: version.trim() || undefined,
         applicable_group: applicableGroup.trim() || undefined,
       };
-      if (mode === "ask") {
+      if (submittedMode === "ask") {
         const response = await api.knowledge.ask(query.trim(), filters);
+        if (generation !== searchGeneration.current) return;
         setAnswer(response);
         setEvidence(response.evidence);
         setVersionConflicts(response.version_conflicts ?? []);
         setApplicabilityConflicts(response.applicability_conflicts ?? []);
       } else {
         const response = await api.knowledge.search(query.trim(), 8, filters);
+        if (generation !== searchGeneration.current) return;
         setEvidence(response.evidence);
         setVersionConflicts(response.version_conflicts);
         setApplicabilityConflicts(response.applicability_conflicts);
       }
+      setHasSearched(true);
     } catch (reason) {
+      if (generation !== searchGeneration.current) return;
       setError(reason instanceof ApiError ? reason.userMessage : "检索失败，请重试。");
     } finally {
-      setSearching(false);
+      if (generation === searchGeneration.current) setSearching(false);
     }
+  };
+
+  const changeMode = (nextMode: "ask" | "search") => {
+    if (nextMode === mode) return;
+    searchGeneration.current += 1;
+    setMode(nextMode);
+    setSearching(false);
+    setHasSearched(false);
+    setAnswer(null);
+    setEvidence([]);
+    setVersionConflicts([]);
+    setApplicabilityConflicts([]);
   };
 
   const upload = async (file: File, metadata: Parameters<typeof api.documents.upload>[1]) => {
@@ -162,7 +183,7 @@ export default function NoticesPage() {
                 type="button"
                 role="tab"
                 aria-selected={mode === "ask"}
-                onClick={() => setMode("ask")}
+                onClick={() => changeMode("ask")}
                 className={`rounded-lg px-3 py-2 text-xs font-bold ${mode === "ask" ? "bg-white text-teal-700 shadow-sm" : "text-ink-500"}`}
               >
                 证据问答
@@ -171,7 +192,7 @@ export default function NoticesPage() {
                 type="button"
                 role="tab"
                 aria-selected={mode === "search"}
-                onClick={() => setMode("search")}
+                onClick={() => changeMode("search")}
                 className={`rounded-lg px-3 py-2 text-xs font-bold ${mode === "search" ? "bg-white text-teal-700 shadow-sm" : "text-ink-500"}`}
               >
                 原文检索
@@ -240,7 +261,7 @@ export default function NoticesPage() {
         </form>
       </section>
 
-      {answer || evidence.length > 0 || searching ? (
+      {answer || evidence.length > 0 || searching || hasSearched ? (
         <section className="mb-6">
           <h2 className="mb-3 text-lg font-extrabold text-ink-950">检索结果</h2>
           {searching ? (
@@ -307,10 +328,12 @@ export default function NoticesPage() {
                 ))}
               </div>
               {!answer && evidence.length === 0 ? (
-                <EmptyState
-                  title="没有找到相关原文"
-                  description="请尝试更具体的课程、部门或日期关键词。"
-                />
+                <div role="status">
+                  <EmptyState
+                    title="没有找到相关原文"
+                    description="请尝试更具体的课程、部门或日期关键词。"
+                  />
+                </div>
               ) : null}
             </>
           )}
