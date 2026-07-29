@@ -1,10 +1,22 @@
 import asyncio
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import event, select
+from sqlalchemy.dialects import postgresql
 
-from app.models.entities import ImpactMigrationPlan
+from app.models.entities import (
+    CalendarEvent,
+    Course,
+    ImpactCase,
+    ImpactMigrationItem,
+    ImpactMigrationPlan,
+    Task,
+    User,
+)
 from app.schemas.notice_radar import MigrationExecuteRequest, MigrationUndoRequest
 from app.services.errors import DomainError, NotFoundError
 from app.services.notices import NoticeRadarService
@@ -58,6 +70,8 @@ def _entity_state(
             key: entity.get(key)
             for key in (
                 "version",
+                "course_id",
+                "course",
                 "due_at",
                 "reminder_at",
                 "start_at",
@@ -85,8 +99,229 @@ def _plan_record(client: TestClient, plan_id: str) -> dict[str, Any]:
                 "generation": plan.generation,
                 "execution_key": plan.execution_idempotency_key,
                 "undo_key": plan.undo_idempotency_key,
+                "conflicts": list(plan.conflicts_json),
+                "verification": dict(plan.verification_json),
                 "execute_receipt": dict(plan.execute_receipt_json),
                 "undo_receipt": dict(plan.undo_receipt_json),
+            }
+
+    return asyncio.run(read())
+
+
+def _first_migration_item_record(client: TestClient, plan_id: str) -> dict[str, Any]:
+    factory = client.app.state.session_factory
+
+    async def read() -> dict[str, Any]:
+        async with factory() as session:
+            item = await session.scalar(
+                select(ImpactMigrationItem)
+                .where(ImpactMigrationItem.plan_id == plan_id)
+                .order_by(ImpactMigrationItem.entity_type, ImpactMigrationItem.entity_id)
+            )
+            assert item is not None
+            return {
+                "before": dict(item.before_snapshot),
+                "after": dict(item.after_snapshot or {}),
+                "verification": dict(item.verification_json),
+                "execute_verification": dict(item.execute_verification_json),
+                "undo_verification": dict(item.undo_verification_json),
+            }
+
+    return asyncio.run(read())
+
+
+def _seed_legacy_foreign_course(client: TestClient) -> None:
+    factory = client.app.state.session_factory
+
+    async def write() -> None:
+        async with factory() as session, session.begin():
+            if await session.get(User, "legacy-course-owner") is None:
+                session.add(User(id="legacy-course-owner", display_name="Legacy Course Owner"))
+                await session.flush()
+                session.add(
+                    Course(
+                        id="legacy-foreign-course",
+                        user_id="legacy-course-owner",
+                        name="Foreign legacy course",
+                    )
+                )
+
+    asyncio.run(write())
+
+
+def _set_legacy_course_reference(
+    client: TestClient,
+    *,
+    entity_type: str,
+    entity_id: str,
+) -> None:
+    _seed_legacy_foreign_course(client)
+    factory = client.app.state.session_factory
+
+    async def write() -> None:
+        async with factory() as session, session.begin():
+            model = Task if entity_type == "task" else CalendarEvent
+            entity = await session.get(model, entity_id)
+            assert entity is not None
+            entity.course_id = "legacy-foreign-course"
+
+    asyncio.run(write())
+
+
+def _corrupt_plan_course_snapshot(
+    client: TestClient,
+    plan_id: str,
+    *,
+    course_id: object,
+) -> None:
+    factory = client.app.state.session_factory
+
+    async def write() -> None:
+        async with factory() as session, session.begin():
+            item = await session.scalar(
+                select(ImpactMigrationItem)
+                .where(ImpactMigrationItem.plan_id == plan_id)
+                .order_by(ImpactMigrationItem.entity_type, ImpactMigrationItem.entity_id)
+            )
+            assert item is not None
+            item.before_snapshot = item.before_snapshot | {"course_id": course_id}
+
+    asyncio.run(write())
+
+
+def _corrupt_plan_conflict_course_payloads(client: TestClient, plan_id: str) -> None:
+    _seed_legacy_foreign_course(client)
+    factory = client.app.state.session_factory
+
+    async def write() -> None:
+        async with factory() as session, session.begin():
+            if await session.get(Course, "legacy-owned-course") is None:
+                session.add(
+                    Course(
+                        id="legacy-owned-course",
+                        user_id="user_demo",
+                        name="Owned legacy course",
+                    )
+                )
+                await session.flush()
+            plan = await session.get(ImpactMigrationPlan, plan_id)
+            assert plan is not None
+            plan.conflicts_json = [
+                {"course_id": "legacy-foreign-course"},
+                {"nested": {"course_id": "legacy-owned-course"}},
+            ]
+
+    asyncio.run(write())
+
+
+def _corrupt_public_migration_course_payloads(
+    client: TestClient,
+    plan_id: str,
+) -> str:
+    _seed_legacy_foreign_course(client)
+    factory = client.app.state.session_factory
+
+    async def write() -> str:
+        async with factory() as session, session.begin():
+            if await session.get(Course, "legacy-owned-course") is None:
+                session.add(
+                    Course(
+                        id="legacy-owned-course",
+                        user_id="user_demo",
+                        name="Owned legacy course",
+                    )
+                )
+                await session.flush()
+            plan = await session.get(ImpactMigrationPlan, plan_id)
+            assert plan is not None
+            plan.conflicts_json = [
+                {"course_id": "legacy-foreign-course"},
+                {"nested": {"course_id": "legacy-owned-course"}},
+            ]
+            plan.verification_json = plan.verification_json | {
+                "legacy": {"course_id": "legacy-dangling-course"}
+            }
+            plan.execute_receipt_json = plan.execute_receipt_json | {
+                "legacy": {"course_id": "legacy-foreign-course"}
+            }
+            plan.undo_receipt_json = plan.undo_receipt_json | {
+                "legacy": {"course_id": "legacy-owned-course"}
+            }
+            item = await session.scalar(
+                select(ImpactMigrationItem)
+                .where(ImpactMigrationItem.plan_id == plan_id)
+                .order_by(ImpactMigrationItem.entity_type, ImpactMigrationItem.entity_id)
+            )
+            assert item is not None
+            item.before_snapshot = item.before_snapshot | {"course_id": "legacy-foreign-course"}
+            item.after_snapshot = (item.after_snapshot or item.before_snapshot) | {
+                "course_id": "legacy-dangling-course"
+            }
+            item.verification_json = {
+                "operation": "execute",
+                "verified": True,
+                "verified_at": "2026-07-28T00:00:00+00:00",
+                "expected_snapshot": {"course_id": ["malformed"]},
+                "database_snapshot": {"course_id": None},
+            }
+            item.execute_verification_json = {
+                "operation": "execute",
+                "verified": True,
+                "verified_at": "2026-07-28T00:00:00+00:00",
+                "expected_snapshot": {"course_id": "legacy-owned-course"},
+                "database_snapshot": {"course_id": "legacy-foreign-course"},
+            }
+            item.undo_verification_json = {
+                "operation": "undo",
+                "verified": True,
+                "verified_at": "2026-07-28T00:00:00+00:00",
+                "expected_snapshot": {"course_id": "   "},
+                "database_snapshot": {"course_id": "legacy-owned-course"},
+            }
+            return item.id
+
+    return asyncio.run(write())
+
+
+def _corrupt_public_impact_course_payloads(client: TestClient, impact_id: str) -> None:
+    _seed_legacy_foreign_course(client)
+    factory = client.app.state.session_factory
+
+    async def write() -> None:
+        async with factory() as session, session.begin():
+            if await session.get(Course, "legacy-owned-course") is None:
+                session.add(
+                    Course(
+                        id="legacy-owned-course",
+                        user_id="user_demo",
+                        name="Owned legacy course",
+                    )
+                )
+                await session.flush()
+            impact = await session.get(ImpactCase, impact_id)
+            assert impact is not None
+            impact.current_snapshot = impact.current_snapshot | {
+                "course_id": "legacy-foreign-course",
+                "owned": {"course_id": "legacy-owned-course"},
+            }
+            impact.proposed_patch = impact.proposed_patch | {
+                "course_id": "legacy-dangling-course",
+                "invalid": {"course_id": ["malformed"]},
+            }
+
+    asyncio.run(write())
+
+
+def _impact_record(client: TestClient, impact_id: str) -> dict[str, Any]:
+    factory = client.app.state.session_factory
+
+    async def read() -> dict[str, Any]:
+        async with factory() as session:
+            impact = await session.get(ImpactCase, impact_id)
+            assert impact is not None
+            return {
+                "current_snapshot": dict(impact.current_snapshot),
+                "proposed_patch": dict(impact.proposed_patch),
             }
 
     return asyncio.run(read())
@@ -761,3 +996,688 @@ def test_notice_plan_impacts_execution_and_receipts_are_user_isolated(
     record = _plan_record(client, plan["id"])
     assert record["status"] == "ready"
     assert record["execution_key"] is None
+
+
+def test_plan_build_rejects_legacy_foreign_course_reference(client: TestClient) -> None:
+    _v1, v2 = _create_demo_chain(client)
+    change_set = _change_set_for_document(client, v2["id"])
+    task_id = client.get("/api/tasks").json()["items"][0]["id"]
+    _set_legacy_course_reference(
+        client,
+        entity_type="task",
+        entity_id=task_id,
+    )
+
+    response = _challenged_write(
+        client,
+        "POST",
+        f"/api/notice-radar/changes/{change_set['id']}/migration-preview",
+        None,
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "migration_course_reference_invalid"
+
+
+def test_course_ownership_check_locks_rows_only_for_write_paths() -> None:
+    scalars = AsyncMock(return_value=["course-owned"])
+    session = SimpleNamespace(scalars=scalars)
+
+    asyncio.run(
+        NoticeRadarService._ensure_migration_course_references(
+            session,
+            "user_demo",
+            "task",
+            "task-owned",
+            "course-owned",
+            for_update=True,
+        )
+    )
+
+    statement = scalars.await_args.args[0]
+    sql = str(statement.compile(dialect=postgresql.dialect()))
+    assert "FOR SHARE" in sql
+    assert "ORDER BY courses.id" in sql
+
+    scalars.reset_mock()
+    asyncio.run(
+        NoticeRadarService._ensure_migration_course_references(
+            session,
+            "user_demo",
+            "task",
+            "task-owned",
+            "course-owned",
+        )
+    )
+    statement = scalars.await_args.args[0]
+    sql = str(statement.compile(dialect=postgresql.dialect()))
+    assert "FOR UPDATE" not in sql
+    assert "FOR SHARE" not in sql
+    assert "ORDER BY courses.id" in sql
+
+
+def test_event_conflict_lock_query_uses_stable_order() -> None:
+    scalars = AsyncMock(return_value=[])
+    session = SimpleNamespace(scalars=scalars)
+    service = NoticeRadarService(SimpleNamespace())
+
+    asyncio.run(
+        service._event_conflicts(
+            session,
+            "user_demo",
+            "event-owned",
+            {
+                "start_at": "2026-07-28T09:00:00+00:00",
+                "end_at": "2026-07-28T10:00:00+00:00",
+            },
+            for_update=True,
+        )
+    )
+
+    statement = scalars.await_args.args[0]
+    sql = str(statement.compile(dialect=postgresql.dialect()))
+    assert "ORDER BY calendar_events.id" in sql
+    assert "FOR UPDATE" in sql
+
+
+def test_conflict_change_error_redacts_unowned_course_ids(
+    client: TestClient,
+) -> None:
+    _v1, v2 = _create_demo_chain(client)
+    change_set = _change_set_for_document(client, v2["id"])
+    plan = _preview(client, change_set["id"])
+    _corrupt_plan_conflict_course_payloads(client, plan["id"])
+
+    response = _challenged_write(
+        client,
+        "POST",
+        f"/api/notice-radar/migrations/{plan['id']}/execute",
+        {
+            "plan_version": plan["version"],
+            "idempotency_key": "legacy-conflict-detail-redaction",
+            "allow_conflicts": False,
+            "confirmation_stages": 2,
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    error = response.json()["error"]
+    assert error["code"] == "calendar_conflicts_changed"
+    assert error["details"]["preview_conflicts"] == [
+        {},
+        {"nested": {"course_id": "legacy-owned-course"}},
+    ]
+    assert error["details"]["current_conflicts"] == []
+    assert "legacy-foreign-course" not in response.text
+
+    raw_plan = _plan_record(client, plan["id"])
+    assert raw_plan["status"] == "ready"
+    assert raw_plan["conflicts"][0]["course_id"] == "legacy-foreign-course"
+
+
+def test_legacy_impact_list_redacts_unowned_course_ids_in_one_batch(
+    client: TestClient,
+) -> None:
+    _v1, v2 = _create_demo_chain(client)
+    change_set = _change_set_for_document(client, v2["id"])
+    initial = client.get("/api/notice-radar/impacts", params={"change_set_id": change_set["id"]})
+    assert initial.status_code == 200, initial.text
+    impact_id = initial.json()["items"][0]["id"]
+    _corrupt_public_impact_course_payloads(client, impact_id)
+
+    course_selects: list[str] = []
+
+    def capture_course_select(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        if statement.lstrip().upper().startswith("SELECT") and "FROM courses" in statement:
+            course_selects.append(statement)
+
+    engine = client.app.state.database_engine.sync_engine
+    event.listen(engine, "before_cursor_execute", capture_course_select)
+    try:
+        response = client.get(
+            "/api/notice-radar/impacts", params={"change_set_id": change_set["id"]}
+        )
+        assert response.status_code == 200, response.text
+        assert len(course_selects) == 1
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_course_select)
+
+    impact = next(item for item in response.json()["items"] if item["id"] == impact_id)
+    assert "legacy-foreign-course" not in response.text
+    assert "legacy-dangling-course" not in response.text
+    assert "malformed" not in response.text
+    assert "course_id" not in impact["current_snapshot"]
+    assert impact["current_snapshot"]["owned"]["course_id"] == "legacy-owned-course"
+    assert "course_id" not in impact["proposed_patch"]
+    assert impact["proposed_patch"]["invalid"] == {}
+
+    raw = _impact_record(client, impact_id)
+    assert raw["current_snapshot"]["course_id"] == "legacy-foreign-course"
+    assert raw["proposed_patch"]["course_id"] == "legacy-dangling-course"
+    assert raw["proposed_patch"]["invalid"]["course_id"] == ["malformed"]
+
+
+def test_legacy_plan_and_receipt_redact_unowned_course_ids_in_one_batch(
+    client: TestClient,
+) -> None:
+    _v1, v2 = _create_demo_chain(client)
+    change_set = _change_set_for_document(client, v2["id"])
+    plan = _preview(client, change_set["id"])
+    executed = _challenged_write(
+        client,
+        "POST",
+        f"/api/notice-radar/migrations/{plan['id']}/execute",
+        _execute_body(plan, "legacy-public-course-redaction"),
+    )
+    assert executed.status_code == 200, executed.text
+    item_id = _corrupt_public_migration_course_payloads(client, plan["id"])
+
+    course_selects: list[str] = []
+
+    def capture_course_select(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        if statement.lstrip().upper().startswith("SELECT") and "FROM courses" in statement:
+            course_selects.append(statement)
+
+    engine = client.app.state.database_engine.sync_engine
+    event.listen(engine, "before_cursor_execute", capture_course_select)
+    try:
+        plan_response = client.get(f"/api/notice-radar/migrations/{plan['id']}")
+        assert plan_response.status_code == 200, plan_response.text
+        assert len(course_selects) == 1
+        course_selects.clear()
+        receipt_response = client.get(
+            f"/api/notice-radar/migrations/{plan['id']}/receipt",
+            params={"operation": "execute"},
+        )
+        assert receipt_response.status_code == 200, receipt_response.text
+        assert len(course_selects) == 1
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_course_select)
+
+    plan_payload = plan_response.json()
+    plan_item = next(item for item in plan_payload["items"] if item["id"] == item_id)
+    receipt_item = next(item for item in receipt_response.json()["items"] if item["id"] == item_id)
+    assert plan_payload["conflicts"] == [
+        {},
+        {"nested": {"course_id": "legacy-owned-course"}},
+    ]
+    assert plan_payload["verification"]["legacy"] == {}
+    assert plan_payload["execute_receipt"]["legacy"] == {}
+    assert plan_payload["undo_receipt"]["legacy"] == {"course_id": "legacy-owned-course"}
+    for payload in (plan_response.text, receipt_response.text):
+        assert "legacy-foreign-course" not in payload
+        assert "legacy-dangling-course" not in payload
+        assert "malformed" not in payload
+    assert "course_id" not in plan_item["before"]
+    assert "course_id" not in plan_item["after"]
+    assert "course_id" not in plan_item["verification"]["expected_snapshot"]
+    assert plan_item["verification"]["database_snapshot"]["course_id"] is None
+    assert (
+        plan_item["execute_verification"]["expected_snapshot"]["course_id"] == "legacy-owned-course"
+    )
+    assert plan_item["undo_verification"]["database_snapshot"]["course_id"] == "legacy-owned-course"
+    assert "course_id" not in plan_item["undo_verification"]["expected_snapshot"]
+    assert receipt_item["verification"]["expected_snapshot"]["course_id"] == "legacy-owned-course"
+    assert "course_id" not in receipt_item["verification"]["database_snapshot"]
+
+    raw_plan = _plan_record(client, plan["id"])
+    assert raw_plan["conflicts"][0]["course_id"] == "legacy-foreign-course"
+    assert raw_plan["verification"]["legacy"]["course_id"] == "legacy-dangling-course"
+    assert raw_plan["execute_receipt"]["legacy"]["course_id"] == "legacy-foreign-course"
+    assert raw_plan["undo_receipt"]["legacy"]["course_id"] == "legacy-owned-course"
+
+    raw_item = _first_migration_item_record(client, plan["id"])
+    assert raw_item["before"]["course_id"] == "legacy-foreign-course"
+    assert raw_item["after"]["course_id"] == "legacy-dangling-course"
+    assert raw_item["verification"]["expected_snapshot"]["course_id"] == ["malformed"]
+    assert (
+        raw_item["execute_verification"]["database_snapshot"]["course_id"]
+        == "legacy-foreign-course"
+    )
+    assert raw_item["undo_verification"]["expected_snapshot"]["course_id"] == "   "
+
+
+def test_execute_rejects_malformed_course_reference_in_plan_snapshot(
+    client: TestClient,
+) -> None:
+    _v1, v2 = _create_demo_chain(client)
+    change_set = _change_set_for_document(client, v2["id"])
+    plan = _preview(client, change_set["id"])
+    _corrupt_plan_course_snapshot(client, plan["id"], course_id=["malformed"])
+
+    response = _challenged_write(
+        client,
+        "POST",
+        f"/api/notice-radar/migrations/{plan['id']}/execute",
+        _execute_body(plan, "malformed-course-snapshot"),
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "migration_course_reference_invalid"
+    assert _plan_record(client, plan["id"])["status"] == "ready"
+
+
+def test_execute_rejects_foreign_course_string_in_plan_snapshot(
+    client: TestClient,
+) -> None:
+    _v1, v2 = _create_demo_chain(client)
+    change_set = _change_set_for_document(client, v2["id"])
+    plan = _preview(client, change_set["id"])
+    _seed_legacy_foreign_course(client)
+    _corrupt_plan_course_snapshot(
+        client,
+        plan["id"],
+        course_id="legacy-foreign-course",
+    )
+
+    response = _challenged_write(
+        client,
+        "POST",
+        f"/api/notice-radar/migrations/{plan['id']}/execute",
+        _execute_body(plan, "foreign-course-snapshot"),
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "migration_course_reference_invalid"
+    record = _plan_record(client, plan["id"])
+    assert record["status"] == "ready"
+    assert record["execution_key"] is None
+
+
+def test_execute_verification_persists_foreign_course_failure(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _v1, v2 = _create_demo_chain(client)
+    change_set = _change_set_for_document(client, v2["id"])
+    plan = _preview(client, change_set["id"])
+    service = NoticeRadarService(client.app.state.session_factory)
+    request = MigrationExecuteRequest(**_execute_body(plan, "course-verify-boundary"))
+    original_verify = service._verify
+
+    async def verifier_crash(_user_id: str, _plan_id: str, *, operation: str) -> Any:
+        raise RuntimeError(f"simulated crash before {operation} verification")
+
+    monkeypatch.setattr(service, "_verify", verifier_crash)
+    with pytest.raises(RuntimeError, match="execute verification"):
+        asyncio.run(_service_execute(service, client, plan["id"], request))
+    assert _plan_record(client, plan["id"])["status"] == "applied"
+
+    affected = plan["items"][0]
+    _set_legacy_course_reference(
+        client,
+        entity_type=affected["entity_type"],
+        entity_id=affected["entity_id"],
+    )
+    monkeypatch.setattr(service, "_verify", original_verify)
+
+    receipt = asyncio.run(service._verify("user_demo", plan["id"], operation="execute"))
+
+    assert receipt.status == "verification_failed"
+    assert receipt.all_verified is False
+    failed = [item for item in receipt.items if not item.verification["verified"]]
+    assert failed
+    assert failed[0].verification["reason"] == "migration_course_reference_invalid"
+    assert "legacy-foreign-course" not in receipt.model_dump_json()
+    item_record = _first_migration_item_record(client, plan["id"])
+    assert "legacy-foreign-course" not in str(item_record["execute_verification"])
+    record = _plan_record(client, plan["id"])
+    assert record["status"] == "verification_failed"
+    assert record["execute_receipt"]["status"] == "verification_failed"
+    assert record["execute_receipt"]["verified"] is False
+
+
+def test_undo_verification_persists_foreign_course_failure(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _v1, v2 = _create_demo_chain(client)
+    change_set = _change_set_for_document(client, v2["id"])
+    plan = _preview(client, change_set["id"])
+    execute_path = f"/api/notice-radar/migrations/{plan['id']}/execute"
+    executed = _challenged_write(
+        client,
+        "POST",
+        execute_path,
+        _execute_body(plan, "undo-course-verify-execute"),
+    )
+    assert executed.status_code == 200, executed.text
+    current_plan = client.get(f"/api/notice-radar/migrations/{plan['id']}").json()
+    service = NoticeRadarService(client.app.state.session_factory)
+    request = MigrationUndoRequest(
+        plan_version=current_plan["version"],
+        idempotency_key="undo-course-verify-boundary",
+        confirmation_stages=2,
+    )
+    original_verify = service._verify
+
+    async def verifier_crash(_user_id: str, _plan_id: str, *, operation: str) -> Any:
+        raise RuntimeError(f"simulated crash before {operation} verification")
+
+    monkeypatch.setattr(service, "_verify", verifier_crash)
+    with pytest.raises(RuntimeError, match="undo verification"):
+        asyncio.run(_service_undo(service, client, plan["id"], request))
+    assert _plan_record(client, plan["id"])["status"] == "undo_applied"
+
+    affected = plan["items"][0]
+    _set_legacy_course_reference(
+        client,
+        entity_type=affected["entity_type"],
+        entity_id=affected["entity_id"],
+    )
+    monkeypatch.setattr(service, "_verify", original_verify)
+
+    receipt = asyncio.run(service._verify("user_demo", plan["id"], operation="undo"))
+
+    assert receipt.status == "undo_verification_failed"
+    assert receipt.all_verified is False
+    failed = [item for item in receipt.items if not item.verification["verified"]]
+    assert failed
+    assert failed[0].verification["reason"] == "migration_course_reference_invalid"
+    assert "legacy-foreign-course" not in receipt.model_dump_json()
+    item_record = _first_migration_item_record(client, plan["id"])
+    assert "legacy-foreign-course" not in str(item_record["undo_verification"])
+    record = _plan_record(client, plan["id"])
+    assert record["status"] == "undo_verification_failed"
+    assert record["undo_receipt"]["status"] == "undo_verification_failed"
+    assert record["undo_receipt"]["verified"] is False
+
+
+def test_group_undo_rejects_legacy_foreign_course_reference(
+    client: TestClient,
+) -> None:
+    _v1, v2 = _create_demo_chain(client)
+    change_set = _change_set_for_document(client, v2["id"])
+    plan = _preview(client, change_set["id"])
+    execute_path = f"/api/notice-radar/migrations/{plan['id']}/execute"
+    executed = _challenged_write(
+        client,
+        "POST",
+        execute_path,
+        _execute_body(plan, "course-undo-execute"),
+    )
+    assert executed.status_code == 200, executed.text
+
+    affected = plan["items"][0]
+    _set_legacy_course_reference(
+        client,
+        entity_type=affected["entity_type"],
+        entity_id=affected["entity_id"],
+    )
+    current_plan = client.get(f"/api/notice-radar/migrations/{plan['id']}").json()
+
+    response = _challenged_write(
+        client,
+        "POST",
+        execute_path.replace("/execute", "/undo"),
+        {
+            "plan_version": current_plan["version"],
+            "idempotency_key": "course-undo-boundary",
+            "confirmation_stages": 2,
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "migration_course_reference_invalid"
+    assert _plan_record(client, plan["id"])["status"] == "verified"
+
+
+def test_group_undo_rejects_foreign_before_snapshot_atomically(
+    client: TestClient,
+) -> None:
+    _v1, v2 = _create_demo_chain(client)
+    change_set = _change_set_for_document(client, v2["id"])
+    plan = _preview(client, change_set["id"])
+    execute_path = f"/api/notice-radar/migrations/{plan['id']}/execute"
+    executed = _challenged_write(
+        client,
+        "POST",
+        execute_path,
+        _execute_body(plan, "foreign-before-undo-execute"),
+    )
+    assert executed.status_code == 200, executed.text
+    _seed_legacy_foreign_course(client)
+    _corrupt_plan_course_snapshot(
+        client,
+        plan["id"],
+        course_id="legacy-foreign-course",
+    )
+    before_undo = _entity_state(client, plan)
+    current_plan = client.get(f"/api/notice-radar/migrations/{plan['id']}").json()
+
+    response = _challenged_write(
+        client,
+        "POST",
+        execute_path.replace("/execute", "/undo"),
+        {
+            "plan_version": current_plan["version"],
+            "idempotency_key": "foreign-before-group-undo",
+            "confirmation_stages": 2,
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "migration_course_reference_invalid"
+    assert _entity_state(client, plan) == before_undo
+    record = _plan_record(client, plan["id"])
+    assert record["status"] == "verified"
+    assert record["undo_key"] is None
+    assert record["undo_receipt"] == {}
+
+
+def test_stale_execute_verifier_cannot_overwrite_completed_undo(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _v1, v2 = _create_demo_chain(client)
+    change_set = _change_set_for_document(client, v2["id"])
+    plan = _preview(client, change_set["id"])
+    before_execute = _entity_state(client, plan)
+    factory = client.app.state.session_factory
+    execute_service = NoticeRadarService(factory)
+    undo_service = NoticeRadarService(factory)
+    execute_request = MigrationExecuteRequest(**_execute_body(plan, "stale-verify-execute"))
+    original_verify = execute_service._verify
+    execute_waiting = asyncio.Event()
+    release_execute_verify = asyncio.Event()
+    preserved_undo_receipt: dict[str, Any] = {}
+
+    async def delayed_verify(user_id: str, plan_id: str, *, operation: str) -> Any:
+        if operation == "execute":
+            execute_waiting.set()
+            await release_execute_verify.wait()
+        return await original_verify(user_id, plan_id, operation=operation)
+
+    monkeypatch.setattr(execute_service, "_verify", delayed_verify)
+
+    async def execute_then_undo() -> None:
+        async with factory() as execute_session:
+            execute_task = asyncio.create_task(
+                execute_service.execute(
+                    execute_session,
+                    "user_demo",
+                    plan["id"],
+                    execute_request,
+                )
+            )
+            execute_result: Any = None
+            try:
+                await asyncio.wait_for(execute_waiting.wait(), timeout=2)
+                async with factory() as read_session:
+                    applied = await read_session.get(ImpactMigrationPlan, plan["id"])
+                    assert applied is not None
+                    assert applied.status == "applied"
+                    undo_request = MigrationUndoRequest(
+                        plan_version=applied.version,
+                        idempotency_key="completed-concurrent-undo",
+                        confirmation_stages=2,
+                    )
+                async with factory() as undo_session:
+                    undo_receipt = await undo_service.undo(
+                        undo_session,
+                        "user_demo",
+                        plan["id"],
+                        undo_request,
+                    )
+                assert undo_receipt.status == "undone"
+                async with factory() as read_session:
+                    undone = await read_session.get(ImpactMigrationPlan, plan["id"])
+                    assert undone is not None
+                    preserved_undo_receipt.update(undone.undo_receipt_json)
+            finally:
+                release_execute_verify.set()
+                try:
+                    (execute_result,) = await asyncio.wait_for(
+                        asyncio.gather(execute_task, return_exceptions=True),
+                        timeout=10,
+                    )
+                except TimeoutError:
+                    execute_task.cancel()
+                    await asyncio.gather(execute_task, return_exceptions=True)
+                    raise
+            if isinstance(execute_result, BaseException):
+                raise execute_result
+
+    with pytest.raises(DomainError) as raised:
+        asyncio.run(execute_then_undo())
+
+    assert raised.value.code == "migration_verification_state_conflict"
+    assert raised.value.details == {"operation": "execute", "status": "undone"}
+    record = _plan_record(client, plan["id"])
+    assert record["status"] == "undone"
+    assert record["undo_key"] == "completed-concurrent-undo"
+    assert record["undo_receipt"] == preserved_undo_receipt
+    assert record["undo_receipt"]["status"] == "undone"
+    after_undo = _entity_state(client, plan)
+    for entity_key, before in before_execute.items():
+        after = after_undo[entity_key]
+        assert {key: value for key, value in after.items() if key != "version"} == {
+            key: value for key, value in before.items() if key != "version"
+        }
+        assert int(after["version"]) == int(before["version"]) + 2
+
+
+def test_sqlite_verifier_write_lock_prevents_stale_entity_snapshot(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _v1, v2 = _create_demo_chain(client)
+    change_set = _change_set_for_document(client, v2["id"])
+    plan = _preview(client, change_set["id"])
+    factory = client.app.state.session_factory
+    service = NoticeRadarService(factory)
+    request = MigrationExecuteRequest(**_execute_body(plan, "sqlite-lock-execute"))
+    original_verify = service._verify
+
+    async def verifier_crash(_user_id: str, _plan_id: str, *, operation: str) -> Any:
+        raise RuntimeError(f"simulated crash before {operation} verification")
+
+    monkeypatch.setattr(service, "_verify", verifier_crash)
+    with pytest.raises(RuntimeError, match="execute verification"):
+        asyncio.run(_service_execute(service, client, plan["id"], request))
+    monkeypatch.setattr(service, "_verify", original_verify)
+
+    original_owned_entity = service._owned_entity
+    entity_read = asyncio.Event()
+    release_verifier = asyncio.Event()
+    mutation_started = asyncio.Event()
+    mutation_committed = asyncio.Event()
+    paused = False
+
+    async def paused_owned_entity(
+        session: Any,
+        user_id: str,
+        entity_type: str,
+        entity_id: str,
+        *,
+        for_update: bool = False,
+    ) -> Any:
+        nonlocal paused
+        entity = await original_owned_entity(
+            session,
+            user_id,
+            entity_type,
+            entity_id,
+            for_update=for_update,
+        )
+        if not paused:
+            paused = True
+            entity_read.set()
+            await release_verifier.wait()
+        return entity
+
+    monkeypatch.setattr(service, "_owned_entity", paused_owned_entity)
+    affected = plan["items"][0]
+    model = Task if affected["entity_type"] == "task" else CalendarEvent
+
+    async def mutate_entity() -> None:
+        async with factory() as session, session.begin():
+            entity = await session.get(model, affected["entity_id"])
+            assert entity is not None
+            entity.description = f"{entity.description or ''} concurrent write"
+            entity.version += 1
+            mutation_started.set()
+            await session.flush()
+        mutation_committed.set()
+
+    async def verify_while_mutating() -> tuple[Any, bool]:
+        verify_task = asyncio.create_task(
+            service._verify("user_demo", plan["id"], operation="execute")
+        )
+        mutation_task: asyncio.Task[None] | None = None
+        results: list[Any] | tuple[Any, ...] = []
+        mutation_was_blocked = False
+        try:
+            await asyncio.wait_for(entity_read.wait(), timeout=2)
+            mutation_task = asyncio.create_task(mutate_entity())
+            await asyncio.wait_for(mutation_started.wait(), timeout=2)
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(mutation_committed.wait()),
+                    timeout=0.25,
+                )
+            except TimeoutError:
+                mutation_was_blocked = True
+        finally:
+            release_verifier.set()
+            tasks = [verify_task]
+            if mutation_task is not None:
+                tasks.append(mutation_task)
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=10,
+                )
+            except TimeoutError:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+        if mutation_task is None:
+            raise AssertionError("entity mutation task did not start")
+        verify_result, mutation_result = results
+        if isinstance(verify_result, BaseException):
+            raise verify_result
+        if isinstance(mutation_result, BaseException):
+            raise mutation_result
+        return verify_result, mutation_was_blocked
+
+    receipt, mutation_was_blocked = asyncio.run(verify_while_mutating())
+
+    assert mutation_was_blocked is True
+    assert receipt.status == "verified"
+    assert receipt.all_verified is True

@@ -16,6 +16,7 @@ from app.models.entities import (
     CalendarEvent,
     Conversation,
     CorrectionRecord,
+    Course,
     Document,
     DocumentChunk,
     ImpactCase,
@@ -328,6 +329,95 @@ async def _seed_other_user(factory: async_sessionmaker[AsyncSession]) -> None:
     )
 
 
+async def _privacy_export_course_snapshot(
+    factory: async_sessionmaker[AsyncSession],
+) -> dict[str, Any]:
+    async with factory() as session:
+        impact = await session.get(ImpactCase, "imp_current_task")
+        plan = await session.get(ImpactMigrationPlan, "mpl_current")
+        item = await session.get(ImpactMigrationItem, "mpi_current_task")
+        task = await session.get(Task, "tsk_current_notice")
+        event = await session.get(CalendarEvent, "evt_current_notice")
+        assert impact is not None
+        assert plan is not None
+        assert item is not None
+        assert task is not None
+        assert event is not None
+        return {
+            "impact_current": dict(impact.current_snapshot),
+            "impact_patch": dict(impact.proposed_patch),
+            "plan_conflicts": list(plan.conflicts_json),
+            "plan_verification": dict(plan.verification_json),
+            "plan_execute_receipt": dict(plan.execute_receipt_json),
+            "plan_undo_receipt": dict(plan.undo_receipt_json),
+            "item_before": dict(item.before_snapshot),
+            "item_patch": dict(item.proposed_patch),
+            "item_after": dict(item.after_snapshot or {}),
+            "item_verification": dict(item.verification_json),
+            "task_course_id": task.course_id,
+            "event_course_id": event.course_id,
+        }
+
+
+async def _corrupt_privacy_export_course_payloads(
+    factory: async_sessionmaker[AsyncSession],
+) -> dict[str, Any]:
+    async with factory() as session, session.begin():
+        session.add_all(
+            [
+                Course(
+                    id="privacy-owned-course",
+                    user_id="user_demo",
+                    name="Privacy owned course",
+                ),
+                Course(
+                    id="privacy-foreign-course",
+                    user_id="user_other",
+                    name="Privacy foreign course",
+                ),
+            ]
+        )
+        await session.flush()
+        impact = await session.get(ImpactCase, "imp_current_task")
+        plan = await session.get(ImpactMigrationPlan, "mpl_current")
+        item = await session.get(ImpactMigrationItem, "mpi_current_task")
+        task = await session.get(Task, "tsk_current_notice")
+        event = await session.get(CalendarEvent, "evt_current_notice")
+        assert impact is not None
+        assert plan is not None
+        assert item is not None
+        assert task is not None
+        assert event is not None
+        impact.current_snapshot = impact.current_snapshot | {
+            "course_id": "privacy-foreign-course",
+            "owned": {"course_id": "privacy-owned-course"},
+        }
+        impact.proposed_patch = impact.proposed_patch | {"course_id": "privacy-dangling-course"}
+        plan.conflicts_json = plan.conflicts_json + [
+            {"course_id": "privacy-foreign-course"},
+            {"owned": {"course_id": "privacy-owned-course"}},
+        ]
+        plan.verification_json = plan.verification_json | {
+            "legacy": {"course_id": "privacy-dangling-course"}
+        }
+        plan.execute_receipt_json = plan.execute_receipt_json | {
+            "legacy": {"course_id": "privacy-foreign-course"}
+        }
+        plan.undo_receipt_json = plan.undo_receipt_json | {
+            "legacy": {"course_id": "privacy-owned-course"}
+        }
+        item.before_snapshot = item.before_snapshot | {"course_id": "privacy-foreign-course"}
+        item.proposed_patch = item.proposed_patch | {"course_id": "privacy-dangling-course"}
+        item.after_snapshot = (item.after_snapshot or {}) | {"course_id": "privacy-owned-course"}
+        item.verification_json = item.verification_json | {
+            "legacy": {"course_id": ["privacy-malformed-course"]}
+        }
+        task.course_id = "privacy-owned-course"
+        event.course_id = "privacy-foreign-course"
+
+    return await _privacy_export_course_snapshot(factory)
+
+
 async def _v03_graph_counts(
     factory: async_sessionmaker[AsyncSession], user_id: str
 ) -> dict[str, int]:
@@ -603,6 +693,9 @@ def test_export_is_user_scoped_no_store_and_excludes_security_material(
     )
     _portal_call(client, _seed_notice_graph, _factory(client), "user_demo", "current")
     _portal_call(client, _seed_other_user, _factory(client))
+    raw_course_snapshot = _portal_call(
+        client, _corrupt_privacy_export_course_payloads, _factory(client)
+    )
 
     prepared = client.post(
         "/api/actions/prepare",
@@ -636,6 +729,10 @@ def test_export_is_user_scoped_no_store_and_excludes_security_material(
         "Notice-backed task",
     }
     assert all(item["title"] != "Other user's private task" for item in body["data"]["tasks"])
+    exported_tasks = {item["id"]: item for item in body["data"]["tasks"]}
+    exported_events = {item["id"]: item for item in body["data"]["calendar_events"]}
+    assert exported_tasks["tsk_current_notice"]["course_id"] == "privacy-owned-course"
+    assert "course_id" not in exported_events["evt_current_notice"]
     assert body["data"]["document_chunks"]
     assert {item["source_url"] for item in body["data"]["documents"] if item["source_url"]} == {
         "https://example.edu/notice"
@@ -765,23 +862,45 @@ def test_export_is_user_scoped_no_store_and_excludes_security_material(
     assert exported_impacts["imp_current_task"]["requires_manual_review"] is False
     assert exported_impacts["imp_current_event"]["recommended_action"] == "manual_review"
     assert exported_impacts["imp_current_event"]["requires_manual_review"] is True
+    assert "course_id" not in exported_impacts["imp_current_task"]["current_snapshot"]
+    assert exported_impacts["imp_current_task"]["current_snapshot"]["owned"] == {
+        "course_id": "privacy-owned-course"
+    }
+    assert "course_id" not in exported_impacts["imp_current_task"]["proposed_patch"]
 
     exported_plan = body["data"]["impact_migration_plans"][0]
     assert exported_plan["generation"] == 3
     assert exported_plan["execute_receipt_json"] == {
         "operation": "execute",
         "verified": True,
+        "legacy": {},
     }
     assert exported_plan["undo_receipt_json"] == {
         "operation": "undo",
         "verified": True,
+        "legacy": {"course_id": "privacy-owned-course"},
     }
+    assert exported_plan["conflicts_json"][-2:] == [
+        {},
+        {"owned": {"course_id": "privacy-owned-course"}},
+    ]
+    assert exported_plan["verification_json"]["legacy"] == {}
     assert "execution_idempotency_key" not in exported_plan
     assert "undo_idempotency_key" not in exported_plan
 
     exported_items = {item["id"]: item for item in body["data"]["impact_migration_items"]}
     assert exported_items["mpi_current_task"]["execute_verification_json"] == {"verified": True}
     assert exported_items["mpi_current_task"]["undo_verification_json"] == {"verified": False}
+    assert "course_id" not in exported_items["mpi_current_task"]["before_snapshot"]
+    assert "course_id" not in exported_items["mpi_current_task"]["proposed_patch"]
+    assert exported_items["mpi_current_task"]["after_snapshot"]["course_id"] == (
+        "privacy-owned-course"
+    )
+    assert exported_items["mpi_current_task"]["verification_json"]["legacy"] == {}
+    assert (
+        _portal_call(client, _privacy_export_course_snapshot, _factory(client))
+        == raw_course_snapshot
+    )
 
     serialized = json.dumps(body, ensure_ascii=False)
     for forbidden in (
@@ -817,6 +936,9 @@ def test_export_is_user_scoped_no_store_and_excludes_security_material(
         "undo-receipt-secret",
         "execute-verification-secret",
         "undo-verification-secret",
+        "privacy-foreign-course",
+        "privacy-dangling-course",
+        "privacy-malformed-course",
         "doc_other_v1",
     ):
         assert forbidden not in serialized
