@@ -235,6 +235,55 @@ describe("TasksPage destructive confirmation", () => {
     expect(screen.getByText("已撤回并通过数据库验证。")).toBeInTheDocument();
   });
 
+  it("retries the same task action when the first undo response is lost", async () => {
+    mocks.listLogs.mockResolvedValue({
+      items: [
+        {
+          id: "latest-task-log",
+          action: "update_task",
+          action_id: "latest-task-action",
+          undoable: true,
+          undone: false,
+        },
+        {
+          id: "older-task-log",
+          action: "create_task",
+          action_id: "older-task-action",
+          undoable: true,
+          undone: false,
+        },
+      ],
+      total: 2,
+    });
+    mocks.undo
+      .mockReset()
+      .mockRejectedValueOnce(new Error("undo response lost"))
+      .mockResolvedValueOnce({
+        success: true,
+        action: "undo_update_task",
+        record_id: "task-delete",
+        verified_fields: {},
+        side_effects: [],
+        message: "待办撤销成功",
+      });
+
+    render(<TasksPage />);
+    await waitFor(() => expect(mocks.listTasks).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "撤销最近操作" }));
+    expect(await screen.findByText("撤销失败。")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "撤销最近操作" }));
+
+    await waitFor(() => expect(mocks.undo).toHaveBeenCalledTimes(2));
+    expect(mocks.undo.mock.calls.map(([actionId]) => actionId)).toEqual([
+      "latest-task-action",
+      "latest-task-action",
+    ]);
+    expect(mocks.undo).not.toHaveBeenCalledWith("older-task-action");
+    expect(mocks.listLogs).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText("待办撤销成功")).toBeInTheDocument();
+  });
+
   it("loads later pages before applying the active-task filter", async () => {
     const completedTasks = Array.from({ length: 500 }, (_, index) => ({
       id: `completed-task-${index}`,

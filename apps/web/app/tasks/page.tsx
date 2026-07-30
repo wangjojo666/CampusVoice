@@ -53,6 +53,7 @@ export default function TasksPage() {
   const deleteCancellationBlocked = !deleteRetryBlocked && deleteNeedsExecutionRecovery;
   const loadGenerationRef = useRef(0);
   const deleteGenerationRef = useRef(0);
+  const pendingUndoActionIdRef = useRef<string | null>(null);
 
   const load = useCallback(async () => {
     const generation = ++loadGenerationRef.current;
@@ -321,20 +322,26 @@ export default function TasksPage() {
     setNotice(null);
     setVerifiedFinish(null);
     try {
-      const logs = await collectAllPages(
-        ({ limit, offset }) => api.actionLogs.list(limit, offset),
-        {
-          getKey: (log) => log.id,
-          shouldStop: (page) => Boolean(latestUndoableTaskAction(page)),
-        },
-      );
-      const target = latestUndoableTaskAction(logs);
-      if (!target?.action_id) {
-        setNotice("没有可撤销的最近操作。");
-        return;
+      let actionId = pendingUndoActionIdRef.current;
+      if (!actionId) {
+        const logs = await collectAllPages(
+          ({ limit, offset }) => api.actionLogs.list(limit, offset),
+          {
+            getKey: (log) => log.id,
+            shouldStop: (page) => Boolean(latestUndoableTaskAction(page)),
+          },
+        );
+        const target = latestUndoableTaskAction(logs);
+        if (!target?.action_id) {
+          setNotice("没有可撤销的最近操作。");
+          return;
+        }
+        actionId = target.action_id;
+        pendingUndoActionIdRef.current = actionId;
       }
-      const result = await api.actions.undo(target.action_id);
+      const result = await api.actions.undo(actionId);
       if (!result.success) throw new ApiError(result.message, { status: 409, details: result });
+      pendingUndoActionIdRef.current = null;
       setNotice(result.message);
       setVerifiedFinish(createVerifiedFinishEvent(result, "undo"));
       await load();

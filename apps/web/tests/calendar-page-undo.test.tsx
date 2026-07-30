@@ -204,6 +204,55 @@ describe("CalendarPage undo entry", () => {
     expect(screen.getByText("已撤回并通过数据库验证。")).toBeInTheDocument();
   });
 
+  it("retries the same event action when the first undo response is lost", async () => {
+    mocks.listLogs.mockResolvedValue({
+      items: [
+        {
+          id: "latest-event-log",
+          action_id: "latest-event-action",
+          action: "update_event",
+          undoable: true,
+          undone: false,
+        },
+        {
+          id: "older-event-log",
+          action_id: "older-event-action",
+          action: "create_event",
+          undoable: true,
+          undone: false,
+        },
+      ],
+      total: 2,
+    });
+    mocks.undo
+      .mockReset()
+      .mockRejectedValueOnce(new Error("undo response lost"))
+      .mockResolvedValueOnce({
+        success: true,
+        action: "undo_update_event",
+        record_id: "event-1",
+        verified_fields: {},
+        side_effects: [],
+        message: "撤销已完成并通过数据库验证",
+      });
+
+    render(<CalendarPage />);
+    await waitFor(() => expect(mocks.listEvents).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "撤销最近操作" }));
+    expect(await screen.findByText("撤销失败，请重试。")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "撤销最近操作" }));
+
+    await waitFor(() => expect(mocks.undo).toHaveBeenCalledTimes(2));
+    expect(mocks.undo.mock.calls.map(([actionId]) => actionId)).toEqual([
+      "latest-event-action",
+      "latest-event-action",
+    ]);
+    expect(mocks.undo).not.toHaveBeenCalledWith("older-event-action");
+    expect(mocks.listLogs).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText("撤销已完成并通过数据库验证")).toBeInTheDocument();
+  });
+
   it("keeps an empty month navigable and loads every page for the selected range", async () => {
     const rangeStart = "2026-08-01T00:00:00.000Z";
     const rangeEnd = "2026-09-01T00:00:00.000Z";

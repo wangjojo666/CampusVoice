@@ -64,6 +64,7 @@ export default function CalendarPage() {
   const visibleRangeRef = useRef(visibleRange);
   const loadGenerationRef = useRef(0);
   const deleteGenerationRef = useRef(0);
+  const pendingUndoActionIdRef = useRef<string | null>(null);
   const [events, setEvents] = useState<CalendarEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [hasLoaded, setHasLoaded] = useState(false);
@@ -377,20 +378,26 @@ export default function CalendarPage() {
     setNotice(null);
     setVerifiedFinish(null);
     try {
-      const logs = await collectAllPages(
-        ({ limit, offset }) => api.actionLogs.list(limit, offset),
-        {
-          getKey: (log) => log.id,
-          shouldStop: (page) => Boolean(latestUndoableEventAction(page)),
-        },
-      );
-      const latest = latestUndoableEventAction(logs);
-      if (!latest?.action_id) {
-        setError("没有可撤销的最近日历操作。");
-        return;
+      let actionId = pendingUndoActionIdRef.current;
+      if (!actionId) {
+        const logs = await collectAllPages(
+          ({ limit, offset }) => api.actionLogs.list(limit, offset),
+          {
+            getKey: (log) => log.id,
+            shouldStop: (page) => Boolean(latestUndoableEventAction(page)),
+          },
+        );
+        const latest = latestUndoableEventAction(logs);
+        if (!latest?.action_id) {
+          setError("没有可撤销的最近日历操作。");
+          return;
+        }
+        actionId = latest.action_id;
+        pendingUndoActionIdRef.current = actionId;
       }
-      const result = await api.actions.undo(latest.action_id);
+      const result = await api.actions.undo(actionId);
       if (!result.success) throw new ApiError(result.message, { status: 409, details: result });
+      pendingUndoActionIdRef.current = null;
       setNotice(result.message);
       setVerifiedFinish(createVerifiedFinishEvent(result, "undo"));
       await load();
