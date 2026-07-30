@@ -28,7 +28,7 @@ from app.services.knowledge import parser as document_parser
 
 
 def test_document_title_is_normalized_before_length_validation() -> None:
-    normalized_title = "x" * 500
+    normalized_title = "x" * 240
 
     metadata = DocumentMetadata(
         title=f"  {normalized_title}  ",
@@ -40,6 +40,36 @@ def test_document_title_is_normalized_before_length_validation() -> None:
         DocumentMetadata(
             title=f"  {normalized_title}x  ",
             file_type=DocumentFileType.TXT,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "maximum"),
+    [
+        pytest.param("department", 160, id="department"),
+        pytest.param("applicable_group", 240, id="applicable-group"),
+        pytest.param("version", 80, id="version"),
+    ],
+)
+def test_document_metadata_text_fields_match_database_length_boundaries(
+    field_name: str,
+    maximum: int,
+) -> None:
+    payload: dict[str, object] = {
+        "title": "Metadata boundary",
+        "file_type": DocumentFileType.TXT,
+        field_name: "x" * maximum,
+    }
+
+    metadata = DocumentMetadata.model_validate(payload)
+
+    assert getattr(metadata, field_name) == "x" * maximum
+    with pytest.raises(ValueError):
+        DocumentMetadata.model_validate(
+            {
+                **payload,
+                field_name: "x" * (maximum + 1),
+            }
         )
 
 

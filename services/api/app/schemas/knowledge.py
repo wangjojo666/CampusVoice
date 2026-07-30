@@ -16,12 +16,12 @@ class DocumentFileType(StrEnum):
 
 
 class DocumentMetadata(_StrictModel):
-    title: str = Field(min_length=1, max_length=500)
-    department: str | None = Field(default=None, max_length=300)
+    title: str = Field(min_length=1, max_length=240)
+    department: str | None = Field(default=None, max_length=160)
     publish_date: date | None = None
-    applicable_group: str | None = Field(default=None, max_length=500)
+    applicable_group: str | None = Field(default=None, max_length=240)
     source_url: HttpUrl | None = None
-    version: str | None = Field(default=None, max_length=100)
+    version: str | None = Field(default=None, max_length=80)
     file_type: DocumentFileType
 
     @field_validator("title", mode="before")
