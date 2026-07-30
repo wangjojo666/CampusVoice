@@ -182,14 +182,37 @@ export function useModalDialog({
     });
 
     let active = true;
-    queueMicrotask(() => {
-      if (!active || !isTopModal(id)) return;
+    let focusContainmentQueued = false;
+    const containFocus = () => {
+      if (focusContainmentQueued) return;
+      focusContainmentQueued = true;
+      queueMicrotask(() => {
+        focusContainmentQueued = false;
+        if (!active || !isTopModal(id) || !dialog.isConnected) return;
+        const focused = document.activeElement;
+        if (focused instanceof HTMLElement && focused !== dialog && dialog.contains(focused))
+          return;
+        const target =
+          dialog.querySelector<HTMLElement>("[autofocus]") ??
+          focusableElements(dialog)[0] ??
+          dialog;
+        target.focus();
+      });
+    };
+    containFocus();
+
+    const onFocusOut = (event: FocusEvent) => {
+      const nextFocused = event.relatedTarget;
+      if (nextFocused instanceof Node && dialog.contains(nextFocused)) return;
+      containFocus();
+    };
+    dialog.addEventListener("focusout", onFocusOut);
+
+    const dialogObserver = new MutationObserver(() => {
       const focused = document.activeElement;
-      if (focused instanceof HTMLElement && focused !== dialog && dialog.contains(focused)) return;
-      const target =
-        dialog.querySelector<HTMLElement>("[autofocus]") ?? focusableElements(dialog)[0] ?? dialog;
-      target.focus();
+      if (!(focused instanceof Node) || !dialog.contains(focused)) containFocus();
     });
+    dialogObserver.observe(dialog, { childList: true, subtree: true });
 
     const onKeyDown = (event: KeyboardEvent) => {
       if (!isTopModal(id) || event.defaultPrevented || event.isComposing) return;
@@ -229,6 +252,8 @@ export function useModalDialog({
     document.addEventListener("keydown", onKeyDown);
     return () => {
       active = false;
+      dialogObserver.disconnect();
+      dialog.removeEventListener("focusout", onFocusOut);
       document.removeEventListener("keydown", onKeyDown);
       const { wasTop, returnFocusCandidates } = unregisterModal(id);
       if (!wasTop) return;

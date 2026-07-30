@@ -69,6 +69,35 @@ function StackedModalHarness() {
   );
 }
 
+function ReplacingContentModalHarness() {
+  const [open, setOpen] = useState(false);
+  const [reviewing, setReviewing] = useState(false);
+  return (
+    <>
+      <button type="button" onClick={() => setOpen(true)}>
+        Open changing dialog
+      </button>
+      <Modal open={open} title="Changing dialog" onClose={() => setOpen(false)}>
+        {reviewing ? (
+          <div>
+            <p>Review the replacement content</p>
+            <button type="button">Confirm replacement</button>
+          </div>
+        ) : (
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              setReviewing(true);
+            }}
+          >
+            <button type="submit">Review replacement</button>
+          </form>
+        )}
+      </Modal>
+    </>
+  );
+}
+
 describe("Modal accessibility boundary", () => {
   it("enters and traps focus, inerts the background, locks scrolling, and restores focus", async () => {
     const user = userEvent.setup();
@@ -111,6 +140,25 @@ describe("Modal accessibility boundary", () => {
     expect(container).not.toHaveAttribute("inert");
     expect(document.body.style.overflow).toBe(originalOverflow);
     expect(opener).toHaveFocus();
+  });
+
+  it("keeps focus inside when the focused modal content is replaced", async () => {
+    const user = userEvent.setup();
+    render(<ReplacingContentModalHarness />);
+
+    await user.click(screen.getByRole("button", { name: "Open changing dialog" }));
+    const dialog = await screen.findByRole("dialog", { name: "Changing dialog" });
+    const review = screen.getByRole("button", { name: "Review replacement" });
+    review.focus();
+    expect(review).toHaveFocus();
+
+    await user.keyboard("{Enter}");
+    await screen.findByText("Review the replacement content");
+
+    await waitFor(() => {
+      expect(document.activeElement).toBeInstanceOf(HTMLElement);
+      expect(dialog.contains(document.activeElement)).toBe(true);
+    });
   });
 
   it("lets only the top modal handle Escape and keeps the outer modal isolated", async () => {
