@@ -6,6 +6,7 @@ RUN corepack enable && corepack prepare pnpm@11.7.0 --activate
 
 WORKDIR /workspace
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
+COPY patches ./patches
 COPY apps/web/package.json ./apps/web/package.json
 COPY packages/shared-types/package.json ./packages/shared-types/package.json
 RUN pnpm install --frozen-lockfile
