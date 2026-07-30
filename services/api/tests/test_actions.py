@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.entities import ActionLog, PendingAction, Task, UndoRecord
 from app.models.enums import PendingActionState
@@ -1330,8 +1331,25 @@ def test_actions_prepared_from_same_task_version_reject_stale_second_write(
     for item in prepared:
         confirm_action(client, item["id"])
 
-    winner = client.post(f"/api/actions/{prepared[0]['id']}/execute")
-    stale = client.post(f"/api/actions/{prepared[1]['id']}/execute")
+    original_get_for_update = TaskRepository.get_for_update
+    lock_calls: list[tuple[str, str]] = []
+
+    async def track_get_for_update(
+        repository: TaskRepository,
+        session: AsyncSession,
+        user_id: str,
+        locked_task_id: str,
+    ) -> Task | None:
+        lock_calls.append((user_id, locked_task_id))
+        return await original_get_for_update(repository, session, user_id, locked_task_id)
+
+    with patch.object(
+        TaskRepository,
+        "get_for_update",
+        new=track_get_for_update,
+    ):
+        winner = client.post(f"/api/actions/{prepared[0]['id']}/execute")
+        stale = client.post(f"/api/actions/{prepared[1]['id']}/execute")
 
     assert winner.status_code == 200
     assert winner.json()["success"] is True
@@ -1345,5 +1363,8 @@ def test_actions_prepared_from_same_task_version_reject_stale_second_write(
         "low",
         2,
     )
-    assert client.get(f"/api/actions/{prepared[0]['id']}").json()["state"] == "executed"
-    assert client.get(f"/api/actions/{prepared[1]['id']}").json()["state"] == "ready"
+    assert lock_calls == [("user_demo", task_id), ("user_demo", task_id)]
+    winner_state = client.get(f"/api/actions/{prepared[0]['id']}").json()
+    stale_state = client.get(f"/api/actions/{prepared[1]['id']}").json()
+    assert (winner_state["state"], winner_state["attempt_count"]) == ("executed", 1)
+    assert (stale_state["state"], stale_state["attempt_count"]) == ("ready", 0)
