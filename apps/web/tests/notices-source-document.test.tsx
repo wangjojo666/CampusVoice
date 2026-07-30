@@ -81,6 +81,23 @@ describe("NoticesPage source document handoff", () => {
     expect(screen.queryByText("没有找到相关原文")).not.toBeInTheDocument();
   });
 
+  it("clears an original-text search error after switching modes", async () => {
+    mocks.search.mockRejectedValueOnce(new Error("search unavailable"));
+    render(<NoticesPage />);
+    await waitFor(() => expect(mocks.listDocuments).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole("tab", { name: "原文检索" }));
+    fireEvent.change(screen.getByLabelText("输入检索关键词"), {
+      target: { value: "失败的检索" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "搜索原文" }));
+
+    expect(await screen.findByText("检索失败，请重试。")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: "证据问答" }));
+    expect(screen.queryByText("检索失败，请重试。")).not.toBeInTheDocument();
+  });
+
   it("ignores an original-text response after switching modes", async () => {
     let resolveSearch!: (value: {
       evidence: [];

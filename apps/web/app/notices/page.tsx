@@ -44,6 +44,7 @@ export default function NoticesPage() {
   const searchGeneration = useRef(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [searchError, setSearchError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [uploadOpen, setUploadOpen] = useState(false);
 
@@ -70,6 +71,7 @@ export default function NoticesPage() {
     const submittedMode = mode;
     setSearching(true);
     setError(null);
+    setSearchError(null);
     setAnswer(null);
     setEvidence([]);
     setVersionConflicts([]);
@@ -97,7 +99,7 @@ export default function NoticesPage() {
       setHasSearched(true);
     } catch (reason) {
       if (generation !== searchGeneration.current) return;
-      setError(reason instanceof ApiError ? reason.userMessage : "检索失败，请重试。");
+      setSearchError(reason instanceof ApiError ? reason.userMessage : "检索失败，请重试。");
     } finally {
       if (generation === searchGeneration.current) setSearching(false);
     }
@@ -108,6 +110,7 @@ export default function NoticesPage() {
     searchGeneration.current += 1;
     setMode(nextMode);
     setSearching(false);
+    setSearchError(null);
     setHasSearched(false);
     setAnswer(null);
     setEvidence([]);
@@ -155,6 +158,11 @@ export default function NoticesPage() {
       {error ? (
         <div className="mb-5">
           <ErrorState message={error} onRetry={loading ? undefined : () => void load()} compact />
+        </div>
+      ) : null}
+      {searchError ? (
+        <div className="mb-5">
+          <ErrorState message={searchError} compact />
         </div>
       ) : null}
       {notice ? (
