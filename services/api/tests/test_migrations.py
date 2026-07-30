@@ -162,12 +162,40 @@ def test_offline_postgresql_upgrade_renders_through_head(target: str) -> None:
     assert completed.stdout.count("UPDATE impact_migration_items") == 2
     assert "SELECT impact_migration_plans.id" not in completed.stdout
     assert "SELECT impact_migration_items.id" not in completed.stdout
-    assert completed.stdout.count("length(btrim(tasks.course_id") == 1
-    assert completed.stdout.count("length(btrim(calendar_events.course_id") == 1
+    assert completed.stdout.count("btrim(tasks.course_id") == 3
+    assert completed.stdout.count("btrim(calendar_events.course_id") == 3
+    assert completed.stdout.count("chr(160)") == 6
     assert "typeof(tasks.course_id)" not in completed.stdout
     assert "typeof(calendar_events.course_id)" not in completed.stdout
+    assert completed.stdout.count("DO $alembic_0009$") == 4
+    assert "LOCK TABLE courses, tasks, calendar_events IN EXCLUSIVE MODE NOWAIT" in completed.stdout
+    assert "revision 0009 cannot strictly advance tasks.updated_at" in completed.stdout
+    assert "revision 0009 cannot strictly advance calendar_events.updated_at" in completed.stdout
+    assert "revision 0009 cannot safely advance tasks.version" in completed.stdout
+    assert "revision 0009 cannot safely advance calendar_events.version" in completed.stdout
+    assert completed.stdout.count("version >= 2147483647") == 2
+    assert completed.stdout.count("'infinity'::TIMESTAMP WITHOUT TIME ZONE") == 2
+    assert completed.stdout.count("TIMESTAMP '9999-12-31 23:59:59.999999'") == 2
     assert completed.stdout.count("version = version + 1") == 2
-    assert completed.stdout.count("updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')") == 2
+    assert completed.stdout.count("updated_at = GREATEST(") == 2
+    assert completed.stdout.count("CURRENT_TIMESTAMP AT TIME ZONE 'UTC'") == 4
+    assert completed.stdout.count("updated_at + INTERVAL '1 microsecond'") == 4
+    lock_position = completed.stdout.index(
+        "LOCK TABLE courses, tasks, calendar_events IN EXCLUSIVE MODE NOWAIT"
+    )
+    guard_positions = [
+        completed.stdout.index(message)
+        for message in (
+            "revision 0009 cannot safely advance tasks.version",
+            "revision 0009 cannot strictly advance tasks.updated_at",
+            "revision 0009 cannot safely advance calendar_events.version",
+            "revision 0009 cannot strictly advance calendar_events.updated_at",
+        )
+    ]
+    task_update = completed.stdout.index("UPDATE tasks\n")
+    event_update = completed.stdout.index("UPDATE calendar_events\n")
+    assert max(guard_positions) < min(task_update, event_update)
+    assert lock_position < min(guard_positions)
     expected_targets = {
         "execute_receipt_json": "execute",
         "undo_receipt_json": "undo",
@@ -1290,7 +1318,11 @@ def test_v09_clears_only_invalid_course_ownership_and_downgrade_does_not_restore
 ) -> None:
     database_path = tmp_path / "v09-course-ownership.db"
     _run_alembic(database_path, "upgrade", "0008_notice_current_and_receipt_repair")
-    timestamp = "2026-07-19T00:00:00"
+    timestamp = "2999-07-19T00:00:00.123456"
+    unicode_blank_course_id = "\u00a0"
+    assert unicode_blank_course_id.strip() == ""
+    nul_owned_course_id = "\x00owned"
+    assert nul_owned_course_id.strip() == nul_owned_course_id
 
     with closing(sqlite3.connect(database_path)) as connection:
         connection.execute("PRAGMA foreign_keys=OFF")
@@ -1308,11 +1340,19 @@ def test_v09_clears_only_invalid_course_ownership_and_downgrade_does_not_restore
             "VALUES (?, ?, ?, 1, ?, ?)",
             [
                 ("course-owned", "course-owner", "Owned Course", timestamp, timestamp),
+                (nul_owned_course_id, "course-owner", "NUL owned course", timestamp, timestamp),
                 ("course-foreign", "course-other", "Foreign Course", timestamp, timestamp),
                 (
                     " \t\n\v\f\r",
                     "course-owner",
                     "Blank identifier course",
+                    timestamp,
+                    timestamp,
+                ),
+                (
+                    unicode_blank_course_id,
+                    "course-owner",
+                    "Unicode blank identifier course",
                     timestamp,
                     timestamp,
                 ),
@@ -1332,6 +1372,14 @@ def test_v09_clears_only_invalid_course_ownership_and_downgrade_does_not_restore
             "VALUES (?, 'course-owner', ?, ?, ?, 'medium', 'pending', 'manual', 7, ?, ?)",
             [
                 ("task-owned", "Owned task", "course-owned", "Owned text", timestamp, timestamp),
+                (
+                    "task-nul-owned",
+                    "NUL owned task",
+                    nul_owned_course_id,
+                    "NUL owned text",
+                    timestamp,
+                    timestamp,
+                ),
                 (
                     "task-foreign",
                     "Foreign task",
@@ -1353,6 +1401,14 @@ def test_v09_clears_only_invalid_course_ownership_and_downgrade_does_not_restore
                     "Blank task",
                     " \t\n\v\f\r",
                     "Blank text",
+                    timestamp,
+                    timestamp,
+                ),
+                (
+                    "task-unicode-blank",
+                    "Unicode blank task",
+                    unicode_blank_course_id,
+                    "Unicode blank text",
                     timestamp,
                     timestamp,
                 ),
@@ -1380,6 +1436,16 @@ def test_v09_clears_only_invalid_course_ownership_and_downgrade_does_not_restore
                     "Owned text",
                     "2026-07-20T09:00:00",
                     "2026-07-20T10:00:00",
+                    timestamp,
+                    timestamp,
+                ),
+                (
+                    "event-nul-owned",
+                    "NUL owned event",
+                    nul_owned_course_id,
+                    "NUL owned text",
+                    "2026-07-20T08:00:00",
+                    "2026-07-20T09:00:00",
                     timestamp,
                     timestamp,
                 ),
@@ -1414,6 +1480,16 @@ def test_v09_clears_only_invalid_course_ownership_and_downgrade_does_not_restore
                     timestamp,
                 ),
                 (
+                    "event-unicode-blank",
+                    "Unicode blank event",
+                    unicode_blank_course_id,
+                    "Unicode blank text",
+                    "2026-07-20T16:00:00",
+                    "2026-07-20T17:00:00",
+                    timestamp,
+                    timestamp,
+                ),
+                (
                     "event-blob",
                     "Blob event",
                     sqlite3.Binary(b"course-blob"),
@@ -1443,8 +1519,16 @@ def test_v09_clears_only_invalid_course_ownership_and_downgrade_does_not_restore
             ).fetchone() == ("text",)
             assert connection.execute(
                 f"SELECT typeof(course_id) FROM {table} WHERE id = ?",
+                (f"{prefix}-unicode-blank",),
+            ).fetchone() == ("text",)
+            assert connection.execute(
+                f"SELECT typeof(course_id) FROM {table} WHERE id = ?",
                 (f"{prefix}-blob",),
             ).fetchone() == ("blob",)
+            assert connection.execute(
+                f"SELECT typeof(course_id) FROM {table} WHERE id = ?",
+                (f"{prefix}-nul-owned",),
+            ).fetchone() == ("text",)
 
     _run_alembic(database_path, "upgrade", "head")
     expected = [
@@ -1452,11 +1536,13 @@ def test_v09_clears_only_invalid_course_ownership_and_downgrade_does_not_restore
         ("blob", None, "Blob text"),
         ("foreign", None, "Foreign text"),
         ("missing", None, "Missing text"),
+        ("nul-owned", nul_owned_course_id, "NUL owned text"),
         ("null", None, "Null text"),
         ("owned", "course-owned", "Owned text"),
+        ("unicode-blank", None, "Unicode blank text"),
     ]
 
-    invalid_suffixes = {"blank", "blob", "foreign", "missing"}
+    invalid_suffixes = {"blank", "blob", "foreign", "missing", "unicode-blank"}
 
     def assert_repaired_course_references(
         connection: sqlite3.Connection,
@@ -1469,12 +1555,15 @@ def test_v09_clears_only_invalid_course_ownership_and_downgrade_does_not_restore
                 (f"{prefix}-%",),
             ).fetchall()
             assert rows == expected
-            for suffix, version, updated_at in connection.execute(
-                f"SELECT substr(id, instr(id, '-') + 1), version, updated_at "
+            for suffix, version, version_type, updated_at in connection.execute(
+                f"SELECT substr(id, instr(id, '-') + 1), version, "
+                f"typeof(version), updated_at "
                 f"FROM {table} WHERE id LIKE ? ORDER BY id",
                 (f"{prefix}-%",),
             ):
-                current = (int(version), str(updated_at))
+                assert type(version) is int
+                assert version_type == "integer"
+                current = (version, str(updated_at))
                 metadata[(table, str(suffix))] = current
                 if suffix in invalid_suffixes:
                     assert current[0] == 8
@@ -1516,3 +1605,232 @@ def test_v09_clears_only_invalid_course_ownership_and_downgrade_does_not_restore
     assert _current_revision(database_path) == HEAD_REVISION
     with closing(sqlite3.connect(database_path)) as connection:
         assert assert_repaired_course_references(connection) == repaired_metadata
+
+
+@pytest.mark.parametrize("boundary_table", ["tasks", "calendar_events"])
+@pytest.mark.parametrize(
+    (
+        "guard_function",
+        "guard_kind",
+        "boundary_column",
+        "boundary_value",
+        "safe_value",
+    ),
+    [
+        (
+            "_assert_version_can_advance",
+            "version",
+            "version",
+            9223372036854775807,
+            7,
+        ),
+        (
+            "_assert_updated_at_can_advance",
+            "updated_at",
+            "updated_at",
+            datetime.max.isoformat(),
+            "2999-07-19T00:00:00.123456",
+        ),
+    ],
+)
+def test_v09_sqlite_guard_replaces_collision_and_allows_same_connection_retry(
+    boundary_table: str,
+    guard_function: str,
+    guard_kind: str,
+    boundary_column: str,
+    boundary_value: object,
+    safe_value: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    revision_path = API_ROOT / "alembic" / "versions" / "0009_repair_legacy_course_ownership.py"
+    spec = importlib.util.spec_from_file_location("v09_guard_collision_test", revision_path)
+    assert spec is not None and spec.loader is not None
+    revision_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(revision_module)
+    guard_table = f"_alembic_0009_{boundary_table}_{guard_kind}_guard"
+    guard_constraint = f"ck_0009_{boundary_table}_{guard_kind}_advanceable"
+    values = {
+        "version": 7,
+        "updated_at": "2999-07-19T00:00:00.123456",
+    }
+    values[boundary_column] = boundary_value
+
+    with closing(sqlite3.connect(":memory:")) as connection:
+        connection.execute("CREATE TABLE courses (id TEXT PRIMARY KEY, user_id TEXT NOT NULL)")
+        connection.execute(
+            f"CREATE TABLE {boundary_table} ("
+            "id TEXT PRIMARY KEY, user_id TEXT NOT NULL, course_id TEXT, "
+            "version INTEGER NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            f"INSERT INTO {boundary_table} "
+            "(id, user_id, course_id, version, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (
+                "invalid-reference",
+                "owner",
+                "missing-course",
+                values["version"],
+                values["updated_at"],
+            ),
+        )
+        connection.execute(f"CREATE TEMPORARY TABLE {guard_table} (is_advanceable INTEGER)")
+        monkeypatch.setattr(
+            revision_module.op,
+            "execute",
+            lambda statement: connection.execute(str(statement)),
+        )
+        guard = getattr(revision_module, guard_function)
+
+        with pytest.raises(sqlite3.IntegrityError, match=guard_constraint):
+            guard(boundary_table, "sqlite")
+
+        temp_sql = connection.execute(
+            "SELECT sql FROM sqlite_temp_master WHERE type = 'table' AND name = ?",
+            (guard_table,),
+        ).fetchone()
+        assert temp_sql is not None
+        assert guard_constraint in str(temp_sql[0])
+        assert connection.execute(
+            f"SELECT {boundary_column} FROM {boundary_table} WHERE id = ?",
+            ("invalid-reference",),
+        ).fetchone() == (boundary_value,)
+
+        connection.execute(
+            f"UPDATE {boundary_table} SET {boundary_column} = ? WHERE id = ?",
+            (safe_value, "invalid-reference"),
+        )
+        guard(boundary_table, "sqlite")
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_temp_master WHERE type = 'table' AND name = ?",
+                (guard_table,),
+            ).fetchone()
+            is None
+        )
+
+
+@pytest.mark.parametrize("boundary_table", ["tasks", "calendar_events"])
+def test_v09_rejects_unadvanceable_updated_at_before_any_repair(
+    tmp_path: Path,
+    boundary_table: str,
+) -> None:
+    database_path = tmp_path / f"v09-{boundary_table}-updated-at-boundary.db"
+    _run_alembic(database_path, "upgrade", "0008_notice_current_and_receipt_repair")
+    normal_future = "2999-07-19T00:00:00.123456"
+    unadvanceable = datetime.max.isoformat()
+    task_updated_at = unadvanceable if boundary_table == "tasks" else normal_future
+    event_updated_at = unadvanceable if boundary_table == "calendar_events" else normal_future
+
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute(
+            "INSERT INTO users (id, display_name, is_active, created_at, updated_at) "
+            "VALUES ('boundary-owner', 'Boundary Owner', 1, ?, ?)",
+            (normal_future, normal_future),
+        )
+        connection.execute(
+            "INSERT INTO tasks "
+            "(id, user_id, title, course_id, course, priority, status, source_type, "
+            "version, created_at, updated_at) "
+            "VALUES ('task-boundary', 'boundary-owner', 'Boundary task', "
+            "'missing-course', 'Task legacy text', 'medium', 'pending', 'manual', 7, ?, ?)",
+            (normal_future, task_updated_at),
+        )
+        connection.execute(
+            "INSERT INTO calendar_events "
+            "(id, user_id, title, course_id, course, start_at, end_at, reminder_minutes, "
+            "source_type, version, created_at, updated_at) "
+            "VALUES ('event-boundary', 'boundary-owner', 'Boundary event', "
+            "'missing-course', 'Event legacy text', '2026-07-20T09:00:00', "
+            "'2026-07-20T10:00:00', 15, 'manual', 7, ?, ?)",
+            (normal_future, event_updated_at),
+        )
+        connection.commit()
+        before = {
+            table: connection.execute(
+                f"SELECT course_id, course, version, updated_at FROM {table} WHERE id = ?",
+                (("task-boundary" if table == "tasks" else "event-boundary"),),
+            ).fetchone()
+            for table in ("tasks", "calendar_events")
+        }
+
+    completed = _alembic_process(_database_url(database_path), "upgrade", "head")
+
+    assert completed.returncode != 0
+    diagnostics = completed.stdout + completed.stderr
+    assert f"ck_0009_{boundary_table}_updated_at_advanceable" in diagnostics
+    assert _current_revision(database_path) == "0008_notice_current_and_receipt_repair"
+    with closing(sqlite3.connect(database_path)) as connection:
+        after = {
+            table: connection.execute(
+                f"SELECT course_id, course, version, updated_at FROM {table} WHERE id = ?",
+                (("task-boundary" if table == "tasks" else "event-boundary"),),
+            ).fetchone()
+            for table in ("tasks", "calendar_events")
+        }
+    assert after == before
+
+
+@pytest.mark.parametrize("boundary_table", ["tasks", "calendar_events"])
+def test_v09_rejects_unadvanceable_version_before_any_repair(
+    tmp_path: Path,
+    boundary_table: str,
+) -> None:
+    database_path = tmp_path / f"v09-{boundary_table}-version-boundary.db"
+    _run_alembic(database_path, "upgrade", "0008_notice_current_and_receipt_repair")
+    timestamp = "2999-07-19T00:00:00.123456"
+    max_sqlite_integer = 9223372036854775807
+    task_version = max_sqlite_integer if boundary_table == "tasks" else 7
+    event_version = max_sqlite_integer if boundary_table == "calendar_events" else 7
+
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute(
+            "INSERT INTO users (id, display_name, is_active, created_at, updated_at) "
+            "VALUES ('version-owner', 'Version Owner', 1, ?, ?)",
+            (timestamp, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO tasks "
+            "(id, user_id, title, course_id, course, priority, status, source_type, "
+            "version, created_at, updated_at) "
+            "VALUES ('task-version-boundary', 'version-owner', 'Version task', "
+            "'missing-course', 'Task legacy text', 'medium', 'pending', 'manual', ?, ?, ?)",
+            (task_version, timestamp, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO calendar_events "
+            "(id, user_id, title, course_id, course, start_at, end_at, reminder_minutes, "
+            "source_type, version, created_at, updated_at) "
+            "VALUES ('event-version-boundary', 'version-owner', 'Version event', "
+            "'missing-course', 'Event legacy text', '2026-07-20T09:00:00', "
+            "'2026-07-20T10:00:00', 15, 'manual', ?, ?, ?)",
+            (event_version, timestamp, timestamp),
+        )
+        connection.commit()
+        before = {
+            table: connection.execute(
+                f"SELECT course_id, course, version, typeof(version), updated_at "
+                f"FROM {table} WHERE id = ?",
+                (("task-version-boundary" if table == "tasks" else "event-version-boundary"),),
+            ).fetchone()
+            for table in ("tasks", "calendar_events")
+        }
+
+    completed = _alembic_process(_database_url(database_path), "upgrade", "head")
+
+    assert completed.returncode != 0
+    diagnostics = completed.stdout + completed.stderr
+    assert f"ck_0009_{boundary_table}_version_advanceable" in diagnostics
+    assert _current_revision(database_path) == "0008_notice_current_and_receipt_repair"
+    with closing(sqlite3.connect(database_path)) as connection:
+        after = {
+            table: connection.execute(
+                f"SELECT course_id, course, version, typeof(version), updated_at "
+                f"FROM {table} WHERE id = ?",
+                (("task-version-boundary" if table == "tasks" else "event-version-boundary"),),
+            ).fetchone()
+            for table in ("tasks", "calendar_events")
+        }
+    assert after == before
+    assert all(row is not None and row[3] == "integer" for row in after.values())
