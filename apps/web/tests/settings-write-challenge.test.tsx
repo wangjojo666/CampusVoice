@@ -187,22 +187,34 @@ describe("SettingsPage write challenges", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "保存设置" })).toBeEnabled());
   });
 
-  it("does not reload settings for an unrelated hotword load error", async () => {
+  it("retries only hotwords while preserving the settings draft", async () => {
     mocks.listHotwords.mockRejectedValueOnce(new Error("hotwords unavailable"));
     render(<SettingsPage />);
 
-    await waitFor(() => expect(mocks.getSettings).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("热词加载失败")).toBeInTheDocument();
     const save = await screen.findByRole("button", { name: "保存设置" });
     await waitFor(() => expect(save).toBeEnabled());
+    expect(screen.getByLabelText("新热词")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "添加热词" })).toBeDisabled();
+    expect(screen.queryByText("还没有热词")).not.toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("专业"), {
       target: { value: "保留本地草稿" },
     });
 
-    expect(screen.queryByRole("button", { name: "重试" })).not.toBeInTheDocument();
+    const retry = screen.getByRole("button", { name: "重试" });
+    act(() => {
+      retry.click();
+      retry.click();
+    });
+
+    expect(await screen.findByRole("button", { name: "删除热词机器学习" })).toBeInTheDocument();
+    expect(screen.getByLabelText("新热词")).toBeEnabled();
     expect(screen.getByLabelText("专业")).toHaveValue("保留本地草稿");
     expect(mocks.getSettings).toHaveBeenCalledTimes(1);
+    expect(mocks.listHotwords).toHaveBeenCalledTimes(2);
   });
+
   it("preserves edits made while an older settings snapshot is being saved", async () => {
     render(<SettingsPage />);
     const save = await screen.findByRole("button", { name: "保存设置" });

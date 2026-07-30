@@ -55,7 +55,11 @@ export default function SettingsPage() {
   const loadInFlight = useRef(false);
   const settingsWriteInFlight = useRef(false);
   const settingsEditGeneration = useRef(0);
+  const hotwordsLoadInFlight = useRef(false);
   const [hotwords, setHotwords] = useState<Hotword[]>([]);
+  const [hotwordsLoaded, setHotwordsLoaded] = useState(false);
+  const [hotwordsLoading, setHotwordsLoading] = useState(false);
+  const [hotwordLoadError, setHotwordLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -79,6 +83,9 @@ export default function SettingsPage() {
     const generation = ++loadGeneration.current;
     setLoading(true);
     setSettingsLoaded(false);
+    setHotwordsLoaded(false);
+    setHotwords([]);
+    setHotwordLoadError(null);
     setError(null);
     try {
       const [settingsResult, hotwordsResult] = await Promise.allSettled([
@@ -86,26 +93,28 @@ export default function SettingsPage() {
         api.hotwords.list(),
       ]);
       if (generation !== loadGeneration.current) return;
-      const failures: string[] = [];
       if (settingsResult.status === "fulfilled") {
         settingsEditGeneration.current = 0;
         setSettings(settingsResult.value);
         setCurrentUserSettings(settingsResult.value);
         setSettingsLoaded(true);
-      } else
-        failures.push(
+      } else {
+        setError(
           settingsResult.reason instanceof ApiError
             ? settingsResult.reason.userMessage
             : "设置加载失败",
         );
-      if (hotwordsResult.status === "fulfilled") setHotwords(hotwordsResult.value.items);
-      else
-        failures.push(
+      }
+      if (hotwordsResult.status === "fulfilled") {
+        setHotwords(hotwordsResult.value.items);
+        setHotwordsLoaded(true);
+      } else {
+        setHotwordLoadError(
           hotwordsResult.reason instanceof ApiError
             ? hotwordsResult.reason.userMessage
             : "热词加载失败",
         );
-      setError(failures.length ? [...new Set(failures)].join(" ") : null);
+      }
     } finally {
       if (generation === loadGeneration.current) {
         loadInFlight.current = false;
@@ -117,6 +126,25 @@ export default function SettingsPage() {
     const timer = window.setTimeout(() => void load(), 0);
     return () => window.clearTimeout(timer);
   }, [load]);
+
+  const loadHotwords = useCallback(async () => {
+    if (loadInFlight.current || hotwordsLoadInFlight.current) return;
+    hotwordsLoadInFlight.current = true;
+    setHotwordsLoading(true);
+    setHotwordsLoaded(false);
+    setHotwordLoadError(null);
+    try {
+      const result = await api.hotwords.list();
+      setHotwords(result.items);
+      setHotwordsLoaded(true);
+    } catch (reason) {
+      setHotwords([]);
+      setHotwordLoadError(reason instanceof ApiError ? reason.userMessage : "热词加载失败");
+    } finally {
+      hotwordsLoadInFlight.current = false;
+      setHotwordsLoading(false);
+    }
+  }, []);
 
   const editSettings = useCallback((update: (current: UserSettings) => UserSettings) => {
     settingsEditGeneration.current += 1;
@@ -161,7 +189,7 @@ export default function SettingsPage() {
   };
 
   const addHotword = async () => {
-    if (!newWord.trim()) return;
+    if (!hotwordsLoaded || hotwordsLoading || !newWord.trim()) return;
     setBusy(true);
     setError(null);
     try {
@@ -177,6 +205,7 @@ export default function SettingsPage() {
   };
 
   const beginRemoveHotword = async (word: Hotword) => {
+    if (!hotwordsLoaded || hotwordsLoading) return;
     setBusy(true);
     setError(null);
     try {
@@ -195,7 +224,7 @@ export default function SettingsPage() {
   };
 
   const finishRemoveHotword = async () => {
-    if (!pendingHotwordRemoval) return;
+    if (!hotwordsLoaded || hotwordsLoading || !pendingHotwordRemoval) return;
     setBusy(true);
     setError(null);
     try {
@@ -730,16 +759,27 @@ export default function SettingsPage() {
                     <p className="text-xs text-ink-400">按课程、教师和专业术语分类管理</p>
                   </div>
                 </div>
+                {hotwordLoadError ? (
+                  <div className="mb-4">
+                    <ErrorState
+                      message={hotwordLoadError}
+                      onRetry={!hotwordsLoading && !busy ? () => void loadHotwords() : undefined}
+                      compact
+                    />
+                  </div>
+                ) : null}
                 <form
                   onSubmit={(event) => {
                     event.preventDefault();
                     void addHotword();
                   }}
                   className="space-y-2"
+                  aria-busy={hotwordsLoading}
                 >
                   <input
                     value={newWord}
                     onChange={(input) => setNewWord(input.target.value)}
+                    disabled={!hotwordsLoaded || hotwordsLoading}
                     className="field"
                     placeholder="输入热词"
                     aria-label="新热词"
@@ -750,6 +790,7 @@ export default function SettingsPage() {
                       onChange={(input) =>
                         setNewCategory(input.target.value as Hotword["category"])
                       }
+                      disabled={!hotwordsLoaded || hotwordsLoading}
                       className="field"
                     >
                       <option value="custom">自定义</option>
@@ -760,7 +801,7 @@ export default function SettingsPage() {
                     </select>
                     <button
                       type="submit"
-                      disabled={busy || !newWord.trim()}
+                      disabled={busy || hotwordsLoading || !hotwordsLoaded || !newWord.trim()}
                       className="btn-primary shrink-0 !px-3"
                     >
                       <Plus size={17} />
@@ -769,7 +810,9 @@ export default function SettingsPage() {
                   </div>
                 </form>
                 <div className="mt-5 space-y-4">
-                  {hotwords.length === 0 ? (
+                  {hotwordsLoading ? (
+                    <LoadingState rows={3} />
+                  ) : !hotwordsLoaded ? null : hotwords.length === 0 ? (
                     <EmptyState title="还没有热词" description="添加后会同步到识别服务。" />
                   ) : (
                     byCategory.map(([category, words]) => (
