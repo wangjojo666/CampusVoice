@@ -7,12 +7,14 @@ import {
   renderHook,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import VoicePage from "@/app/voice/page";
 import { useAsr } from "@/hooks/use-asr";
+import { ApiError } from "@/lib/api-client";
 import { DEFAULT_USER_SETTINGS, setCurrentUserSettings } from "@/lib/user-settings";
 import { useAssistantStore } from "@/stores/assistant-store";
 
@@ -28,9 +30,12 @@ interface ClientHandlers {
 }
 
 interface RecorderProps {
+  disabled?: boolean;
+  onStart?: () => boolean | void;
   onTranscriptChange?: (text: string, confidence: number | null) => void;
   onSourceChange?: (source: AsrTranscriptReference) => void;
-  onReset?: () => void;
+  onActiveChange?: (active: boolean) => void;
+  onReset?: () => boolean | void;
 }
 
 const mocks = vi.hoisted(() => ({
@@ -39,6 +44,8 @@ const mocks = vi.hoisted(() => ({
   recorderResume: vi.fn(),
   recorderStop: vi.fn(),
   recorderHandlers: null as RecorderHandlers | null,
+  recorderProps: null as RecorderProps | null,
+  executionOnUndo: null as (() => void) | null,
   clientConstructed: vi.fn(),
   clientConnect: vi.fn(),
   clientSendAudio: vi.fn(),
@@ -121,7 +128,18 @@ vi.mock("@/lib/asr/asr-client", () => ({
 
 vi.mock("@/lib/api-client", () => ({
   ApiError: class ApiError extends Error {
-    userMessage = this.message;
+    readonly status: number;
+    readonly code?: string;
+
+    constructor(message: string, options: { status: number; code?: string } = { status: 0 }) {
+      super(message);
+      this.status = options.status;
+      this.code = options.code;
+    }
+
+    get userMessage() {
+      return this.message;
+    }
   },
   api: {
     auth: { websocketTicket: mocks.websocketTicket },
@@ -143,26 +161,30 @@ vi.mock("@/lib/api-client", () => ({
 }));
 
 vi.mock("@/components/voice/asr-recorder", () => ({
-  AsrRecorder: ({ onTranscriptChange, onSourceChange, onReset }: RecorderProps) => (
-    <div>
-      <button
-        type="button"
-        onClick={() => {
-          onSourceChange?.({
-            sessionId: "voice-session-1",
-            transcriptionId: "transcription-1",
-            originalText: "创建复习机器学西待办",
-          });
-          onTranscriptChange?.("创建复习机器学西待办", 0.64);
-        }}
-      >
-        提交语音转写
-      </button>
-      <button type="button" onClick={onReset}>
-        重置录音
-      </button>
-    </div>
-  ),
+  AsrRecorder: (props: RecorderProps) => {
+    mocks.recorderProps = props;
+    const { onTranscriptChange, onSourceChange, onReset } = props;
+    return (
+      <div>
+        <button
+          type="button"
+          onClick={() => {
+            onSourceChange?.({
+              sessionId: "voice-session-1",
+              transcriptionId: "transcription-1",
+              originalText: "创建复习机器学西待办",
+            });
+            onTranscriptChange?.("创建复习机器学西待办", 0.64);
+          }}
+        >
+          提交语音转写
+        </button>
+        <button type="button" onClick={() => onReset?.()}>
+          重置录音
+        </button>
+      </div>
+    );
+  },
 }));
 
 vi.mock("@/components/layout/page-header", () => ({
@@ -191,21 +213,24 @@ vi.mock("@/components/actions/execution-result", () => ({
     onRetry?: () => void;
     onUndo?: () => void;
     undoBusy?: boolean;
-  }) => (
-    <div>
-      {result.message}
-      {result.retryable && onRetry ? (
-        <button type="button" onClick={onRetry}>
-          重试一次
-        </button>
-      ) : null}
-      {onUndo ? (
-        <button type="button" disabled={undoBusy} onClick={onUndo}>
-          {undoBusy ? "正在撤销" : "撤销本次操作"}
-        </button>
-      ) : null}
-    </div>
-  ),
+  }) => {
+    mocks.executionOnUndo = onUndo ?? null;
+    return (
+      <div>
+        {result.message}
+        {result.retryable && onRetry ? (
+          <button type="button" onClick={onRetry}>
+            重试一次
+          </button>
+        ) : null}
+        {onUndo ? (
+          <button type="button" disabled={undoBusy} onClick={onUndo}>
+            {undoBusy ? "正在撤销" : "撤销本次操作"}
+          </button>
+        ) : null}
+      </div>
+    );
+  },
 }));
 
 vi.mock("@/components/ui/error-state", () => ({
@@ -250,6 +275,8 @@ beforeEach(() => {
   setCurrentUserSettings(DEFAULT_USER_SETTINGS);
   useAssistantStore.getState().reset();
   mocks.recorderHandlers = null;
+  mocks.recorderProps = null;
+  mocks.executionOnUndo = null;
   mocks.clientHandlers = null;
   mocks.clientOptions = null;
   [
@@ -759,6 +786,8 @@ describe("VoicePage ASR lineage", () => {
         }),
     );
     const store = useAssistantStore.getState();
+    store.setTranscript("创建当前待办");
+    store.setSourceDocumentId("document-current");
     store.setExecution({
       success: true,
       action: "create_task",
@@ -770,10 +799,29 @@ describe("VoicePage ASR lineage", () => {
     store.setLastExecutedActionId("action-current");
     store.setWorkflowStatus("succeeded");
     const view = render(<VoicePage />);
+    const staleRecorderProps = mocks.recorderProps;
+    expect(staleRecorderProps).not.toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "撤销本次操作" }));
     const busyButton = screen.getByRole("button", { name: "正在撤销" });
     expect(busyButton).toBeDisabled();
+    expect(screen.getByRole("button", { name: "新指令" })).toBeDisabled();
+    expect(screen.getByLabelText("待解析的转写文字")).toBeDisabled();
+    expect(mocks.recorderProps?.disabled).toBe(true);
+    act(() => {
+      expect(staleRecorderProps?.onStart?.()).toBe(false);
+      expect(staleRecorderProps?.onReset?.()).toBe(false);
+      staleRecorderProps?.onSourceChange?.({
+        sessionId: "stale-session",
+        transcriptionId: "stale-transcription",
+        originalText: "过期原文",
+      });
+      staleRecorderProps?.onTranscriptChange?.("过期转写", 0.5);
+    });
+    expect(useAssistantStore.getState()).toMatchObject({
+      transcript: "创建当前待办",
+      sourceDocumentId: "document-current",
+    });
     fireEvent.click(busyButton);
 
     expect(mocks.undoAction).toHaveBeenCalledTimes(1);
@@ -798,6 +846,61 @@ describe("VoicePage ASR lineage", () => {
     );
     expect(useAssistantStore.getState().lastExecutedActionId).toBeNull();
   });
+
+  it("rejects a stale normal undo callback after the exact action context changes", () => {
+    const store = useAssistantStore.getState();
+    store.setExecution({
+      success: true,
+      action: "create_task",
+      record_id: "task-a",
+      verified_fields: { title: true },
+      side_effects: [],
+      message: "操作 A 已写入并复验",
+    });
+    store.setLastExecutedActionId("action-a");
+    store.setWorkflowStatus("succeeded");
+    render(<VoicePage />);
+
+    const staleActionACallback = mocks.executionOnUndo;
+    expect(staleActionACallback).toBeTypeOf("function");
+
+    act(() => {
+      const current = useAssistantStore.getState();
+      current.setExecution({
+        success: true,
+        action: "create_task",
+        record_id: "task-b",
+        verified_fields: { title: true },
+        side_effects: [],
+        message: "操作 B 已写入并复验",
+      });
+      current.setLastExecutedActionId("action-b");
+      current.setUndoRecoveryActionId(null);
+      current.setError(null);
+      current.setWorkflowStatus("succeeded");
+    });
+
+    staleActionACallback?.();
+    expect(mocks.undoAction).not.toHaveBeenCalled();
+    expect(useAssistantStore.getState()).toMatchObject({
+      lastExecutedActionId: "action-b",
+      undoRecoveryActionId: null,
+      execution: expect.objectContaining({ record_id: "task-b" }),
+    });
+
+    const staleActionBCallback = mocks.executionOnUndo;
+    expect(staleActionBCallback).toBeTypeOf("function");
+    act(() => useAssistantStore.getState().setUndoRecoveryActionId("action-stale"));
+    staleActionBCallback?.();
+
+    expect(mocks.undoAction).not.toHaveBeenCalled();
+    expect(useAssistantStore.getState()).toMatchObject({
+      lastExecutedActionId: "action-b",
+      undoRecoveryActionId: "action-stale",
+      execution: expect.objectContaining({ record_id: "task-b" }),
+    });
+  });
+
   it("retries a failed undo with the same current action id", async () => {
     const failedUndo = {
       success: false,
@@ -919,7 +1022,7 @@ describe("VoicePage ASR lineage", () => {
     expect(screen.queryByText("当前没有日程记录。")).not.toBeInTheDocument();
   });
 
-  it("does not let a stale undo response overwrite a reset workflow or newer action", async () => {
+  it("does not let a stale undo response overwrite a newer external action", async () => {
     const staleUndo = {
       success: true,
       action: "undo_create_task",
@@ -949,10 +1052,10 @@ describe("VoicePage ASR lineage", () => {
     render(<VoicePage />);
 
     fireEvent.click(screen.getByRole("button", { name: "撤销本次操作" }));
-    fireEvent.click(screen.getByRole("button", { name: "重置录音" }));
     act(() => {
       const current = useAssistantStore.getState();
       current.setActiveOperationId("operation-new");
+      current.setUndoRecoveryActionId(null);
       current.setExecution({
         success: true,
         action: "create_task",
@@ -1008,6 +1111,7 @@ describe("VoicePage ASR lineage", () => {
     fireEvent.click(screen.getByRole("button", { name: "撤销本次操作" }));
     expect(await screen.findByText("撤销失败，请重试。")).toBeInTheDocument();
     expect(useAssistantStore.getState().undoRecoveryActionId).toBe("action-current");
+    expect(screen.queryByRole("button", { name: "撤销本次操作" })).not.toBeInTheDocument();
 
     view.unmount();
     render(<VoicePage />);
@@ -1099,6 +1203,311 @@ describe("VoicePage ASR lineage", () => {
     });
   });
 
+  it("retries a lost execute response with the exact pending id without reparsing", async () => {
+    mocks.prepareAction.mockResolvedValueOnce({
+      id: "action-exact",
+      action: "create_task",
+      risk_level: "medium",
+      risk_reasons: ["writes_data"],
+      payload: { title: "当前待办", source_type: "manual" },
+      status: "ready",
+      confirmation_count: 1,
+      confirmations_required: 1,
+    });
+    mocks.executeAction
+      .mockRejectedValueOnce(new Error("network unavailable"))
+      .mockResolvedValueOnce({
+        success: true,
+        action: "create_task",
+        record_id: "task-exact",
+        verified_fields: { title: true },
+        side_effects: [],
+        message: "当前操作已写入并复验",
+        retryable: false,
+      });
+    const store = useAssistantStore.getState();
+    store.setTranscript("创建当前待办");
+    store.setInputMode("text_demo");
+    render(<VoicePage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "解析并检查" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("执行失败，请重试。");
+    expect(mocks.executeAction).toHaveBeenNthCalledWith(1, "action-exact");
+    expect(mocks.previewCorrection).toHaveBeenCalledOnce();
+    expect(mocks.parseIntent).toHaveBeenCalledOnce();
+    expect(mocks.prepareAction).toHaveBeenCalledOnce();
+    expect(useAssistantStore.getState()).toMatchObject({
+      workflowStatus: "error",
+      pendingAction: expect.objectContaining({ id: "action-exact", status: "ready" }),
+      execution: null,
+    });
+    expect(screen.getByRole("button", { name: "新指令" })).toBeDisabled();
+    expect(screen.getByLabelText("待解析的转写文字")).toBeDisabled();
+    expect(mocks.recorderProps?.disabled).toBe(true);
+
+    fireEvent.click(within(alert).getByRole("button", { name: "重试" }));
+
+    await waitFor(() => expect(mocks.executeAction).toHaveBeenCalledTimes(2));
+    expect(mocks.executeAction).toHaveBeenNthCalledWith(2, "action-exact");
+    expect(mocks.previewCorrection).toHaveBeenCalledOnce();
+    expect(mocks.parseIntent).toHaveBeenCalledOnce();
+    expect(mocks.prepareAction).toHaveBeenCalledOnce();
+    expect(await screen.findByText("当前操作已写入并复验")).toBeInTheDocument();
+    expect(useAssistantStore.getState()).toMatchObject({
+      workflowStatus: "succeeded",
+      pendingAction: null,
+      lastExecutedActionId: "action-exact",
+      error: null,
+    });
+  });
+
+  it("retries a resolved retryable execute result with the same pending id", async () => {
+    mocks.prepareAction.mockResolvedValueOnce({
+      id: "action-resolved-retry",
+      action: "create_task",
+      risk_level: "medium",
+      risk_reasons: ["writes_data"],
+      payload: { title: "当前待办", source_type: "manual" },
+      status: "ready",
+      confirmation_count: 1,
+      confirmations_required: 1,
+    });
+    mocks.executeAction
+      .mockResolvedValueOnce({
+        success: false,
+        action: "create_task",
+        record_id: null,
+        verified_fields: {},
+        side_effects: [],
+        message: "执行结果暂时无法确认",
+        retryable: true,
+      })
+      .mockResolvedValueOnce({
+        success: true,
+        action: "create_task",
+        record_id: "task-resolved-retry",
+        verified_fields: { title: true },
+        side_effects: [],
+        message: "当前操作已写入并复验",
+        retryable: false,
+      });
+    const store = useAssistantStore.getState();
+    store.setTranscript("创建当前待办");
+    store.setInputMode("text_demo");
+    render(<VoicePage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "解析并检查" }));
+
+    expect(await screen.findByText("执行结果暂时无法确认")).toBeInTheDocument();
+    expect(useAssistantStore.getState()).toMatchObject({
+      workflowStatus: "error",
+      pendingAction: expect.objectContaining({ id: "action-resolved-retry", status: "ready" }),
+      execution: expect.objectContaining({ success: false, retryable: true }),
+    });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "重试一次" })).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "重试一次" }));
+
+    await waitFor(() => expect(mocks.executeAction).toHaveBeenCalledTimes(2));
+    expect(mocks.executeAction).toHaveBeenNthCalledWith(1, "action-resolved-retry");
+    expect(mocks.executeAction).toHaveBeenNthCalledWith(2, "action-resolved-retry");
+    expect(mocks.previewCorrection).toHaveBeenCalledOnce();
+    expect(mocks.parseIntent).toHaveBeenCalledOnce();
+    expect(mocks.prepareAction).toHaveBeenCalledOnce();
+    expect(await screen.findByText("当前操作已写入并复验")).toBeInTheDocument();
+  });
+
+  it("fails closed and clears the pending id after a permanent execute failure", async () => {
+    mocks.prepareAction.mockResolvedValueOnce({
+      id: "action-permanent",
+      action: "create_task",
+      risk_level: "medium",
+      risk_reasons: ["writes_data"],
+      payload: { title: "当前待办", source_type: "manual" },
+      status: "ready",
+      confirmation_count: 1,
+      confirmations_required: 1,
+    });
+    mocks.executeAction.mockRejectedValueOnce(
+      new ApiError("动作状态冲突", { status: 409, code: "action_state_conflict" }),
+    );
+    const store = useAssistantStore.getState();
+    store.setTranscript("创建当前待办");
+    store.setInputMode("text_demo");
+    render(<VoicePage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "解析并检查" }));
+
+    expect(await screen.findByText("动作状态冲突")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(mocks.executeAction).toHaveBeenCalledWith("action-permanent");
+    expect(useAssistantStore.getState()).toMatchObject({
+      workflowStatus: "error",
+      pendingAction: null,
+      lastExecutedActionId: null,
+      execution: {
+        success: false,
+        action: "create_task",
+        record_id: null,
+        retryable: false,
+        failure_reason: "action_state_conflict",
+      },
+    });
+    expect(screen.queryByRole("button", { name: "重试" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "重试一次" })).not.toBeInTheDocument();
+  });
+
+  it("clears the pending id after a resolved permanent execute result", async () => {
+    mocks.prepareAction.mockResolvedValueOnce({
+      id: "action-resolved-permanent",
+      action: "create_task",
+      risk_level: "medium",
+      risk_reasons: ["writes_data"],
+      payload: { title: "当前待办", source_type: "manual" },
+      status: "ready",
+      confirmation_count: 1,
+      confirmations_required: 1,
+    });
+    mocks.executeAction.mockResolvedValueOnce({
+      success: false,
+      action: "create_task",
+      record_id: null,
+      verified_fields: {},
+      side_effects: [],
+      message: "动作已终止，不能重试",
+      retryable: false,
+    });
+    const store = useAssistantStore.getState();
+    store.setTranscript("创建当前待办");
+    store.setInputMode("text_demo");
+    render(<VoicePage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "解析并检查" }));
+
+    expect(await screen.findByText("动作已终止，不能重试")).toBeInTheDocument();
+    expect(mocks.executeAction).toHaveBeenCalledWith("action-resolved-permanent");
+    expect(useAssistantStore.getState()).toMatchObject({
+      workflowStatus: "error",
+      pendingAction: null,
+      lastExecutedActionId: null,
+      execution: expect.objectContaining({ success: false, retryable: false }),
+    });
+    expect(screen.queryByRole("button", { name: "重试" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "重试一次" })).not.toBeInTheDocument();
+  });
+
+  it("clears stale workflow on ASR start and blocks parsing while ASR is active", async () => {
+    const store = useAssistantStore.getState();
+    store.setTranscript("旧指令");
+    store.setExecution({
+      success: true,
+      action: "create_task",
+      record_id: "task-old",
+      verified_fields: { title: true },
+      side_effects: [],
+      message: "旧操作已写入",
+    });
+    store.setLastExecutedActionId("action-old");
+    store.setWorkflowStatus("succeeded");
+    render(<VoicePage />);
+
+    act(() => expect(mocks.recorderProps?.onStart?.()).not.toBe(false));
+    expect(useAssistantStore.getState()).toMatchObject({
+      transcript: "",
+      workflowStatus: "idle",
+      execution: null,
+      lastExecutedActionId: null,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "提交语音转写" }));
+    const textarea = screen.getByLabelText("待解析的转写文字");
+    const analyzeButton = screen.getByRole("button", { name: "解析并检查" });
+    expect(textarea).toBeDisabled();
+    expect(analyzeButton).toBeDisabled();
+    expect(screen.getByRole("button", { name: "新指令" })).toBeDisabled();
+    fireEvent.click(analyzeButton);
+    expect(mocks.previewCorrection).not.toHaveBeenCalled();
+
+    act(() => mocks.recorderProps?.onActiveChange?.(true));
+    expect(analyzeButton).toBeDisabled();
+    act(() => mocks.recorderProps?.onActiveChange?.(false));
+    await waitFor(() => expect(analyzeButton).toBeEnabled());
+  });
+
+  it("fails closed and forgets the undo id after a permanent undo failure", async () => {
+    mocks.undoAction.mockRejectedValueOnce(
+      new ApiError("撤销状态冲突", { status: 409, code: "undo_conflict" }),
+    );
+    const store = useAssistantStore.getState();
+    store.setTranscript("创建当前待办");
+    store.setExecution({
+      success: true,
+      action: "create_task",
+      record_id: "task-current",
+      verified_fields: { title: true },
+      side_effects: [],
+      message: "当前操作已写入并复验",
+    });
+    store.setLastExecutedActionId("action-current");
+    store.setWorkflowStatus("succeeded");
+    render(<VoicePage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "撤销本次操作" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("撤销状态冲突");
+    expect(mocks.undoAction).toHaveBeenCalledWith("action-current");
+    expect(useAssistantStore.getState()).toMatchObject({
+      workflowStatus: "error",
+      lastExecutedActionId: null,
+      undoRecoveryActionId: null,
+    });
+    expect(screen.queryByRole("button", { name: "重试" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "重试一次" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "撤销本次操作" })).not.toBeInTheDocument();
+  });
+
+  it("forgets the undo id after a resolved permanent undo result", async () => {
+    mocks.undoAction.mockResolvedValueOnce({
+      success: false,
+      action: "undo_create_task",
+      record_id: "task-current",
+      verified_fields: { deleted: false },
+      side_effects: [],
+      message: "撤销状态已终止，不能重试",
+      retryable: false,
+    });
+    const store = useAssistantStore.getState();
+    store.setTranscript("创建当前待办");
+    store.setExecution({
+      success: true,
+      action: "create_task",
+      record_id: "task-current",
+      verified_fields: { title: true },
+      side_effects: [],
+      message: "当前操作已写入并复验",
+    });
+    store.setLastExecutedActionId("action-current");
+    store.setWorkflowStatus("succeeded");
+    render(<VoicePage />);
+
+    fireEvent.click(screen.getByRole("button", { name: "撤销本次操作" }));
+
+    expect(await screen.findByText("撤销状态已终止，不能重试")).toBeInTheDocument();
+    expect(mocks.undoAction).toHaveBeenCalledWith("action-current");
+    expect(useAssistantStore.getState()).toMatchObject({
+      workflowStatus: "error",
+      lastExecutedActionId: null,
+      undoRecoveryActionId: null,
+      execution: expect.objectContaining({ success: false, retryable: false }),
+    });
+    expect(screen.queryByRole("button", { name: "重试" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "重试一次" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "撤销本次操作" })).not.toBeInTheDocument();
+  });
+
   it("does not offer analyze as a retry for a non-retryable undo failure", () => {
     const store = useAssistantStore.getState();
     store.setTranscript("创建当前待办");
@@ -1117,7 +1526,8 @@ describe("VoicePage ASR lineage", () => {
 
     render(<VoicePage />);
 
-    expect(screen.getByRole("alert")).toHaveTextContent("当前撤销无法安全重试");
+    expect(screen.getByText("当前撤销无法安全重试")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "重试" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "重试一次" })).not.toBeInTheDocument();
     expect(mocks.previewCorrection).not.toHaveBeenCalled();
@@ -1157,7 +1567,9 @@ describe("VoicePage ASR lineage", () => {
     store.setWorkflowStatus("error");
     render(<VoicePage />);
 
-    expect(screen.getByRole("alert")).toHaveTextContent("首次数据库复验失败");
+    expect(screen.getByText("首次数据库复验失败")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "重试一次" })).toHaveLength(1);
     fireEvent.click(screen.getByRole("button", { name: "重试一次" }));
 
     expect(mocks.executeAction).toHaveBeenCalledWith("action-current");

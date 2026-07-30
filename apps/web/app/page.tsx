@@ -19,6 +19,7 @@ import { buildTodaySummary } from "@/lib/dashboard/today";
 import { buildWeeklyRhythm } from "@/lib/dashboard/weekly-rhythm";
 import { formatDateTime, relativeTime } from "@/lib/format";
 import { useUserSettings } from "@/lib/user-settings";
+import { hasUnsettledAssistantMutation } from "@/lib/voice/workflow-recovery";
 import { useAssistantStore } from "@/stores/assistant-store";
 
 const VOICE_STARTERS = [
@@ -57,11 +58,24 @@ export default function HomePage() {
   const [clockMs, setClockMs] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [logsExpanded, setLogsExpanded] = useState(false);
-  const setTranscript = useAssistantStore((state) => state.setTranscript);
-  const setInputMode = useAssistantStore((state) => state.setInputMode);
-  const clearResult = useAssistantStore((state) => state.clearResult);
-  const resetAssistant = useAssistantStore((state) => state.reset);
   const transcript = useAssistantStore((state) => state.transcript);
+  const mutationLocked = useAssistantStore((state) => hasUnsettledAssistantMutation(state));
+
+  const replaceAssistantInput = useCallback((text: string, mode: "voice" | "text_demo") => {
+    const current = useAssistantStore.getState();
+    if (hasUnsettledAssistantMutation(current)) return false;
+    current.clearResult();
+    current.setTranscript(text);
+    current.setInputMode(mode);
+    return true;
+  }, []);
+
+  const resetAssistantInput = useCallback(() => {
+    const current = useAssistantStore.getState();
+    if (hasUnsettledAssistantMutation(current)) return false;
+    current.reset();
+    return true;
+  }, []);
 
   const load = useCallback(async () => {
     setTaskStatus((current) => (current === "error" ? "loading" : current));
@@ -236,17 +250,14 @@ export default function HomePage() {
                     <button
                       key={starter.label}
                       type="button"
+                      disabled={mutationLocked}
                       title={starter.prompt}
-                      onClick={() => {
-                        clearResult();
-                        setTranscript(starter.prompt);
-                        setInputMode("text_demo");
-                      }}
+                      onClick={() => replaceAssistantInput(starter.prompt, "text_demo")}
                       aria-pressed={selected}
                       className={
                         selected
-                          ? "min-h-11 rounded-xl border border-teal-200 bg-teal-50 px-3.5 py-2 text-left text-xs leading-5 font-bold text-teal-800 transition-colors"
-                          : "min-h-11 rounded-xl border border-mist-200 bg-white/82 px-3.5 py-2 text-left text-xs leading-5 font-bold text-ink-600 transition-colors hover:border-teal-100 hover:bg-teal-50/60"
+                          ? "min-h-11 rounded-xl border border-teal-200 bg-teal-50 px-3.5 py-2 text-left text-xs leading-5 font-bold text-teal-800 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                          : "min-h-11 rounded-xl border border-mist-200 bg-white/82 px-3.5 py-2 text-left text-xs leading-5 font-bold text-ink-600 transition-colors hover:border-teal-100 hover:bg-teal-50/60 disabled:cursor-not-allowed disabled:opacity-50"
                       }
                     >
                       {starter.label}
@@ -260,14 +271,12 @@ export default function HomePage() {
           <div className="rounded-[1.6rem] border border-white/80 bg-white/88 p-5 shadow-[0_18px_45px_rgba(34,56,68,.09)] backdrop-blur sm:p-6">
             <AsrRecorder
               compact
+              disabled={mutationLocked}
+              onStart={resetAssistantInput}
               onTranscriptChange={(text) => {
-                clearResult();
-                setTranscript(text);
-                setInputMode("voice");
+                replaceAssistantInput(text, "voice");
               }}
-              onReset={() => {
-                resetAssistant();
-              }}
+              onReset={resetAssistantInput}
             />
             <WorkflowSnapshot />
           </div>

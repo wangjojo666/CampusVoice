@@ -35,6 +35,12 @@ import { formatDateTime } from "@/lib/format";
 import { useUserSettings } from "@/lib/user-settings";
 import { createVerifiedFinishEvent, type VerifiedFinishEvent } from "@/lib/verified-finish";
 import { actionRequestFrom } from "@/lib/voice/action-request";
+import {
+  canInvokeAssistantUndo,
+  hasUnsettledAssistantMutation,
+  isRetryableExecuteFailure,
+  isRetryableUndoFailure,
+} from "@/lib/voice/workflow-recovery";
 import { useAssistantStore } from "@/stores/assistant-store";
 
 type IntentWithCorrection = IntentResult & { correction?: CorrectionResult };
@@ -99,10 +105,12 @@ export default function VoicePage() {
   const [transcriptionId, setTranscriptionId] = useState<string | null>(null);
   const [originalTranscript, setOriginalTranscript] = useState("");
   const [asrConfidence, setAsrConfidence] = useState<number | null>(null);
+  const [asrInProgress, setAsrInProgress] = useState(false);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [verifiedFinish, setVerifiedFinish] = useState<VerifiedFinishEvent | null>(null);
-  const [undoing, setUndoing] = useState(false);
+  const [undoingActionId, setUndoingActionId] = useState<string | null>(null);
   const undoInFlight = useRef(false);
+  const asrInProgressRef = useRef(false);
   const mounted = useRef(true);
   const startOperation = useCallback(() => {
     const operationId = crypto.randomUUID();
@@ -110,7 +118,7 @@ export default function VoicePage() {
     currentStore.setActiveOperationId(operationId);
     currentStore.setUndoRecoveryActionId(null);
     undoInFlight.current = false;
-    setUndoing(false);
+    setUndoingActionId(null);
     return operationId;
   }, []);
   const isOperationCurrent = useCallback(
@@ -126,14 +134,28 @@ export default function VoicePage() {
     };
   }, []);
 
+  const undoRetryActionId =
+    store.undoRecoveryActionId !== null && store.undoRecoveryActionId === store.lastExecutedActionId
+      ? store.undoRecoveryActionId
+      : null;
   const undoBusy =
-    undoing ||
-    (store.workflowStatus === "executing" &&
-      Boolean(store.undoRecoveryActionId) &&
-      store.undoRecoveryActionId === store.lastExecutedActionId);
+    store.workflowStatus === "executing" &&
+    (undoRetryActionId !== null || undoingActionId === store.lastExecutedActionId);
+  const undoRecoveryMatchesCurrent =
+    store.undoRecoveryActionId === null ||
+    store.undoRecoveryActionId === store.lastExecutedActionId;
+  const canOfferUndo =
+    store.execution?.success === true &&
+    store.lastExecutedActionId !== null &&
+    !store.error &&
+    undoRecoveryMatchesCurrent &&
+    (store.workflowStatus === "succeeded" || undoBusy);
+  const undoActionId = canOfferUndo ? store.lastExecutedActionId : null;
+  const mutationInFlight = hasUnsettledAssistantMutation(store);
   const busy =
     ["analyzing", "preparing", "confirming", "executing"].includes(store.workflowStatus) ||
     undoBusy;
+  const inputBusy = busy || mutationInFlight || asrInProgress;
 
   const execute = useCallback(
     async (action: PendingAction, generation = startOperation()) => {
@@ -146,7 +168,7 @@ export default function VoicePage() {
         if (!isOperationCurrent(generation)) return;
         store.setExecution(result);
         store.setLastExecutedActionId(result.success ? action.id : null);
-        store.setPendingAction(result.success ? null : action);
+        store.setPendingAction(!result.success && result.retryable ? action : null);
         store.setWorkflowStatus(result.success ? "succeeded" : "error");
         if (result.success) {
           store.setSourceDocumentId(null);
@@ -154,11 +176,55 @@ export default function VoicePage() {
         } else store.setError(result.message);
       } catch (reason) {
         if (!isOperationCurrent(generation)) return;
+        const message =
+          reason instanceof ApiError
+            ? reason.userMessage
+            : "\u6267\u884c\u5931\u8d25\uff0c\u8bf7\u91cd\u8bd5\u3002";
+        const retryable = isRetryableExecuteFailure(reason);
+        if (retryable) {
+          store.setPendingAction(action);
+          store.setExecution(null);
+        } else {
+          store.setPendingAction(null);
+          store.setExecution({
+            success: false,
+            action: action.action,
+            record_id: null,
+            verified_fields: {},
+            side_effects: [],
+            message,
+            failure_reason: reason instanceof ApiError ? reason.code : null,
+            retryable: false,
+          });
+        }
         store.setWorkflowStatus("error");
         store.setError(reason instanceof ApiError ? reason.userMessage : "执行失败，请重试。");
       }
     },
     [isOperationCurrent, startOperation, store],
+  );
+
+  const retryExecution = useCallback(
+    (expectedActionId: string) => {
+      const latest = useAssistantStore.getState();
+      const action = latest.pendingAction;
+      const execution = latest.execution;
+      const retryableState =
+        !execution ||
+        (!execution.success && execution.retryable === true && action?.action === execution.action);
+      if (
+        latest.workflowStatus !== "error" ||
+        latest.undoRecoveryActionId !== null ||
+        !retryableState ||
+        !action ||
+        action.id !== expectedActionId ||
+        action.status !== "ready"
+      ) {
+        return;
+      }
+      void execute(action);
+    },
+    [execute],
   );
 
   const prepareIntent = useCallback(
@@ -263,6 +329,12 @@ export default function VoicePage() {
   const analyze = useCallback(
     async (text = store.transcript, operationId?: string) => {
       if (!text.trim()) return;
+      if (
+        !operationId &&
+        (hasUnsettledAssistantMutation(useAssistantStore.getState()) || asrInProgressRef.current)
+      ) {
+        return;
+      }
       if (operationId && !isOperationCurrent(operationId)) return;
       if (mounted.current) setVerifiedFinish(null);
       store.clearResult();
@@ -409,10 +481,10 @@ export default function VoicePage() {
     }
   };
 
-  const undo = async (retryActionId?: string) => {
+  const undo = async (expectedActionId: string, mode: "normal" | "recovery") => {
     const currentState = useAssistantStore.getState();
     const currentActionId = currentState.lastExecutedActionId;
-    if (!currentActionId || (retryActionId && retryActionId !== currentActionId)) return;
+    if (!currentActionId || !canInvokeAssistantUndo(currentState, expectedActionId, mode)) return;
     if (
       undoInFlight.current ||
       (currentState.workflowStatus === "executing" &&
@@ -421,11 +493,11 @@ export default function VoicePage() {
       return;
     }
 
-    const actionId = retryActionId ?? currentActionId;
+    const actionId = expectedActionId;
     const generation = startOperation();
     store.setUndoRecoveryActionId(actionId);
     undoInFlight.current = true;
-    setUndoing(true);
+    setUndoingActionId(actionId);
     setVerifiedFinish(null);
     store.setError(null);
     store.setWorkflowStatus("executing");
@@ -433,22 +505,26 @@ export default function VoicePage() {
       const result = await api.actions.undo(actionId);
       if (!isOperationCurrent(generation)) return;
       if (useAssistantStore.getState().lastExecutedActionId !== actionId) return;
-      store.setUndoRecoveryActionId(!result.success && result.retryable ? actionId : null);
+      const retryable = !result.success && result.retryable === true;
+      store.setUndoRecoveryActionId(retryable ? actionId : null);
       store.setExecution(result);
+      if (result.success || !retryable) store.setLastExecutedActionId(null);
       if (result.success) {
-        store.setLastExecutedActionId(null);
         if (mounted.current) setVerifiedFinish(createVerifiedFinishEvent(result, "undo"));
       }
       store.setWorkflowStatus(result.success ? "succeeded" : "error");
     } catch (reason) {
       if (!isOperationCurrent(generation)) return;
       if (useAssistantStore.getState().lastExecutedActionId !== actionId) return;
+      const retryable = isRetryableUndoFailure(reason);
+      store.setUndoRecoveryActionId(retryable ? actionId : null);
+      if (!retryable) store.setLastExecutedActionId(null);
       store.setWorkflowStatus("error");
       store.setError(reason instanceof ApiError ? reason.userMessage : "撤销失败，请重试。");
     } finally {
       if (isOperationCurrent(generation)) {
         undoInFlight.current = false;
-        if (mounted.current) setUndoing(false);
+        if (mounted.current) setUndoingActionId(null);
       }
     }
   };
@@ -461,6 +537,7 @@ export default function VoicePage() {
 
   const handleAsrSource = useCallback(
     (source: AsrTranscriptReference) => {
+      if (hasUnsettledAssistantMutation(useAssistantStore.getState())) return;
       setVoiceSessionId(source.sessionId);
       setTranscriptionId(source.transcriptionId);
       setOriginalTranscript(source.originalText);
@@ -468,6 +545,33 @@ export default function VoicePage() {
     },
     [store],
   );
+
+  const setAsrActive = useCallback((active: boolean) => {
+    asrInProgressRef.current = active;
+    setAsrInProgress(active);
+  }, []);
+
+  const resetWorkflowContext = useCallback(() => {
+    const currentStore = useAssistantStore.getState();
+    if (hasUnsettledAssistantMutation(currentStore)) return false;
+    currentStore.reset();
+    undoInFlight.current = false;
+    setUndoingActionId(null);
+    setConversationId(null);
+    setVoiceSessionId(null);
+    setTranscriptionId(null);
+    setOriginalTranscript("");
+    setAsrConfidence(null);
+    setAsrActive(false);
+    setVerifiedFinish(null);
+    return true;
+  }, [setAsrActive]);
+
+  const startAsrWorkflow = useCallback(() => {
+    if (!resetWorkflowContext()) return false;
+    setAsrActive(true);
+    return true;
+  }, [resetWorkflowContext, setAsrActive]);
 
   return (
     <div>
@@ -483,16 +587,8 @@ export default function VoicePage() {
             {store.transcript ? (
               <button
                 type="button"
-                onClick={() => {
-                  store.reset();
-                  undoInFlight.current = false;
-                  setUndoing(false);
-                  setConversationId(null);
-                  setVoiceSessionId(null);
-                  setTranscriptionId(null);
-                  setOriginalTranscript("");
-                  setVerifiedFinish(null);
-                }}
+                disabled={mutationInFlight || asrInProgress}
+                onClick={() => void resetWorkflowContext()}
                 className="btn-secondary"
               >
                 <RotateCcw size={16} /> 新指令
@@ -505,24 +601,18 @@ export default function VoicePage() {
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1.15fr)_minmax(360px,.85fr)]">
         <div className="space-y-6">
           <AsrRecorder
+            disabled={mutationInFlight}
             onTranscriptChange={(text, confidence) => {
+              if (hasUnsettledAssistantMutation(useAssistantStore.getState())) return;
               setVerifiedFinish(null);
               store.setTranscript(text);
               store.setInputMode("voice");
               setAsrConfidence(confidence);
             }}
+            onActiveChange={setAsrActive}
             onSourceChange={handleAsrSource}
-            onReset={() => {
-              setVoiceSessionId(null);
-              setTranscriptionId(null);
-              setOriginalTranscript("");
-              setAsrConfidence(null);
-              setConversationId(null);
-              setVerifiedFinish(null);
-              undoInFlight.current = false;
-              setUndoing(false);
-              store.reset();
-            }}
+            onStart={startAsrWorkflow}
+            onReset={resetWorkflowContext}
           />
 
           {store.transcript ? (
@@ -545,7 +635,11 @@ export default function VoicePage() {
               ) : null}
               <textarea
                 value={store.transcript}
-                onChange={(event) => store.setTranscript(event.target.value)}
+                onChange={(event) => {
+                  if (hasUnsettledAssistantMutation(useAssistantStore.getState())) return;
+                  store.setTranscript(event.target.value);
+                }}
+                disabled={inputBusy}
                 className="field resize-y leading-7"
                 rows={3}
                 aria-label="待解析的转写文字"
@@ -553,7 +647,7 @@ export default function VoicePage() {
               <div className="mt-4 flex justify-end">
                 <button
                   type="button"
-                  disabled={busy || !store.transcript.trim()}
+                  disabled={inputBusy || !store.transcript.trim()}
                   onClick={() => void analyze()}
                   className="btn-primary"
                 >
@@ -567,7 +661,7 @@ export default function VoicePage() {
                     : store.workflowStatus === "preparing"
                       ? "正在检查风险"
                       : "解析并检查"}
-                  {!busy ? <ArrowRight size={16} /> : null}
+                  {!inputBusy ? <ArrowRight size={16} /> : null}
                 </button>
               </div>
             </section>
@@ -576,16 +670,18 @@ export default function VoicePage() {
           {store.correction ? (
             <CorrectionDiff correction={store.correction} onChoose={chooseCorrection} />
           ) : null}
-          {store.error ? (
+          {store.error && (!store.execution || store.execution.success) ? (
             <ErrorState
               title="流程暂未完成"
               message={store.error}
               onRetry={
-                store.undoRecoveryActionId
-                  ? () => void undo(store.undoRecoveryActionId ?? undefined)
-                  : !store.execution && store.transcript
-                    ? () => void analyze()
-                    : undefined
+                undoRetryActionId && !undoBusy
+                  ? () => void undo(undoRetryActionId, "recovery")
+                  : !store.execution && store.pendingAction?.status === "ready"
+                    ? () => retryExecution(store.pendingAction?.id ?? "")
+                    : !store.execution && !store.pendingAction && store.transcript
+                      ? () => void analyze()
+                      : undefined
               }
             />
           ) : null}
@@ -683,20 +779,19 @@ export default function VoicePage() {
               verifiedFinish={verifiedFinish}
               undoBusy={undoBusy}
               onRetry={
-                store.execution.retryable && store.undoRecoveryActionId
-                  ? () => void undo(store.undoRecoveryActionId ?? undefined)
-                  : store.execution.retryable && store.pendingAction
-                    ? () => {
-                        const action = store.pendingAction;
-                        if (action) void execute(action);
-                      }
+                store.workflowStatus !== "executing" &&
+                store.execution.retryable &&
+                undoRetryActionId
+                  ? () => void undo(undoRetryActionId, "recovery")
+                  : store.workflowStatus !== "executing" &&
+                      store.execution.retryable &&
+                      store.undoRecoveryActionId === null &&
+                      store.pendingAction?.status === "ready" &&
+                      store.pendingAction.action === store.execution.action
+                    ? () => retryExecution(store.pendingAction?.id ?? "")
                     : undefined
               }
-              onUndo={
-                store.execution.success && store.lastExecutedActionId
-                  ? () => void undo()
-                  : undefined
-              }
+              onUndo={undoActionId ? () => void undo(undoActionId, "normal") : undefined}
             />
           ) : null}
           {store.knowledgeAnswer ? (
