@@ -1,8 +1,9 @@
 import json
 import re
+import unicodedata
 from collections.abc import Sequence
 from datetime import date, datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -215,21 +216,40 @@ def _without_reminder_phrases(text: str) -> str:
     return _REMINDER_PATTERN.sub("", text)
 
 
+_TIME_FRAGMENT_PATTERN = re.compile(
+    r"(?:(?P<period>凌晨|早上|上午|中午|下午|晚上|今晚))?"
+    r"(?P<hour>\d{1,2}|[零一二两三四五六七八九十]{1,3})"
+    r"(?:[:点时](?P<minute>\d{1,2})?分?)"
+)
+_CONTEXT_DATE_FRAGMENT_PATTERN = re.compile(
+    r"(?:今天|今晚|明天|后天|20\d{2}[年\-/]\d{1,2}[月\-/]\d{1,2}日?|"
+    r"\d{1,2}月\d{1,2}[日号])"
+)
+
+
+def _is_pure_temporal_clarification(text: str) -> bool:
+    remainder = _without_reminder_phrases(text)
+    if len(list(_CONTEXT_DATE_FRAGMENT_PATTERN.finditer(remainder))) > 1:
+        return False
+    remainder = _CONTEXT_DATE_FRAGMENT_PATTERN.sub("", remainder)
+    remainder = _TIME_FRAGMENT_PATTERN.sub("", remainder)
+    return re.fullmatch(r"[从到至和及、，,。.!！?？:：]*", remainder) is not None
+
+
 def _find_times(text: str) -> tuple[str | None, str | None]:
     text = _without_reminder_phrases(text)
-    pattern = re.compile(
-        r"(?:(?P<period>凌晨|早上|上午|中午|下午|晚上|今晚))?"
-        r"(?P<hour>\d{1,2}|[零一二两三四五六七八九十]{1,3})"
-        r"(?:[:点时](?P<minute>\d{1,2})?分?)"
-    )
-    matches = list(pattern.finditer(text))
+    matches = list(_TIME_FRAGMENT_PATTERN.finditer(text))
     values: list[str] = []
-    for match in matches[:2]:
+    first_period = ""
+    for index, match in enumerate(matches[:2]):
         hour = _hour_number(match.group("hour"))
         if hour is None:
             continue
         minute = int(match.group("minute") or 0)
-        period = match.group("period") or ""
+        explicit_period = match.group("period") or ""
+        if index == 0:
+            first_period = explicit_period
+        period = explicit_period or (first_period if index > 0 else "")
         if period in {"下午", "晚上", "今晚"} and hour < 12:
             hour += 12
         if period == "中午" and hour < 11:
@@ -240,39 +260,138 @@ def _find_times(text: str) -> tuple[str | None, str | None]:
     return (values[0] if values else None, values[1] if len(values) > 1 else None)
 
 
+_QUOTED_LITERAL_PATTERN = re.compile(
+    r'(《[^》]*》|“[^”]*”|「[^」]*」|『[^』]*』|"[^"]*"|\'[^\']*\')'
+)
+_UPDATE_FIELD_MODIFIER_PATTERN = re.compile(
+    r"(?:的)?(?:标题|优先级|状态|截止时间|截止日期|时间|日期|地点)?"
+    r"(?:改名为|重命名为|改为|改成|更新为|调整为|设为|标记为|改到|推迟到|提前到)"
+)
+_TEMPORAL_META_TITLE_PATTERN = re.compile(
+    r"^(?:研究|学习|讨论|比较|分析|整理|记录|了解|阅读).+"
+    r"(?:的)?(?:含义|概念|(?:这个)?表达|语义|字样|说法|用法|词句|词语|短语|"
+    r"意思|区别|差异|原因|原理|方法|教程|示例|例子)$"
+)
+
+
+def _without_temporal_phrases_outside_quotes(text: str) -> str:
+    parts = _QUOTED_LITERAL_PATTERN.split(text)
+    cleaned_parts: list[str] = []
+    for part in parts:
+        if _QUOTED_LITERAL_PATTERN.fullmatch(part) is not None:
+            cleaned_parts.append(part)
+            continue
+        time_matches = list(_TIME_FRAGMENT_PATTERN.finditer(part))
+        range_spans = [
+            (left.end(), right.start())
+            for left, right in zip(time_matches, time_matches[1:], strict=False)
+            if re.fullmatch(
+                r"(?:到|至|[-~～—–－])",
+                part[left.end() : right.start()],
+            )
+            is not None
+        ]
+        cleaned = part
+        for start, end in reversed(range_spans):
+            cleaned = cleaned[:start] + cleaned[end:]
+        cleaned = _without_reminder_phrases(cleaned)
+        cleaned = _CONTEXT_DATE_FRAGMENT_PATTERN.sub("", cleaned)
+        cleaned = _TIME_FRAGMENT_PATTERN.sub("", cleaned)
+        cleaned = re.sub(
+            r"(^|[，,。.!！?？；;])(?:截止|开始)(?=$|[，,。.!！?？；;])",
+            r"\1",
+            cleaned,
+        )
+        cleaned_parts.append(cleaned)
+    return "".join(cleaned_parts)
+
+
+def _split_temporal_meta_title(text: str) -> tuple[str, str] | None:
+    match = re.match(r"(?P<title>[^，,。.!！?？；;]+)(?P<trailing>.*)$", text)
+    if match is None:
+        return None
+    title = match.group("title")
+    has_temporal_literal = (
+        _REMINDER_PATTERN.search(title) is not None
+        or _CONTEXT_DATE_FRAGMENT_PATTERN.search(title) is not None
+        or _TIME_FRAGMENT_PATTERN.search(title) is not None
+    )
+    if not has_temporal_literal or _TEMPORAL_META_TITLE_PATTERN.search(title) is None:
+        return None
+    return title, match.group("trailing")
+
+
+def _without_create_title_temporal_phrases(text: str) -> str:
+    meta_title = _split_temporal_meta_title(text)
+    if meta_title is None:
+        return _without_temporal_phrases_outside_quotes(text)
+    title, trailing = meta_title
+    return title + _without_temporal_phrases_outside_quotes(trailing)
+
+
+def _temporal_slot_scope(text: str, intent: IntentName) -> str:
+    normalized = _compact_semantic_text(text)
+    if intent in {IntentName.DELETE_TASK, IntentName.DELETE_EVENT}:
+        return ""
+    if intent in {IntentName.UPDATE_TASK, IntentName.UPDATE_EVENT}:
+        title_delimiter = _title_delimiter_position(normalized)
+        if title_delimiter is None:
+            return normalized
+        explicit_title = normalized[title_delimiter + 1 :]
+        modifier = _UPDATE_FIELD_MODIFIER_PATTERN.search(explicit_title)
+        return explicit_title[modifier.start() :] if modifier is not None else ""
+    if intent in {IntentName.CREATE_TASK, IntentName.CREATE_EVENT}:
+        title_delimiter = _title_delimiter_position(normalized)
+        if title_delimiter is not None:
+            title = normalized[title_delimiter + 1 :]
+            meta_title = _split_temporal_meta_title(title)
+            if meta_title is not None:
+                normalized = meta_title[1]
+        return _QUOTED_LITERAL_PATTERN.sub("", normalized)
+    return normalized
+
+
+def _has_multiple_date_fragments(text: str) -> bool:
+    return len(list(_CONTEXT_DATE_FRAGMENT_PATTERN.finditer(text))) > 1
+
+
+def _has_non_increasing_time_range(text: str) -> bool:
+    start_time, end_time = _find_times(text)
+    return start_time is not None and end_time is not None and end_time <= start_time
+
+
+def _has_ambiguous_mutation_temporal_scope(text: str) -> bool:
+    return _has_multiple_date_fragments(text) or _has_non_increasing_time_range(text)
+
+
 def _extract_title(text: str, intent: IntentName) -> str | None:
     candidates: list[str] = []
-    if "把" in text:
-        after = text.split("把", 1)[1]
+    object_first = re.match(r"^(?:(?:请|帮我|麻烦|替我|给我|我想|我要|我需要))*(?:把|将)", text)
+    if object_first is not None:
+        after = text[object_first.end() :]
         candidates.append(re.split(r"(?:加到|加入|添加到|放到|设为|创建成)", after, maxsplit=1)[0])
     candidates.append(
         re.sub(
-            r"^(?:请|帮我|麻烦)?(?:创建|新建|添加|记一个|安排)(?:一个)?"
-            r"(?:待办|任务|日程|日历事件|事件)?[：:，, ]*",
+            r"^(?:(?:请|帮我|麻烦|替我|给我|我想|我要|我需要|先|首先|马上|"
+            r"立刻|立即|稍后|再次|分别|别忘了|不要忘记|记得))*"
+            r"(?:创建|新建|添加|记一个|安排)"
+            r"(?:(?:(?:一个)|(?:1|一)(?:个|项|条|门|份|场|次|节))"
+            r"(?:待办|任务|作业|日历事件|日历|日程|事件|组会|会议|考试|答辩|讲座|课程)"
+            r"|(?:待办|任务|作业|日历事件|日历|日程|事件|组会|会议|考试|答辩|讲座|课程)"
+            r"(?=[：:，, ])|(?:待办|任务|作业|日历事件|日历|日程|事件))?"
+            r"[：:，, ]*",
             "",
             text,
         )
     )
     for candidate in candidates:
-        cleaned = _without_reminder_phrases(candidate)
-        cleaned = re.sub(r"20\d{2}[年\-/]\d{1,2}[月\-/]\d{1,2}日?", "", cleaned)
-        cleaned = re.sub(r"\d{1,2}月\d{1,2}[日号]", "", cleaned)
-        cleaned = re.sub(r"(?:今天|今晚|明天|后天)", "", cleaned)
-        cleaned = re.sub(
-            r"(?:凌晨|早上|上午|中午|下午|晚上|今晚)?(?:\d{1,2}|[零一二两三四五六七八九十]{1,3})(?:[:点时]\d{0,2}分?)",
-            "",
-            cleaned,
-        )
+        cleaned = _without_create_title_temporal_phrases(candidate)
         cleaned = re.sub(
             r"(?:加到|加入|添加到|放到)(?:我的)?(?:日历|日程|待办)(?:里)?",
             "",
             cleaned,
         )
-        cleaned = re.sub(
-            r"(?:创建|新建|添加)(?:一个)?(?:待办|任务|日程|日历事件|事件)",
-            "",
-            cleaned,
-        )
+
         cleaned = cleaned.strip("，,。.!！?？ ：:")
         if intent == IntentName.CREATE_TASK:
             cleaned = re.sub(r"^(?:待办|任务)[：:，, ]*", "", cleaned).strip()
@@ -281,36 +400,63 @@ def _extract_title(text: str, intent: IntentName) -> str | None:
     return None
 
 
+_UPDATE_TRAILING_SINGLE_CHARACTERS = frozenset("，,。.!！?？；;：:")
+_UPDATE_TRAILING_TOKENS = ("然后", "并且", "接着", "随后", "之后", "顺便", "再", "把", "将")
+
+
+def _strip_update_trailing_connectors(text: str) -> str:
+    end = len(text)
+    while end:
+        previous_end = end
+        while end and (
+            text[end - 1] in _UPDATE_TRAILING_SINGLE_CHARACTERS or text[end - 1].isspace()
+        ):
+            end -= 1
+        for token in _UPDATE_TRAILING_TOKENS:
+            if text.endswith(token, 0, end):
+                end -= len(token)
+                break
+        if end == previous_end:
+            break
+    return text[:end]
+
+
 def _extract_target_title(text: str, intent: IntentName) -> str | None:
+    explicit_title = _title_delimiter_position(_compact_semantic_text(text)) is not None
     candidate = text.strip()
-    if "把" in candidate:
-        candidate = candidate.split("把", 1)[1]
-    candidate = re.sub(
-        r"^(?:请|帮我|麻烦)?(?:删除|删掉|移除|取消|修改|更新|调整|完成)", "", candidate
+    object_first = re.match(
+        r"^(?:(?:请|帮我|麻烦|替我|给我|我想|我要|我需要))*(?:把|将)", candidate
     )
+    if object_first is not None:
+        candidate = candidate[object_first.end() :]
     candidate = re.sub(
-        r"^(?:这个|那个|上次的|之前的)?(?:待办|任务|日历事件|日程|事件)[：:，, ]*", "", candidate
-    )
-    if intent in {IntentName.UPDATE_TASK, IntentName.UPDATE_EVENT}:
-        candidate = re.split(
-            r"(?:的)?(?:标题|优先级|状态|截止时间|截止日期|时间|日期|地点)?"
-            r"(?:改名为|重命名为|改为|改成|更新为|调整为|设为|标记为|改到|推迟到|提前到)",
-            candidate,
-            maxsplit=1,
-        )[0]
-        candidate = re.split(
-            r"到(?:今天|今晚|明天|后天|20\d{2}[年\-/]|\d{1,2}月)", candidate, maxsplit=1
-        )[0]
-    candidate = re.sub(r"20\d{2}[年\-/]\d{1,2}[月\-/]\d{1,2}日?", "", candidate)
-    candidate = re.sub(r"\d{1,2}月\d{1,2}[日号]", "", candidate)
-    candidate = re.sub(r"(?:今天|今晚|明天|后天)", "", candidate)
-    candidate = re.sub(
-        r"(?:凌晨|早上|上午|中午|下午|晚上|今晚)?"
-        r"(?:\d{1,2}|[零一二两三四五六七八九十]{1,3})(?:[:点时]\d{0,2}分?)",
+        r"^(?:(?:请|帮我|麻烦|替我|给我|我想|我要|我需要|先|首先|马上|"
+        r"立刻|立即|稍后|再次|分别))*"
+        r"(?:删除|删掉|移除|取消|修改|更新|调整|完成)",
         "",
         candidate,
     )
-    candidate = re.sub(r"(?:这个)?(?:待办|任务|日历事件|日程|事件)$", "", candidate)
+    candidate = re.sub(
+        r"^(?:这个|那个|上次的|之前的)?"
+        r"(?:待办|任务|作业|日历事件|日历|日程|事件|组会|会议|考试|答辩|讲座|课程)[：:，, ]*",
+        "",
+        candidate,
+    )
+    if object_first is not None:
+        candidate = re.sub(
+            r"(?:删除|删掉|移除|取消|修改|更新|调整|完成)(?:一下|一遍|了)?$",
+            "",
+            candidate,
+        )
+    if intent in {IntentName.UPDATE_TASK, IntentName.UPDATE_EVENT}:
+        candidate = _UPDATE_FIELD_MODIFIER_PATTERN.split(candidate, maxsplit=1)[0]
+        candidate = re.split(
+            r"到(?:今天|今晚|明天|后天|20\d{2}[年\-/]|\d{1,2}月)", candidate, maxsplit=1
+        )[0]
+        candidate = _strip_update_trailing_connectors(candidate)
+    if not explicit_title:
+        candidate = _without_temporal_phrases_outside_quotes(candidate)
+        candidate = re.sub(r"(?:这个)?(?:待办|任务|日历事件|日程|事件)$", "", candidate)
     cleaned = candidate.strip("，,。.!！?？ ：:")
     return cleaned or None
 
@@ -320,100 +466,455 @@ def _new_title(text: str) -> str | None:
     return match.group("title").strip() if match else None
 
 
-def _classify_intent(text: str) -> IntentName:
-    normalized = _without_reminder_phrases(re.sub(r"\s+", "", text))
-    create_signal = any(
-        word in normalized for word in ("创建", "新建", "添加", "加到", "加入", "安排", "记一个")
-    )
-    delete_signal = any(word in normalized for word in ("删除", "删掉", "移除", "取消"))
-    update_signal = any(
-        word in normalized
-        for word in (
-            "修改",
-            "更新",
-            "改为",
-            "改成",
-            "改到",
-            "调整",
-            "推迟",
-            "提前",
-            "改名",
-            "重命名",
-            "标记",
-            "完成",
+class _IntentSignals(NamedTuple):
+    create: bool
+    update: bool
+    delete: bool
+    query: bool
+    explicit_event: bool
+    explicit_task: bool
+    mutation_commands: int
+    raw_mutation: bool
+    non_imperative: bool
+
+    @property
+    def conflicting(self) -> bool:
+        mutation_kinds = sum((self.create, self.update, self.delete))
+        return (
+            mutation_kinds > 1
+            or (self.explicit_event and self.explicit_task)
+            or (self.raw_mutation and (mutation_kinds != 1 or self.mutation_commands != 1))
+            or self.non_imperative
         )
+
+    @property
+    def query_mutation_conflict(self) -> bool:
+        return self.query and self.raw_mutation
+
+
+_CREATE_SIGNALS = ("创建", "新建", "添加", "加到", "加入", "安排", "记一个")
+_UPDATE_SIGNALS = (
+    "修改",
+    "更新",
+    "改为",
+    "改成",
+    "改到",
+    "调整",
+    "推迟",
+    "提前",
+    "改名",
+    "重命名",
+    "标记",
+    "完成",
+)
+_DELETE_SIGNALS = ("删除", "删掉", "移除", "取消")
+_QUERY_SIGNALS = (
+    "查询",
+    "查看",
+    "搜索",
+    "查找",
+    "查一下",
+    "找一下",
+    "看一下",
+    "列一下",
+    "列出",
+    "显示",
+    "看看",
+    "找找",
+    "想知道",
+    "想看",
+    "想了解",
+    "了解一下",
+    "告诉我",
+    "什么时候",
+    "有哪些",
+    "有什么",
+)
+_MUTATION_SIGNAL_PATTERN = "|".join(
+    re.escape(signal)
+    for signal in sorted(
+        {*_CREATE_SIGNALS, *_UPDATE_SIGNALS, *_DELETE_SIGNALS},
+        key=len,
+        reverse=True,
     )
-    event_signal = any(
-        word in normalized
-        for word in ("日历", "日程", "事件", "会议", "组会", "考试", "答辩", "讲座")
-    )
-    task_signal = any(word in normalized for word in ("待办", "任务", "作业", "复习"))
-    notice_signal = any(word in normalized for word in ("通知", "公告", "报名", "奖学金", "教务"))
-    query_signal = any(
-        word in normalized
-        for word in (
-            "查询",
-            "查看",
-            "搜索",
-            "查找",
-            "查一下",
-            "找一下",
-            "什么时候",
-            "有哪些",
-            "有什么",
-        )
+)
+_INDEPENDENT_MUTATION_SIGNALS = (
+    *_CREATE_SIGNALS,
+    "修改",
+    "更新",
+    "调整",
+    "推迟",
+    "提前",
+    *_DELETE_SIGNALS,
+)
+_INDEPENDENT_MUTATION_SIGNAL_PATTERN = "|".join(
+    re.escape(signal)
+    for signal in sorted(set(_INDEPENDENT_MUTATION_SIGNALS), key=len, reverse=True)
+)
+_RAW_MUTATION_SIGNAL_PATTERN = rf"(?:{_MUTATION_SIGNAL_PATTERN}|删|改|加)"
+_CREATE_SIGNAL_PATTERN = "|".join(
+    re.escape(signal) for signal in sorted(_CREATE_SIGNALS, key=len, reverse=True)
+)
+_DELETE_SIGNAL_PATTERN = "|".join(
+    re.escape(signal) for signal in sorted(_DELETE_SIGNALS, key=len, reverse=True)
+)
+_EXISTING_TARGET_MUTATION_SIGNAL_PATTERN = "|".join(
+    re.escape(signal)
+    for signal in sorted({*_UPDATE_SIGNALS, *_DELETE_SIGNALS}, key=len, reverse=True)
+)
+_COLLOQUIAL_VERB_PATTERN = r"(?:删(?!除)|改(?!为|成|到|名)|加(?!入|到))"
+_TARGET_SIGNAL_PATTERN = (
+    r"(?:待办|任务|作业|日历事件|日历|日程|事件|组会|会议|考试|答辩|讲座|课程|它|这个|那个)"
+)
+_NOMINAL_ARRANGEMENTS = ("日程安排", "会议安排", "课程安排", "工作安排", "考试安排")
+_NEGATED_IMPERATIVE_MUTATION_PATTERN = re.compile(
+    rf"(?:我|我们)?(?:请)?"
+    rf"(?:不需要|不可以|不要|不用|无需|不必|请勿|勿|禁止|不能|不准|不可|"
+    rf"不得|不应|不想|不愿|不再|不(?!要|用|需|必|可|准|得|应|想|愿|再)|别)"
+    rf"(?!忘)[^：:]*?{_RAW_MUTATION_SIGNAL_PATTERN}"
+)
+_NEGATED_STATEMENT_MUTATION_PATTERN = re.compile(
+    rf"(?:没有|还没|尚未|未(?!来)|没|不曾)"
+    rf"[^。.!！?？；;：:]*?{_RAW_MUTATION_SIGNAL_PATTERN}"
+)
+_COMMAND_PREFIX_PATTERN = (
+    r"(?:(?:请|帮我|麻烦|替我|给我|我想|我要|我需要|先|首先|马上|立刻|立即|"
+    r"稍后|再次|分别|别忘了|不要忘记|记得|顺手|顺便|最后|也))*"
+)
+_SEQUENTIAL_COMMAND_SEPARATOR_PATTERN = (
+    rf"(?:[，,。.!！?？；;、]+|并且|然后|同时|接着|接下来|随后|之后|随即|随之|"
+    rf"继而|顺便|最后|再|又|且|后(?={_COMMAND_PREFIX_PATTERN}(?:(?:把|将)|"
+    rf"(?:{_MUTATION_SIGNAL_PATTERN})|{_TARGET_SIGNAL_PATTERN})))"
+)
+_STRONG_COMMAND_SEPARATOR_PATTERN = re.compile(_SEQUENTIAL_COMMAND_SEPARATOR_PATTERN)
+_COMMAND_SEPARATOR_PATTERN = re.compile(
+    rf"(?:{_SEQUENTIAL_COMMAND_SEPARATOR_PATTERN}|以及|或者|和|与|并)"
+)
+_DIRECT_MUTATION_COMMAND_PATTERN = re.compile(
+    rf"^{_COMMAND_PREFIX_PATTERN}(?:{_MUTATION_SIGNAL_PATTERN})"
+)
+_OBJECT_FIRST_MUTATION_COMMAND_PATTERN = re.compile(
+    rf"^{_COMMAND_PREFIX_PATTERN}(?:把|将)"
+    rf"[^，,。.!！?？；;：:]{{0,128}}?(?:{_MUTATION_SIGNAL_PATTERN})"
+)
+_TARGET_FIRST_NARRATIVE_MARKER_PATTERN = (
+    r"(?:由|被|让|昨天|前天|刚刚?|已经|已|曾经|此前|之前|不能|不要|无需|不用|"
+    r"不必|别|失败)"
+)
+_TARGET_FIRST_MUTATION_COMMAND_PATTERN = re.compile(
+    rf"^{_COMMAND_PREFIX_PATTERN}{_TARGET_SIGNAL_PATTERN}"
+    rf"(?![^，,。.!！?？；;：:]{{0,64}}{_TARGET_FIRST_NARRATIVE_MARKER_PATTERN})"
+    rf"[^，,。.!！?？；;：:]{{0,64}}?(?:给|也|都)?"
+    rf"(?:{_MUTATION_SIGNAL_PATTERN})(?:掉|了)?"
+)
+_MULTIPLE_TARGET_MUTATION_PATTERN = re.compile(
+    rf"^{_COMMAND_PREFIX_PATTERN}(?:{_MUTATION_SIGNAL_PATTERN})"
+    rf"[^：:]*?{_TARGET_SIGNAL_PATTERN}[^：:]*?"
+    rf"(?:以及|和|与|、|或者|或|跟|及|还有|/|&|\+|\||｜|·|•)"
+    rf"[^：:]*?{_TARGET_SIGNAL_PATTERN}"
+)
+_BULK_TARGET_QUANTIFIER_PATTERN = (
+    r"(?:多个|所有|全部|这些|若干|前几个|一批|每个|任意|剩余|上述|以下|一切|"
+    r"大部分|部分|(?:\d+|[零〇一二两三四五六七八九十百千万几]+)"
+    r"(?:个|项|条|门|份|场|次|节)|(?:各|每一?|任意一?)(?:个|项|条|门|份|场|次|节)?)"
+)
+_BULK_TARGET_MUTATION_PATTERN = re.compile(
+    rf"^{_COMMAND_PREFIX_PATTERN}(?:{_EXISTING_TARGET_MUTATION_SIGNAL_PATTERN})"
+    rf"(?:(?!{_TARGET_SIGNAL_PATTERN})[^：:]){{0,32}}?"
+    rf"{_BULK_TARGET_QUANTIFIER_PATTERN}{_TARGET_SIGNAL_PATTERN}"
+)
+_CREATE_BULK_TARGET_MUTATION_PATTERN = re.compile(
+    rf"^{_COMMAND_PREFIX_PATTERN}(?:{_CREATE_SIGNAL_PATTERN})"
+    rf"(?:(?!{_TARGET_SIGNAL_PATTERN})[^：:]){{0,32}}?"
+    rf"(?!(?:1|一)(?:个|项|条|门|份|场|次|节){_TARGET_SIGNAL_PATTERN})"
+    rf"{_BULK_TARGET_QUANTIFIER_PATTERN}{_TARGET_SIGNAL_PATTERN}"
+)
+_IMPLICIT_MULTIPLE_TARGET_PATTERN = re.compile(
+    rf"^{_COMMAND_PREFIX_PATTERN}(?:{_DELETE_SIGNAL_PATTERN})"
+    rf"[^：:]*?{_TARGET_SIGNAL_PATTERN}[^，,。.!！?？；;：:、]{{1,64}}"
+    rf"(?:、|，|,|以及|和|与|或者|或|跟|及|还有|/|&|\+|\||｜|·|•)[^：:]+"
+)
+_REPEATED_INDEPENDENT_MUTATION_PATTERN = re.compile(
+    rf"(?:{_MUTATION_SIGNAL_PATTERN})[^：:]*?"
+    rf"(?:{_INDEPENDENT_MUTATION_SIGNAL_PATTERN})[^：:]*?{_TARGET_SIGNAL_PATTERN}"
+)
+_REPEATED_MUTATION_PREDICATE_PATTERN = re.compile(
+    rf"(?P<repeated_mutation>{_MUTATION_SIGNAL_PATTERN})"
+    rf"[^：:]{{0,96}}?{_TARGET_SIGNAL_PATTERN}[^：:]{{0,96}}?"
+    rf"(?P=repeated_mutation)[^：:]{{0,96}}?{_TARGET_SIGNAL_PATTERN}"
+)
+
+_COLLOQUIAL_MUTATION_PATTERN = re.compile(
+    rf"^{_COMMAND_PREFIX_PATTERN}(?:"
+    rf"(?:把|将)?{_TARGET_SIGNAL_PATTERN}"
+    rf"(?![^，,。.!！?？；;：:]{{0,24}}{_TARGET_FIRST_NARRATIVE_MARKER_PATTERN})"
+    rf"[^，,。.!！?？；;：:]{{0,24}}?{_COLLOQUIAL_VERB_PATTERN}"
+    rf"(?:掉|一下|一遍|了)?|{_COLLOQUIAL_VERB_PATTERN}(?:掉|一下|一遍|了)?"
+    rf"[^，,。.!！?？；;：:]{{0,24}}?{_TARGET_SIGNAL_PATTERN})"
+)
+_NON_IMPERATIVE_MUTATION_PATTERN = re.compile(
+    r"(?:只是|仅仅是|不过是|属于|系|由[^：:]{0,32}(?:负责|操作|完成)|"
+    r"为[^：:]{0,32}(?:例子|示例)|是[^：:]{0,32}(?:的|记录|例子|示例)|"
+    r"为什么|为何|何时|是否|能否|可否|是什么意思|什么(?:意思|含义)|的原因|"
+    r"(?:要|该)?(?:怎么|如何)(?:操作|做|弄|恢复|处理)|的方法|的步骤|会(?:怎样|如何)|"
+    r"怎么回事|(?:了|过)?(?:吗|么|呢)[。.!！?？]?$)"
+)
+_TITLE_META_PREFIX_PATTERN = re.compile(r"^(?:研究|学习|讨论|比较|分析|整理|记录|了解|阅读)")
+_TITLE_META_SUFFIX_PATTERN = re.compile(
+    r"(?:的(?:区别|差异|含义|概念|方法|教程|示例|例子|原因|原理)|"
+    r"是什么意思|什么(?:意思|含义))$"
+)
+_ABORT_PATTERN = re.compile(
+    r"^(?:算了|不要了|不用了|取消|停止|别动(?:它|这个|任务|待办|日程|事件)?|"
+    r"别动了|不弄了|先这样)(?:吧)?[。.!！?？]?$"
+)
+
+
+def _semantic_intent_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text)
+    return "".join(character for character in normalized if unicodedata.category(character) != "Cf")
+
+
+def _compact_semantic_text(text: str) -> str:
+    normalized = _semantic_intent_text(text)
+    normalized = re.sub(r"[\r\n]+", ";", normalized)
+    return "".join(character for character in normalized if not character.isspace())
+
+
+def _normalized_intent_text(text: str) -> str:
+    return _without_reminder_phrases(_compact_semantic_text(text))
+
+
+def _mutation_signal_scope(scope: str) -> str:
+    for phrase in _NOMINAL_ARRANGEMENTS:
+        scope = scope.replace(phrase, phrase.removesuffix("安排"))
+    return scope
+
+
+def _title_delimiter_position(normalized: str) -> int | None:
+    for match in re.finditer(r"[：:]", normalized):
+        position = match.start()
+        if (
+            position > 0
+            and position + 1 < len(normalized)
+            and normalized[position - 1].isdigit()
+            and normalized[position + 1].isdigit()
+        ):
+            continue
+        prefix = normalized[:position]
+        signal_scope = _mutation_signal_scope(prefix)
+        if (
+            any(target in prefix for target in ("待办", "任务", "日历", "日程", "事件"))
+            and re.search(_MUTATION_SIGNAL_PATTERN, signal_scope) is not None
+        ):
+            return position
+    return None
+
+
+def _is_meta_title_description(title: str) -> bool:
+    if _TITLE_META_PREFIX_PATTERN.search(title) is not None:
+        return True
+    return (
+        _TITLE_META_SUFFIX_PATTERN.search(title) is not None
+        and len(re.findall(_MUTATION_SIGNAL_PATTERN, title)) > 1
     )
 
-    if delete_signal and event_signal:
+
+def _command_scope(normalized: str) -> str:
+    title_delimiter = _title_delimiter_position(normalized)
+    if title_delimiter is None:
+        return normalized
+    prefix = normalized[:title_delimiter]
+    title = normalized[title_delimiter + 1 :]
+    separator = (
+        _STRONG_COMMAND_SEPARATOR_PATTERN
+        if _is_meta_title_description(title)
+        else _COMMAND_SEPARATOR_PATTERN
+    )
+    title_clauses = separator.split(title)
+    trailing_commands = [
+        clause for clause in title_clauses[1:] if _is_explicit_mutation_clause(clause)
+    ]
+    return ";".join((prefix, *trailing_commands))
+
+
+def _explicit_target_scope(normalized: str) -> str:
+    return re.split(r"[，,。.!！?？；;、]", _command_scope(normalized), maxsplit=1)[0]
+
+
+def _mutation_command_count(command_scope: str) -> int:
+    clauses = [clause for clause in _COMMAND_SEPARATOR_PATTERN.split(command_scope) if clause]
+    count = sum(
+        _DIRECT_MUTATION_COMMAND_PATTERN.search(clause) is not None
+        or (
+            _OBJECT_FIRST_MUTATION_COMMAND_PATTERN.search(clause) is not None
+            and re.search(_TARGET_SIGNAL_PATTERN, clause) is not None
+        )
+        or (
+            index > 0
+            and (
+                _TARGET_FIRST_MUTATION_COMMAND_PATTERN.search(clause) is not None
+                or _COLLOQUIAL_MUTATION_PATTERN.search(clause) is not None
+            )
+        )
+        for index, clause in enumerate(clauses)
+    )
+    if (
+        _MULTIPLE_TARGET_MUTATION_PATTERN.search(command_scope) is not None
+        or _BULK_TARGET_MUTATION_PATTERN.search(command_scope) is not None
+        or _CREATE_BULK_TARGET_MUTATION_PATTERN.search(command_scope) is not None
+        or _IMPLICIT_MULTIPLE_TARGET_PATTERN.search(command_scope) is not None
+        or _REPEATED_INDEPENDENT_MUTATION_PATTERN.search(command_scope) is not None
+        or _REPEATED_MUTATION_PREDICATE_PATTERN.search(command_scope) is not None
+    ):
+        return max(count, 2)
+    return count
+
+
+def _is_explicit_mutation_clause(clause: str) -> bool:
+    return re.search(_TARGET_SIGNAL_PATTERN, clause) is not None and (
+        _DIRECT_MUTATION_COMMAND_PATTERN.search(clause) is not None
+        or _OBJECT_FIRST_MUTATION_COMMAND_PATTERN.search(clause) is not None
+        or _TARGET_FIRST_MUTATION_COMMAND_PATTERN.search(clause) is not None
+        or _COLLOQUIAL_MUTATION_PATTERN.search(clause) is not None
+    )
+
+
+def _has_create_signal(command_scope: str) -> bool:
+    signal_scope = _mutation_signal_scope(command_scope)
+    return any(signal in signal_scope for signal in _CREATE_SIGNALS)
+
+
+def _has_raw_mutation(command_scope: str) -> bool:
+    signal_scope = _mutation_signal_scope(command_scope)
+    return re.search(_RAW_MUTATION_SIGNAL_PATTERN, signal_scope) is not None
+
+
+def _explicitly_negates_mutation(normalized: str) -> bool:
+    command_scope = _command_scope(normalized)
+    return (
+        _NEGATED_IMPERATIVE_MUTATION_PATTERN.search(command_scope) is not None
+        or _NEGATED_STATEMENT_MUTATION_PATTERN.search(command_scope) is not None
+    )
+
+
+def _explicitly_aborts(normalized: str) -> bool:
+    return _ABORT_PATTERN.fullmatch(normalized) is not None
+
+
+def _intent_signals(normalized: str) -> _IntentSignals:
+    command_scope = _command_scope(normalized)
+    signal_scope = _mutation_signal_scope(command_scope)
+    target_scope = _explicit_target_scope(normalized)
+    return _IntentSignals(
+        create=_has_create_signal(command_scope),
+        update=any(word in signal_scope for word in _UPDATE_SIGNALS),
+        delete=any(word in signal_scope for word in _DELETE_SIGNALS),
+        query=any(word in command_scope for word in _QUERY_SIGNALS),
+        explicit_event=any(word in target_scope for word in ("日历", "日程", "事件")),
+        explicit_task=any(word in target_scope for word in ("待办", "任务")),
+        mutation_commands=_mutation_command_count(command_scope),
+        raw_mutation=_has_raw_mutation(command_scope),
+        non_imperative=(
+            _has_raw_mutation(command_scope)
+            and _NON_IMPERATIVE_MUTATION_PATTERN.search(command_scope) is not None
+        ),
+    )
+
+
+def _classify_intent(text: str) -> IntentName:
+    normalized = _normalized_intent_text(text)
+    signals = _intent_signals(normalized)
+    event_signal = any(
+        word in normalized
+        for word in ("日历", "日程", "事件", "会议", "组会", "考试", "答辩", "讲座", "课程")
+    )
+    task_signal = any(word in normalized for word in ("待办", "任务", "作业", "复习"))
+
+    notice_signal = any(word in normalized for word in ("通知", "公告", "报名", "奖学金", "教务"))
+    if (
+        _explicitly_aborts(normalized)
+        or _explicitly_negates_mutation(normalized)
+        or signals.conflicting
+        or signals.query_mutation_conflict
+    ):
+        return IntentName.UNKNOWN
+
+    # An explicitly named target type must outrank words in the title. For
+    # example, "创建待办：整理日程安排" is a task even though "日程" is also
+    # a broad event signal.
+    if signals.explicit_event != signals.explicit_task:
+        if signals.delete:
+            return IntentName.DELETE_EVENT if signals.explicit_event else IntentName.DELETE_TASK
+        if signals.create:
+            return IntentName.CREATE_EVENT if signals.explicit_event else IntentName.CREATE_TASK
+        if signals.update:
+            return IntentName.UPDATE_EVENT if signals.explicit_event else IntentName.UPDATE_TASK
+
+    if signals.delete and event_signal:
         return IntentName.DELETE_EVENT
-    if delete_signal and task_signal:
+    if signals.delete and task_signal:
         return IntentName.DELETE_TASK
-    if create_signal and event_signal:
+    if signals.create and event_signal:
         return IntentName.CREATE_EVENT
-    if create_signal and task_signal:
+    if signals.create and task_signal:
         return IntentName.CREATE_TASK
-    if update_signal and event_signal:
+    if signals.update and event_signal:
         return IntentName.UPDATE_EVENT
-    if update_signal and task_signal:
+    if signals.update and task_signal:
         return IntentName.UPDATE_TASK
-    if notice_signal and (query_signal or not (create_signal or update_signal or delete_signal)):
+    if notice_signal and (
+        signals.query or not (signals.create or signals.update or signals.delete)
+    ):
         return IntentName.SEARCH_NOTICE
-    if event_signal and query_signal:
+    if event_signal and signals.query:
         return IntentName.QUERY_SCHEDULE
     return IntentName.UNKNOWN
 
 
-def _fallback_parse_single(text: str, now: datetime) -> IntentResult:
-    normalized = re.sub(r"\s+", "", text)
-    intent = _classify_intent(text)
-    if intent == IntentName.UNKNOWN:
-        return IntentResult(
-            intent=intent,
-            confidence=0.25,
-            slots=IntentSlots(),
-            missing_fields=[],
-            ambiguities=[],
-            source_text=text,
-            requires_confirmation=False,
-        )
+def _unknown_result(source_text: str) -> IntentResult:
+    return IntentResult(
+        intent=IntentName.UNKNOWN,
+        confidence=0.25,
+        slots=IntentSlots(),
+        missing_fields=[],
+        ambiguities=[],
+        source_text=source_text,
+        requires_confirmation=False,
+    )
 
-    parsed_date = _find_date(normalized, now.date())
-    start_time, end_time = _find_times(normalized)
-    reminder_minutes = _find_reminder_minutes(normalized)
+
+def _fallback_parse_single(text: str, now: datetime) -> IntentResult:
+    semantic_text = _semantic_intent_text(text)
+    normalized = re.sub(r"\s+", "", semantic_text)
+    intent = _classify_intent(semantic_text)
+    if intent == IntentName.UNKNOWN:
+        return _unknown_result(text)
+
+    temporal_scope = _temporal_slot_scope(semantic_text, intent)
+    if intent in _MUTATING_INTENTS and _has_ambiguous_mutation_temporal_scope(temporal_scope):
+        return _unknown_result(text)
+    parsed_date = _find_date(temporal_scope, now.date())
+    start_time, end_time = _find_times(temporal_scope)
+    reminder_minutes = _find_reminder_minutes(temporal_scope)
     if intent in {IntentName.CREATE_TASK, IntentName.CREATE_EVENT}:
-        title = _extract_title(text, intent)
+        title = _extract_title(semantic_text, intent)
     elif intent in {
         IntentName.UPDATE_TASK,
         IntentName.DELETE_TASK,
         IntentName.UPDATE_EVENT,
         IntentName.DELETE_EVENT,
     }:
-        title = _extract_target_title(text, intent)
+        title = _extract_target_title(semantic_text, intent)
     else:
         title = None
     slots = IntentSlots(
         title=title,
-        new_title=_new_title(text),
+        new_title=(
+            _new_title(semantic_text)
+            if intent in {IntentName.UPDATE_TASK, IntentName.UPDATE_EVENT}
+            else None
+        ),
         reminder_minutes=reminder_minutes,
     )
     if intent in {IntentName.CREATE_EVENT, IntentName.UPDATE_EVENT}:
@@ -423,16 +924,25 @@ def _fallback_parse_single(text: str, now: datetime) -> IntentResult:
     elif intent in {IntentName.CREATE_TASK, IntentName.UPDATE_TASK}:
         slots.due_date = parsed_date
         slots.due_time = start_time
-        if "未完成" in normalized or "恢复为待办" in normalized:
+        slot_signal_scope = (
+            _command_scope(_normalized_intent_text(semantic_text))
+            if intent == IntentName.CREATE_TASK
+            else normalized
+        )
+        if "未完成" in slot_signal_scope or "恢复为待办" in slot_signal_scope:
             slots.status = "pending"
-        elif "完成" in normalized:
+        elif "完成" in slot_signal_scope:
             slots.status = "completed"
-        if "高优先级" in normalized:
+        if "高优先级" in slot_signal_scope or re.search(
+            r"优先级(?:改为|改成|调整为|设为)?高", slot_signal_scope
+        ):
             slots.priority = "high"
-        elif "低优先级" in normalized:
+        elif "低优先级" in slot_signal_scope or re.search(
+            r"优先级(?:改为|改成|调整为|设为)?低", slot_signal_scope
+        ):
             slots.priority = "low"
     elif intent == IntentName.SEARCH_NOTICE:
-        slots.query = text.strip()
+        slots.query = semantic_text.strip()
     elif intent == IntentName.QUERY_SCHEDULE:
         slots.date = parsed_date
     return IntentResult(
@@ -451,14 +961,32 @@ def _continue_from_context(
     context: Sequence[str],
     now: datetime,
 ) -> IntentResult | None:
-    normalized = re.sub(r"\s+", "", text)
+    semantic_text = _semantic_intent_text(text)
+    normalized = re.sub(r"\s+", "", semantic_text)
+    if _explicitly_aborts(_normalized_intent_text(semantic_text)):
+        return None
     parsed_date = _find_date(normalized, now.date())
     start_time, end_time = _find_times(normalized)
     reminder_minutes = _find_reminder_minutes(normalized)
+    if not _is_pure_temporal_clarification(normalized):
+        return None
     for previous_text in reversed(context):
-        previous = _fallback_parse_single(previous_text, now)
+        if _explicitly_aborts(_normalized_intent_text(previous_text)):
+            return None
+        previous = _enforce_policy(_fallback_parse_single(previous_text, now), None)
+        if previous.intent == IntentName.UNKNOWN:
+            return None
         if previous.intent not in _MUTATING_INTENTS:
-            continue
+            return None
+        missing_fields = set(previous.missing_fields)
+        if not missing_fields:
+            return None
+        supplies_missing_field = ("date" in missing_fields and parsed_date is not None) or (
+            "start_time" in missing_fields and start_time is not None
+        )
+        if not supplies_missing_field:
+            return None
+
         slots = previous.slots.model_copy(deep=True)
         if previous.intent in {IntentName.CREATE_EVENT, IntentName.UPDATE_EVENT}:
             slots.date = parsed_date or slots.date
@@ -477,13 +1005,7 @@ def _continue_from_context(
                 slots.status = "pending"
             elif "完成" in normalized:
                 slots.status = "completed"
-        if previous.intent in {
-            IntentName.UPDATE_TASK,
-            IntentName.DELETE_TASK,
-            IntentName.UPDATE_EVENT,
-            IntentName.DELETE_EVENT,
-        } and not (parsed_date or start_time or end_time or reminder_minutes is not None):
-            slots.title = _extract_target_title(text, previous.intent) or slots.title
+
         return IntentResult(
             intent=previous.intent,
             confidence=0.74,
@@ -499,6 +1021,15 @@ def _continue_from_context(
 def _fallback_parse(text: str, now: datetime, context: Sequence[str] = ()) -> IntentResult:
     current = _fallback_parse_single(text, now)
     if current.intent != IntentName.UNKNOWN:
+        return current
+    normalized = _normalized_intent_text(text)
+    signals = _intent_signals(normalized)
+    if (
+        _explicitly_aborts(normalized)
+        or _explicitly_negates_mutation(normalized)
+        or signals.conflicting
+        or signals.query_mutation_conflict
+    ):
         return current
     return _continue_from_context(text, context, now) or current
 
@@ -539,11 +1070,11 @@ def _enrich_deterministically(
     now: datetime,
 ) -> IntentResult:
     slots = result.slots.model_copy(deep=True)
-    parsed_date = _find_date(text, now.date())
-    start_time, end_time = _find_times(text)
-    reminder_minutes = _find_reminder_minutes(text)
-    if slots.title:
-        slots.title = _without_reminder_phrases(slots.title).strip("，,。.!！?？ ：:") or None
+    temporal_scope = _temporal_slot_scope(text, result.intent)
+    parsed_date = _find_date(temporal_scope, now.date())
+    start_time, end_time = _find_times(temporal_scope)
+    reminder_minutes = _find_reminder_minutes(temporal_scope)
+
     if reminder_minutes is not None:
         slots.reminder_minutes = reminder_minutes
     if result.intent in {IntentName.CREATE_EVENT, IntentName.UPDATE_EVENT}:
@@ -554,6 +1085,96 @@ def _enrich_deterministically(
         slots.due_date = parsed_date or slots.due_date
         slots.due_time = start_time or slots.due_time
     return result.model_copy(update={"slots": slots})
+
+
+def _metadata_value_has_explicit_cue(
+    field: str,
+    candidate: str,
+    source_text: str,
+) -> bool:
+    escaped = re.escape(candidate)
+    negated_pattern = (
+        rf"(?:不要|不用|无需|不必|请勿|勿|禁止|不能|不准|不可|不得|不应|"
+        rf"不想|不愿|不再|别|不是|并非|非|不在|没有|尚未|未(?!来)|没|不曾)"
+        rf"[^，,。.!！?？；;:]{{0,16}}{escaped}"
+    )
+    if re.search(negated_pattern, source_text) is not None:
+        return False
+    if field == "description":
+        pattern = (
+            rf"(?:描述|备注|说明|内容)(?:为|是|:)?{escaped}|{escaped}(?:作为)?(?:描述|备注|说明)"
+        )
+    elif field == "course":
+        pattern = rf"(?:课程|科目)(?:为|是|:)?{escaped}|{escaped}(?:课程|课)"
+    elif field == "location":
+        pattern = (
+            rf"(?:地点|位置)(?:为|是|:)?{escaped}|(?:在|位于)[^，,。.!！?？；;:]{{0,8}}?{escaped}"
+        )
+    else:
+        return False
+    return re.search(pattern, source_text) is not None
+
+
+def _grounded_llm_metadata_value(
+    field: str,
+    value: str,
+    source_text: str,
+    *,
+    min_length: int,
+    max_length: int,
+) -> str | None:
+    candidate = value.strip()
+    if not min_length <= len(candidate) <= max_length:
+        return None
+    if any(unicodedata.category(character).startswith("C") for character in candidate):
+        return None
+    normalized_candidate = re.sub(r"\s+", "", _semantic_intent_text(candidate)).casefold()
+    normalized_source = re.sub(r"\s+", "", _semantic_intent_text(source_text)).casefold()
+    if not normalized_candidate or normalized_candidate not in normalized_source:
+        return None
+    if not _metadata_value_has_explicit_cue(field, normalized_candidate, normalized_source):
+        return None
+    return candidate
+
+
+def _merge_safe_llm_mutation_metadata(
+    deterministic: IntentResult,
+    parsed: IntentResult,
+) -> IntentResult:
+    candidates: list[tuple[str, str | None, int, int]] = []
+    if deterministic.intent in {
+        IntentName.CREATE_TASK,
+        IntentName.UPDATE_TASK,
+        IntentName.CREATE_EVENT,
+        IntentName.UPDATE_EVENT,
+    }:
+        candidates.extend(
+            [
+                ("description", parsed.slots.description, 2, 4_000),
+                ("course", parsed.slots.course, 2, 160),
+            ]
+        )
+    if deterministic.intent in {IntentName.CREATE_EVENT, IntentName.UPDATE_EVENT}:
+        candidates.append(("location", parsed.slots.location, 2, 240))
+
+    metadata: dict[str, str] = {}
+    for field, value, min_length, max_length in candidates:
+        if value is None:
+            continue
+        grounded = _grounded_llm_metadata_value(
+            field,
+            value,
+            deterministic.source_text,
+            min_length=min_length,
+            max_length=max_length,
+        )
+        if grounded is not None:
+            metadata[field] = grounded
+    if not metadata:
+        return deterministic
+    return deterministic.model_copy(
+        update={"slots": deterministic.slots.model_copy(update=metadata)}
+    )
 
 
 class IntentParser:
@@ -598,6 +1219,9 @@ class IntentParser:
         cleaned = text.strip()
         if not cleaned:
             raise IntentParseError("empty_text", "请输入或转写一段文本后再解析。")
+        semantic_text = _semantic_intent_text(cleaned).strip()
+        if not semantic_text:
+            raise IntentParseError("empty_text", "请输入或转写一段文本后再解析。")
         timezone = ZoneInfo(timezone_name) if timezone_name is not None else self._timezone
         if now is None:
             current = datetime.now(timezone)
@@ -605,19 +1229,35 @@ class IntentParser:
             current = now.replace(tzinfo=timezone)
         else:
             current = now.astimezone(timezone)
-        if self._llm is None:
-            fallback = _enrich_deterministically(
-                _fallback_parse(cleaned, current, context), cleaned, current
+        normalized = _normalized_intent_text(semantic_text)
+        signals = _intent_signals(normalized)
+        classified_intent = _classify_intent(semantic_text)
+        ambiguous_mutation_temporal_scope = (
+            classified_intent in _MUTATING_INTENTS
+            and _has_ambiguous_mutation_temporal_scope(
+                _temporal_slot_scope(semantic_text, classified_intent)
             )
-            return _enforce_policy(fallback, asr_confidence)
+        )
+        deterministic_safety_conflict = (
+            _explicitly_aborts(normalized)
+            or _explicitly_negates_mutation(normalized)
+            or signals.conflicting
+            or signals.query_mutation_conflict
+            or ambiguous_mutation_temporal_scope
+        )
+        deterministic_fallback = _enrich_deterministically(
+            _fallback_parse(cleaned, current, context), semantic_text, current
+        )
+        if self._llm is None or deterministic_safety_conflict:
+            return _enforce_policy(deterministic_fallback, asr_confidence)
 
         with observe_component(self._metrics, "llm", "complete"):
-            raw = await self._llm.extract(cleaned, context)
+            raw = await self._llm.extract(semantic_text, context)
         try:
             parsed = IntentResult.model_validate(_json_object(raw))
         except (json.JSONDecodeError, ValueError, ValidationError) as first_error:
             with observe_component(self._metrics, "llm", "complete"):
-                repaired = await self._llm.repair(cleaned, raw, str(first_error))
+                repaired = await self._llm.repair(semantic_text, raw, str(first_error))
             try:
                 parsed = IntentResult.model_validate(_json_object(repaired))
             except (json.JSONDecodeError, ValueError, ValidationError) as second_error:
@@ -627,7 +1267,12 @@ class IntentParser:
                 ) from second_error
         if parsed.source_text != cleaned:
             parsed = parsed.model_copy(update={"source_text": cleaned})
-        parsed = _enrich_deterministically(parsed, cleaned, current)
+        parsed = _enrich_deterministically(parsed, semantic_text, current)
+        if parsed.intent in _MUTATING_INTENTS:
+            if parsed.intent != deterministic_fallback.intent:
+                return _enforce_policy(_unknown_result(cleaned), asr_confidence)
+            safe_result = _merge_safe_llm_mutation_metadata(deterministic_fallback, parsed)
+            return _enforce_policy(safe_result, asr_confidence)
         return _enforce_policy(parsed, asr_confidence)
 
 
