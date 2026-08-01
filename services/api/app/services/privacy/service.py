@@ -89,6 +89,21 @@ def _safe_value(value: Any) -> Any:
     return value
 
 
+def _sanitize_course_references(value: Any, owned_course_ids: set[str]) -> Any:
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "course_id":
+                if item is None or (isinstance(item, str) and item in owned_course_ids):
+                    sanitized[key] = item
+            else:
+                sanitized[key] = _sanitize_course_references(item, owned_course_ids)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_course_references(item, owned_course_ids) for item in value]
+    return value
+
+
 def _record(entity: object, fields: tuple[str, ...]) -> dict[str, Any]:
     return {field: _safe_value(getattr(entity, field)) for field in fields}
 
@@ -612,6 +627,7 @@ class PrivacyService:
                 for item in undo_records
             ],
         }
+        data = _sanitize_course_references(data, {item.id for item in courses})
         return PrivacyExportResponse(
             generated_at=utc_now(),
             user=_record(

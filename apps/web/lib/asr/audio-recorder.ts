@@ -108,7 +108,12 @@ export class PcmAudioRecorder {
       }
     };
     this.source.connect(this.worklet).connect(this.mutedOutput).connect(context.destination);
-    await context.resume();
+    try {
+      await withTimeout("AudioContext resume", DRAIN_TIMEOUT_MS, () => context.resume());
+    } catch (reason) {
+      if (this.lifecycle !== lifecycle) throw startCancelled();
+      throw reason;
+    }
     if (this.lifecycle !== lifecycle || this.context !== context || this.stream !== stream) {
       throw startCancelled();
     }

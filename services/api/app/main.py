@@ -19,8 +19,16 @@ from app.db.base import Base
 from app.db.session import create_database_engine, create_session_factory
 from app.models.entities import User, UserSettings
 from app.security.authentication import build_authenticator
+from app.security.csrf import OidcCsrfOriginMiddleware
 from app.security.oidc import OidcClient
+from app.security.request_limits import (
+    DOCUMENT_UPLOAD_BODY_LIMIT,
+    DocumentUploadBodyLimitMiddleware,
+    RequestBodyTooLarge,
+    document_too_large_response,
+)
 from app.services.asr.connections import build_asr_quota_registry
+from app.services.asr.worker import AsrProcessSupervisor
 from app.services.errors import DomainError
 
 
@@ -94,6 +102,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         quota_registry = application.state.asr_connections
+        process_supervisor = application.state.asr_process_supervisor
         primary_error: BaseException | None = None
         try:
             await quota_registry.start()
@@ -107,6 +116,10 @@ def create_app(
             primary_error = exc
 
         cleanup_errors: list[BaseException] = []
+        try:
+            await process_supervisor.close()
+        except BaseException as exc:
+            cleanup_errors.append(exc)
         try:
             await quota_registry.close()
         except BaseException as exc:
@@ -142,8 +155,29 @@ def create_app(
     app.state.authenticator = build_authenticator(settings)
     app.state.oidc_client = OidcClient(settings) if settings.auth_mode == "oidc" else None
     app.state.asr_connections = build_asr_quota_registry(settings)
+    app.state.asr_process_supervisor = AsrProcessSupervisor(
+        max_workers=settings.asr_provider_worker_limit,
+        max_waiters=settings.asr_provider_queue_limit,
+        admission_timeout_seconds=settings.asr_provider_admission_timeout_seconds,
+        operation_timeout_seconds=settings.asr_provider_operation_timeout_seconds,
+        finish_timeout_seconds=settings.asr_provider_finish_timeout_seconds,
+        terminate_timeout_seconds=settings.asr_provider_terminate_timeout_seconds,
+        kill_timeout_seconds=settings.asr_provider_kill_timeout_seconds,
+    )
     metrics = InMemoryMetrics()
     app.state.metrics = metrics
+    app.add_middleware(
+        DocumentUploadBodyLimitMiddleware,
+        path=f"{settings.api_prefix.rstrip('/')}/documents",
+        max_body_bytes=DOCUMENT_UPLOAD_BODY_LIMIT,
+    )
+    if settings.auth_mode == "oidc":
+        # Registered before CORS/observability so those outer layers still attach
+        # CORS and request-id headers. This also runs before request body parsing.
+        app.add_middleware(
+            OidcCsrfOriginMiddleware,
+            allowed_origins=settings.cors_origins,
+        )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
@@ -162,6 +196,12 @@ def create_app(
     app.include_router(api_router, prefix=settings.api_prefix)
     app.include_router(asr.router)
     app.include_router(health.root_router)
+
+    @app.exception_handler(RequestBodyTooLarge)
+    async def request_body_too_large_handler(
+        request: Request, _exc: RequestBodyTooLarge
+    ) -> JSONResponse:
+        return document_too_large_response(request)
 
     @app.exception_handler(DomainError)
     async def domain_error_handler(request: Request, exc: DomainError) -> JSONResponse:

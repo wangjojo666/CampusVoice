@@ -137,6 +137,35 @@ describe("PCM recorder lifecycle", () => {
     expect(FakeWorkletNode.instance).toBeNull();
   });
 
+  it("bounds a pending startup resume after cancellation", async () => {
+    vi.useFakeTimers();
+    const resume = deferred<void>();
+    class PendingResumeAudioContext extends FakeAudioContext {
+      override readonly resume = vi.fn(() => resume.promise);
+    }
+    vi.stubGlobal("AudioContext", PendingResumeAudioContext);
+    const stopTrack = vi.fn();
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: vi.fn().mockResolvedValue({ getTracks: () => [{ stop: stopTrack }] }),
+      },
+    });
+    const recorder = new PcmAudioRecorder();
+
+    const started = recorder.start({ onChunk: vi.fn(), onLevel: vi.fn() });
+    const startFailure = started.catch((reason: unknown) => reason);
+    await vi.waitFor(() => expect(FakeAudioContext.instance?.resume).toHaveBeenCalledOnce());
+    const stopped = recorder.stop();
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    await expect(startFailure).resolves.toMatchObject({ name: "AbortError" });
+    await stopped;
+    expect(stopTrack).toHaveBeenCalledOnce();
+    expect(FakeAudioContext.instance?.close).toHaveBeenCalledOnce();
+    resume.resolve();
+  });
+
   it("captures mono microphone frames, reports levels, and releases every media resource", async () => {
     const stopTrack = vi.fn();
     const stream = { getTracks: () => [{ stop: stopTrack }] };
