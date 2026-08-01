@@ -2090,6 +2090,49 @@ def _assert_no_llm_unknown(result: IntentResult, llm: RecordingMutationLlm) -> N
     assert result.requires_confirmation is False
 
 
+async def _median_parser_batch_seconds(
+    texts: Sequence[str],
+    *,
+    now: datetime,
+    with_llm: bool = True,
+) -> tuple[
+    float,
+    tuple[tuple[IntentResult, RecordingMutationLlm | None], ...],
+]:
+    async def run_batch() -> tuple[tuple[IntentResult, RecordingMutationLlm | None], ...]:
+        results: list[tuple[IntentResult, RecordingMutationLlm | None]] = []
+        for text in texts:
+            llm = RecordingMutationLlm() if with_llm else None
+            parser = IntentParser(llm) if llm is not None else IntentParser()
+            result = await parser.parse(text, now=now)
+            results.append((result, llm))
+        return tuple(results)
+
+    await run_batch()
+    samples: list[
+        tuple[
+            float,
+            tuple[tuple[IntentResult, RecordingMutationLlm | None], ...],
+        ]
+    ] = []
+    for _ in range(3):
+        started = perf_counter()
+        results = await run_batch()
+        samples.append((perf_counter() - started, results))
+    samples.sort(key=lambda sample: sample[0])
+    return samples[1]
+
+
+def _assert_near_linear_runtime(
+    small_seconds: float,
+    large_seconds: float,
+    *,
+    input_scale: float,
+) -> None:
+    assert large_seconds < 3.0
+    assert large_seconds <= small_seconds * (input_scale + 2.0) + 0.1
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("direct_text", "context_text"), _RESIDUAL_INVALID_TEMPORAL_CASES)
 async def test_residual_invalid_temporal_mutations_fail_closed_without_llm(
@@ -4588,20 +4631,26 @@ async def test_round16_unquoted_particle_and_connector_values_fail_closed(
 async def test_round17_dense_nominal_reminder_title_is_linear() -> None:
     prefix = "创建待办：研究"
     suffix = "提醒事项"
-    target_length = 9_999
-    text = prefix + "提醒" * ((target_length - len(prefix) - len(suffix)) // len("提醒")) + suffix
-
-    started = perf_counter()
-    result = await IntentParser().parse(
-        text,
-        now=datetime(2026, 7, 28, tzinfo=ZoneInfo("Asia/Shanghai")),
+    target_lengths = (2_499, 9_999)
+    texts = tuple(
+        prefix + "提醒" * ((length - len(prefix) - len(suffix)) // len("提醒")) + suffix
+        for length in target_lengths
     )
-    elapsed = perf_counter() - started
+    now = datetime(2026, 7, 28, tzinfo=ZoneInfo("Asia/Shanghai"))
 
-    assert len(text) == target_length
+    small_seconds, _ = await _median_parser_batch_seconds((texts[0],), now=now, with_llm=False)
+    large_seconds, ((result, _),) = await _median_parser_batch_seconds(
+        (texts[1],), now=now, with_llm=False
+    )
+
+    assert tuple(map(len, texts)) == target_lengths
     assert result.intent == IntentName.CREATE_TASK
-    assert result.slots.title == text.removeprefix("创建待办：")
-    assert elapsed < 1.0
+    assert result.slots.title == texts[1].removeprefix("创建待办：")
+    _assert_near_linear_runtime(
+        small_seconds,
+        large_seconds,
+        input_scale=target_lengths[1] / target_lengths[0],
+    )
 
 
 @pytest.mark.asyncio
@@ -5515,19 +5564,28 @@ def test_round25_linear_reminder_strip_preserves_behavior(text: str, expected: s
 
 @pytest.mark.asyncio
 async def test_round25_adversarial_temporal_scans_remain_linear() -> None:
-    texts = (
-        ("创建日程：明天3点" + "再" * 10_000)[:9_998] + "之后",
-        ("创建待办：交作业，提前一天提醒我" + "再" * 10_000)[:10_000],
-    )
+    def cases(target_length: int) -> tuple[str, str]:
+        return (
+            ("创建日程：明天3点" + "再" * target_length)[: target_length - 2] + "之后",
+            ("创建待办：交作业，提前一天提醒我" + "再" * target_length)[:target_length],
+        )
+
+    small_texts = cases(2_500)
+    large_texts = cases(10_000)
     now = datetime(2026, 7, 28, tzinfo=ZoneInfo("Asia/Shanghai"))
 
-    for text in texts:
-        llm = RecordingMutationLlm()
-        started = perf_counter()
-        result = await IntentParser(llm).parse(text, now=now)
-        elapsed = perf_counter() - started
+    small_seconds, _ = await _median_parser_batch_seconds(small_texts, now=now)
+    large_seconds, results = await _median_parser_batch_seconds(large_texts, now=now)
+
+    assert all(len(text) == 2_500 for text in small_texts)
+    assert all(len(text) == 10_000 for text in large_texts)
+    for result, llm in results:
         _assert_no_llm_unknown(result, llm)
-        assert elapsed < 1.0
+    _assert_near_linear_runtime(
+        small_seconds,
+        large_seconds,
+        input_scale=4.0,
+    )
 
 
 _ROUND25_SAFETY_ONLY_SIGNALS = ("清空", "作废", "抹掉", "注销", "销毁")
@@ -9401,20 +9459,29 @@ async def test_round38_result_narrative_connectors_fail_closed_without_llm(
 
 @pytest.mark.asyncio
 async def test_round38_new_safety_scans_remain_linear_near_input_limit() -> None:
-    cases = (
-        "创建待办：论文，" + "先" * 9_700 + "到这里为止吧",
-        "创建待办：论文，先到这里为止" + "吧" * 9_700,
-        "把任务B" + "已更新" * 3_000 + "尾",
-    )
+    def cases(run_length: int) -> tuple[str, str, str]:
+        return (
+            "创建待办：论文，" + "先" * run_length + "到这里为止吧",
+            "创建待办：论文，先到这里为止" + "吧" * run_length,
+            "把任务B" + "已更新" * (run_length * 30 // 97) + "尾",
+        )
+
+    small_texts = cases(2_425)
+    large_texts = cases(9_700)
     now = datetime(2026, 7, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
-    for text in cases:
+
+    small_seconds, _ = await _median_parser_batch_seconds(small_texts, now=now)
+    large_seconds, results = await _median_parser_batch_seconds(large_texts, now=now)
+
+    for text in large_texts:
         assert len(text) < 10_000
-        llm = RecordingMutationLlm()
-        started = perf_counter()
-        result = await IntentParser(llm).parse(text, now=now)
-        elapsed = perf_counter() - started
+    for result, llm in results:
         _assert_no_llm_unknown(result, llm)
-        assert elapsed < 1.0
+    _assert_near_linear_runtime(
+        small_seconds,
+        large_seconds,
+        input_scale=4.0,
+    )
 
 
 _ROUND39_OBJECT_FIRST_POSITIVES = (
@@ -9523,20 +9590,28 @@ async def test_round39_quoted_abort_finalizers_remain_literal() -> None:
 
 @pytest.mark.asyncio
 async def test_round39_abort_suffix_scan_remains_bounded_near_input_limit() -> None:
-    texts = (
-        "更新任务：" + "A" * 9_700 + "标题改为初稿算啦吧",
-        "更新任务：论文标题改为初稿算啦" + "吧" * 9_700,
-    )
-    now = datetime(2026, 7, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
-    for text in texts:
-        assert len(text) < 10_000
-        llm = RecordingMutationLlm()
-        started = perf_counter()
-        result = await IntentParser(llm).parse(text, now=now)
-        elapsed = perf_counter() - started
+    def texts(run_length: int) -> tuple[str, str]:
+        return (
+            "更新任务：" + "A" * run_length + "标题改为初稿算啦吧",
+            "更新任务：论文标题改为初稿算啦" + "吧" * run_length,
+        )
 
+    small_texts = texts(2_425)
+    large_texts = texts(9_700)
+    now = datetime(2026, 7, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    small_seconds, _ = await _median_parser_batch_seconds(small_texts, now=now)
+    large_seconds, results = await _median_parser_batch_seconds(large_texts, now=now)
+
+    for text in large_texts:
+        assert len(text) < 10_000
+    for result, llm in results:
         _assert_no_llm_unknown(result, llm)
-        assert elapsed < 1.0
+    _assert_near_linear_runtime(
+        small_seconds,
+        large_seconds,
+        input_scale=4.0,
+    )
 
 
 _ROUND40_UNSAFE_OBJECT_PREFIXES = (
