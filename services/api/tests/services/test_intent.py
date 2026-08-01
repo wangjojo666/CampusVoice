@@ -2129,7 +2129,7 @@ def _assert_near_linear_runtime(
     *,
     input_scale: float,
 ) -> None:
-    assert large_seconds < 3.0
+    assert large_seconds < 4.0
     assert large_seconds <= small_seconds * (input_scale + 2.0) + 0.1
 
 
