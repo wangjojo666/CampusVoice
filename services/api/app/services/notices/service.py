@@ -789,23 +789,41 @@ class NoticeRadarService:
                 f"This migration requires {required} confirmation stage(s)",
                 status_code=422,
             )
-        claimed = (
-            await session.execute(
-                update(ImpactMigrationPlan)
-                .where(
-                    ImpactMigrationPlan.id == plan.id,
-                    ImpactMigrationPlan.user_id == user_id,
-                    ImpactMigrationPlan.status == "ready",
-                    ImpactMigrationPlan.version == request.plan_version,
+        await self._ensure_migration_idempotency_key_available(
+            session,
+            user_id,
+            plan.id,
+            request.idempotency_key,
+            operation="execute",
+        )
+        try:
+            claimed = (
+                await session.execute(
+                    update(ImpactMigrationPlan)
+                    .where(
+                        ImpactMigrationPlan.id == plan.id,
+                        ImpactMigrationPlan.user_id == user_id,
+                        ImpactMigrationPlan.status == "ready",
+                        ImpactMigrationPlan.version == request.plan_version,
+                    )
+                    .values(
+                        status="executing",
+                        execution_idempotency_key=request.idempotency_key,
+                        updated_at=utc_now(),
+                    )
+                    .returning(ImpactMigrationPlan.id)
                 )
-                .values(
-                    status="executing",
-                    execution_idempotency_key=request.idempotency_key,
-                    updated_at=utc_now(),
-                )
-                .returning(ImpactMigrationPlan.id)
+            ).scalar_one_or_none()
+        except IntegrityError:
+            await session.rollback()
+            await self._ensure_migration_idempotency_key_available(
+                session,
+                user_id,
+                plan.id,
+                request.idempotency_key,
+                operation="execute",
             )
-        ).scalar_one_or_none()
+            raise
         if claimed is None:
             await session.rollback()
             fresh = await self._owned_plan(session, user_id, plan_id)
@@ -955,25 +973,43 @@ class NoticeRadarService:
                 "The migration receipt changed; reload it before undoing",
                 {"current_version": plan.version},
             )
-        claimed = (
-            await session.execute(
-                update(ImpactMigrationPlan)
-                .where(
-                    ImpactMigrationPlan.id == plan.id,
-                    ImpactMigrationPlan.user_id == user_id,
-                    ImpactMigrationPlan.status.in_(
-                        [
-                            "applied",
-                            "verified",
-                            "verification_failed",
-                        ]
-                    ),
-                    ImpactMigrationPlan.version == request.plan_version,
+        await self._ensure_migration_idempotency_key_available(
+            session,
+            user_id,
+            plan.id,
+            request.idempotency_key,
+            operation="undo",
+        )
+        try:
+            claimed = (
+                await session.execute(
+                    update(ImpactMigrationPlan)
+                    .where(
+                        ImpactMigrationPlan.id == plan.id,
+                        ImpactMigrationPlan.user_id == user_id,
+                        ImpactMigrationPlan.status.in_(
+                            [
+                                "applied",
+                                "verified",
+                                "verification_failed",
+                            ]
+                        ),
+                        ImpactMigrationPlan.version == request.plan_version,
+                    )
+                    .values(status="undoing", undo_idempotency_key=request.idempotency_key)
+                    .returning(ImpactMigrationPlan.id)
                 )
-                .values(status="undoing", undo_idempotency_key=request.idempotency_key)
-                .returning(ImpactMigrationPlan.id)
+            ).scalar_one_or_none()
+        except IntegrityError:
+            await session.rollback()
+            await self._ensure_migration_idempotency_key_available(
+                session,
+                user_id,
+                plan.id,
+                request.idempotency_key,
+                operation="undo",
             )
-        ).scalar_one_or_none()
+            raise
         if claimed is None:
             await session.rollback()
             fresh = await self._owned_plan(session, user_id, plan_id)
@@ -2029,6 +2065,34 @@ class NoticeRadarService:
         if row is None:
             raise NotFoundError("impact migration plan", plan_id)
         return row
+
+    @staticmethod
+    async def _ensure_migration_idempotency_key_available(
+        session: AsyncSession,
+        user_id: str,
+        plan_id: str,
+        idempotency_key: str,
+        *,
+        operation: Literal["execute", "undo"],
+    ) -> None:
+        key_column = (
+            ImpactMigrationPlan.execution_idempotency_key
+            if operation == "execute"
+            else ImpactMigrationPlan.undo_idempotency_key
+        )
+        existing_plan_id = await session.scalar(
+            select(ImpactMigrationPlan.id).where(
+                ImpactMigrationPlan.user_id == user_id,
+                ImpactMigrationPlan.id != plan_id,
+                key_column == idempotency_key,
+            )
+        )
+        if existing_plan_id is not None:
+            raise ConflictError(
+                "migration_idempotency_key_conflict",
+                "This idempotency key belongs to another migration",
+                {"operation": operation},
+            )
 
     @staticmethod
     async def _ensure_migration_course_references(

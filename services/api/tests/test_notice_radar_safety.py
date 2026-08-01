@@ -758,6 +758,63 @@ def test_concurrent_execute_and_undo_each_have_exactly_one_winner(
     assert undo_record["undo_key"] == undo_winner
 
 
+@pytest.mark.parametrize("operation", ["execute", "undo"])
+def test_cross_plan_idempotency_key_reuse_returns_conflict(
+    client: TestClient,
+    operation: str,
+) -> None:
+    _v1, v2 = _create_demo_chain(client)
+    change_set = _change_set_for_document(client, v2["id"])
+    plan = _preview(client, change_set["id"])
+    factory = client.app.state.session_factory
+    shared_key = f"cross-plan-{operation}-key"
+
+    async def seed_sibling_plan() -> tuple[str, int]:
+        async with factory() as session:
+            original = await session.get(ImpactMigrationPlan, plan["id"])
+            assert original is not None
+            if operation == "execute":
+                original.execution_idempotency_key = shared_key
+            else:
+                original.undo_idempotency_key = shared_key
+            sibling = ImpactMigrationPlan(
+                user_id=original.user_id,
+                change_set_id=original.change_set_id,
+                generation=original.generation + 1,
+                status="ready" if operation == "execute" else "verified",
+                risk_level="low",
+            )
+            session.add(sibling)
+            await session.commit()
+            return sibling.id, sibling.version
+
+    sibling_id, sibling_version = asyncio.run(seed_sibling_plan())
+    if operation == "execute":
+        path = f"/api/notice-radar/migrations/{sibling_id}/execute"
+        body = {
+            "plan_version": sibling_version,
+            "idempotency_key": shared_key,
+            "allow_conflicts": False,
+            "confirmation_stages": 1,
+        }
+    else:
+        path = f"/api/notice-radar/migrations/{sibling_id}/undo"
+        body = {
+            "plan_version": sibling_version,
+            "idempotency_key": shared_key,
+            "confirmation_stages": 2,
+        }
+
+    response = _challenged_write(client, "POST", path, body)
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "migration_idempotency_key_conflict"
+    sibling_record = _plan_record(client, sibling_id)
+    assert sibling_record["status"] == ("ready" if operation == "execute" else "verified")
+    key_field = "execution_key" if operation == "execute" else "undo_key"
+    assert sibling_record[key_field] is None
+
+
 async def _service_execute(
     service: NoticeRadarService,
     client: TestClient,
