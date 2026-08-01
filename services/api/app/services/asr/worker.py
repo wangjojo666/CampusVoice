@@ -9,7 +9,7 @@ from enum import StrEnum
 from multiprocessing.connection import Connection
 from multiprocessing.context import SpawnContext
 from multiprocessing.process import BaseProcess
-from typing import Any, Literal, cast
+from typing import Any, Literal, Protocol
 
 from app.services.asr.adapters import (
     AsrProviderError,
@@ -41,11 +41,21 @@ class ProviderSpec:
 WorkerTarget = Callable[[Connection, ProviderSpec], None]
 
 
+class _ConnectionLike(Protocol):
+    def send(self, obj: object) -> None: ...
+
+    def recv(self) -> Any: ...
+
+    def poll(self, timeout: float = 0.0) -> bool: ...
+
+    def close(self) -> None: ...
+
+
 @dataclass(slots=True)
 class _IdleWorker:
     spec: ProviderSpec
     target: WorkerTarget
-    connection: Connection
+    connection: _ConnectionLike
     process: BaseProcess
 
 
@@ -56,7 +66,7 @@ def _close_connection_quietly(connection: Any) -> None:
 
 def _terminate_worker(
     process: BaseProcess,
-    connection: Connection,
+    connection: _ConnectionLike,
     *,
     terminate_timeout_seconds: float,
     kill_timeout_seconds: float,
@@ -331,7 +341,7 @@ class ProcessAsrAdapter:
         self._reuse_worker = (
             worker_target is provider_worker_main if reuse_worker is None else reuse_worker
         )
-        self._connection: Connection | None = None
+        self._connection: _ConnectionLike | None = None
         self._process: BaseProcess | None = None
         self._command_lock = asyncio.Lock()
         self._slot_acquired = False
@@ -381,7 +391,7 @@ class ProcessAsrAdapter:
                     daemon=True,
                     name=f"campusvoice-asr-{self.provider_name}",
                 )
-                self._connection = cast(Connection, parent)
+                self._connection = parent
                 self._process = process
                 process.start()
                 _close_connection_quietly(child)
