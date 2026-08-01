@@ -28,6 +28,7 @@ from app.security.request_limits import (
     document_too_large_response,
 )
 from app.services.asr.connections import build_asr_quota_registry
+from app.services.asr.worker import AsrProcessSupervisor
 from app.services.errors import DomainError
 
 
@@ -101,6 +102,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         quota_registry = application.state.asr_connections
+        process_supervisor = application.state.asr_process_supervisor
         primary_error: BaseException | None = None
         try:
             await quota_registry.start()
@@ -114,6 +116,10 @@ def create_app(
             primary_error = exc
 
         cleanup_errors: list[BaseException] = []
+        try:
+            await process_supervisor.close()
+        except BaseException as exc:
+            cleanup_errors.append(exc)
         try:
             await quota_registry.close()
         except BaseException as exc:
@@ -149,6 +155,15 @@ def create_app(
     app.state.authenticator = build_authenticator(settings)
     app.state.oidc_client = OidcClient(settings) if settings.auth_mode == "oidc" else None
     app.state.asr_connections = build_asr_quota_registry(settings)
+    app.state.asr_process_supervisor = AsrProcessSupervisor(
+        max_workers=settings.asr_provider_worker_limit,
+        max_waiters=settings.asr_provider_queue_limit,
+        admission_timeout_seconds=settings.asr_provider_admission_timeout_seconds,
+        operation_timeout_seconds=settings.asr_provider_operation_timeout_seconds,
+        finish_timeout_seconds=settings.asr_provider_finish_timeout_seconds,
+        terminate_timeout_seconds=settings.asr_provider_terminate_timeout_seconds,
+        kill_timeout_seconds=settings.asr_provider_kill_timeout_seconds,
+    )
     metrics = InMemoryMetrics()
     app.state.metrics = metrics
     app.add_middleware(

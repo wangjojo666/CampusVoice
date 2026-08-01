@@ -110,6 +110,13 @@ class Settings(BaseSettings):
     asr_max_session_seconds: float = Field(default=600.0, ge=10.0, le=3_600.0)
     asr_max_audio_seconds: float = Field(default=300.0, ge=5.0, le=3_600.0)
     asr_max_connections_per_user: int = Field(default=1, ge=1, le=10)
+    asr_provider_worker_limit: int = Field(default=1, ge=1, le=16)
+    asr_provider_queue_limit: int = Field(default=8, ge=1, le=1_000)
+    asr_provider_admission_timeout_seconds: float = Field(default=5.0, ge=0.1, le=60.0)
+    asr_provider_operation_timeout_seconds: float = Field(default=120.0, ge=1.0, le=600.0)
+    asr_provider_finish_timeout_seconds: float = Field(default=30.0, ge=0.1, le=300.0)
+    asr_provider_terminate_timeout_seconds: float = Field(default=2.0, ge=0.1, le=30.0)
+    asr_provider_kill_timeout_seconds: float = Field(default=2.0, ge=0.1, le=30.0)
     asr_quota_backend: Literal["local", "redis"] = "local"
     asr_worker_count: int = Field(default=1, ge=1, le=128)
     asr_redis_url: SecretStr | None = None
