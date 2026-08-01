@@ -9,6 +9,8 @@ class FakeWebSocket {
   readyState: number = FakeWebSocket.OPEN;
   binaryType = "";
   sent: Array<string | ArrayBuffer> = [];
+  closeCode: number | null = null;
+  closeReason: string | null = null;
   onopen: (() => void) | null = null;
   onmessage: ((event: { data: string }) => void) | null = null;
   onerror: (() => void) | null = null;
@@ -25,7 +27,10 @@ class FakeWebSocket {
     this.sent.push(value);
   }
 
-  close(code = 1000) {
+  close(code = 1000, reason = "") {
+    this.readyState = FakeWebSocket.CLOSING;
+    this.closeCode = code;
+    this.closeReason = reason;
     this.onclose?.({ code, wasClean: code === 1000 });
   }
 }
@@ -102,5 +107,34 @@ describe("ASR WebSocket protocol", () => {
       code: 1006,
       wasClean: false,
     });
+  });
+
+  it("closes and rejects a connection that never receives the ready handshake", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.stubGlobal("WebSocket", FakeWebSocket);
+      const client = new AsrWebSocketClient(
+        { onMessage: vi.fn(), onClose: vi.fn(), onError: vi.fn() },
+        {
+          url: "ws://localhost/ws/asr",
+          ticket: "short-lived-ticket",
+          readyTimeoutMs: 1_000,
+        },
+      );
+      const connected = client.connect();
+      const socket = FakeWebSocket.instance;
+      socket?.onopen?.();
+
+      await vi.advanceTimersByTimeAsync(999);
+      expect(socket?.closeCode).toBeNull();
+
+      const rejection = expect(connected).rejects.toThrow("WebSocket ready handshake timed out");
+      await vi.advanceTimersByTimeAsync(1);
+      await rejection;
+      expect(socket?.closeCode).toBe(1000);
+      expect(socket?.closeReason).toBe("ready timeout");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

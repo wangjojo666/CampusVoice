@@ -72,21 +72,24 @@ function normalizeMessage(value: unknown): AsrServerMessage | null {
 }
 
 export class AsrWebSocketClient {
+  private static readonly DEFAULT_READY_TIMEOUT_MS = 15_000;
   private socket: WebSocket | null = null;
   private stopRequested = false;
   private readonly handlers: AsrClientHandlers;
   private readonly url: string;
   private readonly hotwords: string[];
   private readonly ticket: string;
+  private readonly readyTimeoutMs: number;
 
   constructor(
     handlers: AsrClientHandlers,
-    options: { ticket: string; url?: string; hotwords?: string[] },
+    options: { ticket: string; url?: string; hotwords?: string[]; readyTimeoutMs?: number },
   ) {
     this.handlers = handlers;
     this.url = options.url ?? defaultAsrUrl();
     this.hotwords = options.hotwords ?? [];
     this.ticket = options.ticket;
+    this.readyTimeoutMs = options.readyTimeoutMs ?? AsrWebSocketClient.DEFAULT_READY_TIMEOUT_MS;
   }
 
   connect(): Promise<void> {
@@ -94,6 +97,13 @@ export class AsrWebSocketClient {
     return new Promise((resolve, reject) => {
       let settled = false;
       const socket = new WebSocket(this.url, websocketProtocols(this.ticket));
+      const readyTimeoutId = window.setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        if (this.socket === socket) this.socket = null;
+        socket.close(1000, "ready timeout");
+        reject(new Error("WebSocket ready handshake timed out"));
+      }, this.readyTimeoutMs);
       socket.binaryType = "arraybuffer";
       this.socket = socket;
 
@@ -112,6 +122,7 @@ export class AsrWebSocketClient {
           const message = normalizeMessage(JSON.parse(String(event.data)));
           if (!message) return;
           if (message.type === "ready" && !settled) {
+            window.clearTimeout(readyTimeoutId);
             settled = true;
             resolve();
           }
@@ -123,6 +134,7 @@ export class AsrWebSocketClient {
       socket.onerror = () => {
         this.handlers.onError("无法建立语音识别连接，请确认服务已启动。");
         if (!settled) {
+          window.clearTimeout(readyTimeoutId);
           settled = true;
           reject(new Error("WebSocket connection failed"));
         }
@@ -135,6 +147,7 @@ export class AsrWebSocketClient {
           wasClean: event.wasClean,
         });
         if (!settled) {
+          window.clearTimeout(readyTimeoutId);
           settled = true;
           reject(new Error("WebSocket closed before ready"));
         }
