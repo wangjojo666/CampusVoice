@@ -38,6 +38,7 @@ const mocks = vi.hoisted(() => ({
   clientStop: vi.fn(),
   clientClose: vi.fn(),
   clientHandlers: null as ClientHandlers | null,
+  clientRecords: [] as Array<{ client: object; handlers: ClientHandlers }>,
   clientOptions: null as { ticket: string; hotwords?: string[] } | null,
   websocketTicket: vi.fn(),
   listHotwords: vi.fn(),
@@ -80,6 +81,7 @@ vi.mock("@/lib/asr/asr-client", () => ({
   AsrWebSocketClient: class MockAsrWebSocketClient {
     constructor(handlers: ClientHandlers, options: { ticket: string; hotwords?: string[] }) {
       mocks.clientHandlers = handlers;
+      mocks.clientRecords.push({ client: this, handlers });
       mocks.clientOptions = options;
       mocks.clientConstructed(handlers, options);
     }
@@ -101,11 +103,11 @@ vi.mock("@/lib/asr/asr-client", () => ({
     }
 
     stop() {
-      mocks.clientStop();
+      mocks.clientStop(this);
     }
 
     close() {
-      mocks.clientClose();
+      mocks.clientClose(this);
     }
   },
 }));
@@ -198,10 +200,12 @@ vi.mock("@/components/voice/correction-diff", () => ({
 
 function deferred() {
   let resolve!: () => void;
-  const promise = new Promise<void>((done) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<void>((done, fail) => {
     resolve = done;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function resetMock(mock: ReturnType<typeof vi.fn>) {
@@ -212,6 +216,7 @@ beforeEach(() => {
   useAssistantStore.getState().reset();
   mocks.recorderHandlers = null;
   mocks.clientHandlers = null;
+  mocks.clientRecords.length = 0;
   mocks.clientOptions = null;
   [
     mocks.recorderStart,
@@ -381,6 +386,161 @@ describe("useAsr orchestration", () => {
     unmount();
   });
 
+  it("coalesces concurrent stop requests before notifying the server", async () => {
+    const drain = deferred();
+    const { result, unmount } = renderHook(() => useAsr());
+    await act(async () => result.current.start());
+    const client = mocks.clientRecords[0]?.client;
+    mocks.recorderStop.mockReturnValueOnce(drain.promise);
+
+    let first!: Promise<void>;
+    let second!: Promise<void>;
+    act(() => {
+      first = result.current.stop();
+      second = result.current.stop();
+    });
+
+    expect(second).toBe(first);
+    expect(mocks.recorderStop).toHaveBeenCalledOnce();
+    expect(mocks.clientStop).not.toHaveBeenCalled();
+
+    await act(async () => {
+      drain.resolve();
+      await first;
+    });
+
+    expect(mocks.clientStop).toHaveBeenCalledOnce();
+    expect(mocks.clientStop).toHaveBeenCalledWith(client);
+    const afterDrain = result.current.stop();
+    expect(afterDrain).toBe(first);
+    await afterDrain;
+    expect(mocks.clientStop).toHaveBeenCalledOnce();
+    unmount();
+  });
+
+  it("waits for an old stop before reset and isolates its delayed failure from a new client", async () => {
+    const drain = deferred();
+    const { result, unmount } = renderHook(() => useAsr());
+    await act(async () => result.current.start());
+    const firstClient = mocks.clientRecords[0]?.client;
+    mocks.recorderStop.mockReturnValueOnce(drain.promise);
+
+    let oldStop!: Promise<void>;
+    let resetOperation!: Promise<void>;
+    let resetSettled = false;
+    act(() => {
+      oldStop = result.current.stop();
+      resetOperation = result.current.reset().then(() => {
+        resetSettled = true;
+      });
+    });
+    await act(async () => Promise.resolve());
+
+    expect(resetSettled).toBe(false);
+    expect(mocks.clientClose).toHaveBeenCalledWith(firstClient);
+    expect(result.current.state.phase).toBe("finalizing");
+
+    await act(async () => {
+      drain.reject(new Error("old drain failed"));
+      await Promise.all([oldStop, resetOperation]);
+    });
+    expect(result.current.state.phase).toBe("idle");
+
+    await act(async () => result.current.start());
+    expect(mocks.clientRecords).toHaveLength(2);
+    expect(mocks.clientStop).not.toHaveBeenCalled();
+    expect(result.current.state).toMatchObject({ phase: "recording", error: null });
+    unmount();
+  });
+  it("keeps a drain failure in error even after a clean server close", async () => {
+    const failure = new Error("recorder drain failed");
+    const { result, unmount } = renderHook(() => useAsr());
+
+    await act(async () => result.current.start());
+    const clientRecord = mocks.clientRecords[0];
+    expect(clientRecord).toBeDefined();
+    mocks.recorderStop.mockRejectedValueOnce(failure);
+    await act(async () => result.current.stop());
+
+    expect(mocks.clientStop).toHaveBeenCalledOnce();
+    expect(result.current.state).toMatchObject({
+      phase: "error",
+      error: { code: "audio_drain_failed", retryable: true },
+    });
+
+    await act(async () => {
+      clientRecord!.handlers.onClose({ stopRequested: true, code: 1000, wasClean: true });
+    });
+    expect(result.current.state).toMatchObject({
+      phase: "error",
+      error: { code: "audio_drain_failed", retryable: true },
+    });
+    unmount();
+  });
+
+  it("turns a synchronous client stop failure into a handled local error", async () => {
+    const { result, unmount } = renderHook(() => useAsr());
+    await act(async () => result.current.start());
+    mocks.clientStop.mockImplementationOnce(() => {
+      throw new Error("socket send failed");
+    });
+
+    await act(async () => result.current.stop());
+
+    expect(result.current.state).toMatchObject({
+      phase: "error",
+      error: { code: "asr_stop_failed", retryable: true },
+    });
+    unmount();
+  });
+
+  it("preserves the drain failure when client stop also fails", async () => {
+    const { result, unmount } = renderHook(() => useAsr());
+    await act(async () => result.current.start());
+    mocks.recorderStop.mockRejectedValueOnce(new Error("drain failed"));
+    mocks.clientStop.mockImplementationOnce(() => {
+      throw new Error("socket send failed");
+    });
+
+    await act(async () => result.current.stop());
+
+    expect(result.current.state).toMatchObject({
+      phase: "error",
+      error: { code: "audio_drain_failed", retryable: true },
+    });
+    unmount();
+  });
+
+  it("resets cleanly when detached recorder and client cleanup both fail", async () => {
+    const { result, unmount } = renderHook(() => useAsr());
+    await act(async () => result.current.start());
+    mocks.recorderStop.mockRejectedValueOnce(new Error("recorder cleanup failed"));
+    mocks.clientClose.mockImplementationOnce(() => {
+      throw new Error("client close failed");
+    });
+
+    await act(async () => result.current.reset());
+
+    expect(result.current.state.phase).toBe("idle");
+    expect(mocks.clientClose).toHaveBeenCalledOnce();
+    expect(mocks.recorderStop).toHaveBeenCalledOnce();
+    unmount();
+  });
+
+  it("does not leak a rejection when unmount cleanup fails", async () => {
+    const { result, unmount } = renderHook(() => useAsr());
+    await act(async () => result.current.start());
+    mocks.recorderStop.mockRejectedValueOnce(new Error("recorder cleanup failed"));
+    mocks.clientClose.mockImplementationOnce(() => {
+      throw new Error("client close failed");
+    });
+
+    unmount();
+    await act(async () => Promise.resolve());
+
+    expect(mocks.clientClose).toHaveBeenCalledOnce();
+    expect(mocks.recorderStop).toHaveBeenCalledOnce();
+  });
   it("keeps only the latest start when two attempts race during cleanup", async () => {
     const { result, unmount } = renderHook(() => useAsr());
 
@@ -524,9 +684,13 @@ describe("useAsr orchestration", () => {
     unmount();
   });
 
-  it("stops both resources immediately for a fatal server error", async () => {
+  it("preserves a fatal server error when detached cleanup also fails", async () => {
     const { result, unmount } = renderHook(() => useAsr());
     await act(async () => result.current.start());
+    mocks.recorderStop.mockRejectedValueOnce(new Error("recorder cleanup failed"));
+    mocks.clientClose.mockImplementationOnce(() => {
+      throw new Error("client close failed");
+    });
 
     await act(async () => {
       mocks.clientHandlers?.onMessage({
@@ -543,6 +707,39 @@ describe("useAsr orchestration", () => {
     });
     expect(mocks.clientClose).toHaveBeenCalledOnce();
     expect(mocks.recorderStop).toHaveBeenCalledOnce();
+    unmount();
+  });
+
+  it("waits for detached transport cleanup before retrying", async () => {
+    const cleanup = deferred();
+    const { result, unmount } = renderHook(() => useAsr());
+    await act(async () => result.current.start());
+    mocks.recorderStop.mockReturnValueOnce(cleanup.promise);
+
+    act(() => {
+      mocks.clientHandlers?.onError("network failed");
+    });
+    expect(result.current.state.phase).toBe("error");
+
+    let retry!: Promise<void>;
+    act(() => {
+      retry = result.current.start();
+    });
+    await act(async () => Promise.resolve());
+
+    expect(mocks.recorderStop).toHaveBeenCalledOnce();
+    expect(mocks.clientClose).toHaveBeenCalledOnce();
+    expect(mocks.recorderStart).toHaveBeenCalledOnce();
+    expect(mocks.clientRecords).toHaveLength(1);
+
+    await act(async () => {
+      cleanup.resolve();
+      await retry;
+    });
+
+    expect(mocks.recorderStart).toHaveBeenCalledTimes(2);
+    expect(mocks.clientRecords).toHaveLength(2);
+    expect(result.current.state.phase).toBe("recording");
     unmount();
   });
 
