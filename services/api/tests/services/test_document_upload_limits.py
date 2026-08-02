@@ -200,3 +200,15 @@ async def test_pdf_and_docx_parsing_runs_outside_the_event_loop_thread(
 
     assert record.chunk_count == 1
     assert parser_threads and parser_threads[0] != event_loop_thread
+
+
+def test_blank_document_title_is_rejected_before_persistence(client: TestClient) -> None:
+    response = client.post(
+        "/api/documents",
+        files={"file": ("blank-title.txt", b"valid document body", "text/plain")},
+        data={"title": "   "},
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "invalid_document_metadata"
+    assert client.get("/api/documents").json() == []

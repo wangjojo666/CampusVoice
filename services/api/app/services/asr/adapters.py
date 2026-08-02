@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import math
 import threading
@@ -5,11 +7,14 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from time import perf_counter
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
 
 from app.core.config import Settings
+
+if TYPE_CHECKING:
+    from app.services.asr.worker import AsrProcessSupervisor
 
 
 class AsrProviderError(RuntimeError):
@@ -505,19 +510,41 @@ class WhisperAdapter:
         self._audio.clear()
 
 
-def create_asr_adapter(settings: Settings) -> AsrAdapter:
+def create_asr_adapter(
+    settings: Settings,
+    *,
+    process_supervisor: AsrProcessSupervisor | None = None,
+) -> AsrAdapter:
     provider = settings.asr_provider.strip().lower()
     if provider == "disabled":
         return DisabledAsrAdapter()
+    if process_supervisor is None:
+        raise AsrProviderError(
+            "provider_supervisor_unavailable",
+            "语音识别工作进程监督器不可用。",
+        )
+    from app.services.asr.worker import ProcessAsrAdapter, ProviderSpec
+
     if provider == "funasr":
-        return FunAsrAdapter(
-            model_name=settings.asr_model,
-            vad_model=settings.asr_vad_model,
-            punc_model=settings.asr_punc_model,
-            device=settings.asr_device,
+        return ProcessAsrAdapter(
+            process_supervisor,
+            ProviderSpec(
+                provider="funasr",
+                model_name=settings.asr_model,
+                vad_model=settings.asr_vad_model,
+                punc_model=settings.asr_punc_model,
+                device=settings.asr_device,
+            ),
         )
     if provider == "whisper":
-        return WhisperAdapter(model_name=settings.asr_model, device=settings.asr_device)
+        return ProcessAsrAdapter(
+            process_supervisor,
+            ProviderSpec(
+                provider="whisper",
+                model_name=settings.asr_model,
+                device=settings.asr_device,
+            ),
+        )
     raise AsrProviderError(
         "unknown_provider",
         f"不支持的 ASR 提供方：{settings.asr_provider}",

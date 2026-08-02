@@ -1,7 +1,7 @@
 import asyncio
 import json
 from collections.abc import Awaitable, Callable, Sequence
-from contextlib import suppress
+from enum import StrEnum
 from time import monotonic
 from uuid import uuid4
 
@@ -26,6 +26,15 @@ from app.services.asr.adapters import (
 )
 
 _CLIENT_MESSAGE_ADAPTER: TypeAdapter[AsrClientMessage] = TypeAdapter(AsrClientMessage)
+
+
+class AdapterLifecycle(StrEnum):
+    CREATED = "created"
+    OPEN = "open"
+    FINALIZING = "finalizing"
+    FINISHED = "finished"
+    ABORTED = "aborted"
+    CLOSED = "closed"
 
 
 class PcmEnergyVad:
@@ -84,6 +93,7 @@ class _EventSender:
         self.session_id = session_id
         self.provider = provider
         self.sequence = 0
+        self.persistence_failed = False
         self.event_hook = event_hook
 
     async def send(
@@ -117,6 +127,7 @@ class _EventSender:
             except Exception:
                 # Recognition may continue, but the client must know the audit
                 # trail is unavailable. Disable the hook to avoid error floods.
+                self.persistence_failed = True
                 self.event_hook = None
                 persistence_error = AsrServerEvent(
                     type="error",
@@ -143,13 +154,45 @@ class _EventSender:
                 audio_duration_ms=result.audio_duration_ms,
             )
 
+    async def persist_transcripts(self, results: Sequence[TranscriptResult]) -> None:
+        if self.event_hook is None:
+            return
+        for result in results:
+            event = AsrServerEvent(
+                type="final" if result.is_final else "interim",
+                session_id=self.session_id,
+                sequence=self.sequence,
+                provider=self.provider,
+                text=result.text,
+                confidence=result.confidence,
+                latency_ms=result.latency_ms,
+                audio_duration_ms=result.audio_duration_ms,
+            )
+            await self.event_hook(event)
+            self.sequence += 1
+
+    async def persist_terminal_error(self, error: AsrProviderError) -> None:
+        if self.event_hook is None:
+            return
+        event = AsrServerEvent(
+            type="error",
+            session_id=self.session_id,
+            sequence=self.sequence,
+            provider=self.provider,
+            code=error.code,
+            message=error.message,
+            recoverable=False,
+        )
+        await self.event_hook(event)
+        self.sequence += 1
+
 
 async def handle_asr_websocket(
     websocket: WebSocket,
     adapter_factory: Callable[[], AsrAdapter],
     *,
     event_hook: Callable[[AsrServerEvent], Awaitable[None]] | None = None,
-    close_hook: Callable[[str], Awaitable[None]] | None = None,
+    close_hook: Callable[[str, bool], Awaitable[None]] | None = None,
     additional_hotwords: Sequence[str] = (),
     accepted_subprotocol: str | None = None,
     max_frame_bytes: int = 131_072,
@@ -170,49 +213,71 @@ async def handle_asr_websocket(
     vad: PcmEnergyVad | None = None
     provider_vad_enabled = True
     vad_frame_bytes: int | None = None
-    adapter_closed = False
+    adapter_close_started = False
+    adapter_lifecycle = AdapterLifecycle.CREATED
     persistence_closed = False
+    graceful_completion = False
+    client_disconnected = False
     opened_at = monotonic()
     audio_bytes_received = 0
 
-    async def close_resources() -> list[Exception]:
+    async def close_resources(*, completed: bool = False) -> list[BaseException]:
         """Attempt every cleanup exactly once, even when an earlier close fails."""
 
-        nonlocal adapter_closed, persistence_closed
-        failures: list[Exception] = []
-        if adapter is not None and not adapter_closed:
-            adapter_closed = True
+        nonlocal adapter_close_started, adapter_lifecycle, persistence_closed
+        failures: list[BaseException] = []
+        if adapter is not None and not adapter_close_started:
+            adapter_close_started = True
             try:
                 await adapter.close()
-            except Exception as exc:
+            except BaseException as exc:
+                adapter_lifecycle = AdapterLifecycle.ABORTED
                 failures.append(exc)
+            else:
+                adapter_lifecycle = AdapterLifecycle.CLOSED
         if close_hook is not None and not persistence_closed:
             persistence_closed = True
             try:
-                await close_hook(session_id)
-            except Exception as exc:
+                await close_hook(session_id, completed)
+            except BaseException as exc:
                 failures.append(exc)
         return failures
 
-    async def report_cleanup_failure() -> None:
+    async def report_cleanup_failure() -> list[BaseException]:
+        failures: list[BaseException] = []
+        if client_disconnected:
+            return failures
         if sender is not None:
-            with suppress(Exception):
+            try:
                 await sender.send(
                     "error",
                     code="session_cleanup_failed",
                     message="语音识别会话资源清理失败。",
                     recoverable=False,
                 )
-        with suppress(Exception):
+            except Exception:
+                pass
+            except BaseExceptionGroup as exc:
+                failures.append(exc)
+            except asyncio.CancelledError as exc:
+                failures.append(exc)
+        try:
             await websocket.close(code=1011)
+        except Exception:
+            pass
+        except BaseExceptionGroup as exc:
+            failures.append(exc)
+        except asyncio.CancelledError as exc:
+            failures.append(exc)
+        return failures
 
-    async def close_resources_or_raise() -> None:
-        failures = await close_resources()
+    async def close_resources_or_raise(*, completed: bool = False) -> None:
+        failures = await close_resources(completed=completed)
         if failures:
-            await report_cleanup_failure()
+            failures.extend(await report_cleanup_failure())
             if len(failures) == 1:
                 raise failures[0]
-            raise ExceptionGroup("ASR session cleanup failed", failures)
+            raise BaseExceptionGroup("ASR session cleanup failed", failures)
 
     async def process_pcm_frame(pcm_frame: bytes) -> bool:
         """Process at most one 60 ms VAD frame; return True for a fatal provider error."""
@@ -287,6 +352,7 @@ async def handle_asr_websocket(
             speaking = False
         return fatal_error
 
+    primary_failure: BaseException | None = None
     try:
         try:
             adapter = adapter_factory()
@@ -298,6 +364,7 @@ async def handle_asr_websocket(
             await close_resources_or_raise()
             await websocket.close(code=1011)
             return
+        adapter_lifecycle = AdapterLifecycle.OPEN
         sender = _EventSender(websocket, session_id, adapter.provider_name, event_hook)
         await sender.send("ready")
 
@@ -338,6 +405,7 @@ async def handle_asr_websocket(
                 await websocket.close(code=1008)
                 return
             if message["type"] == "websocket.disconnect":
+                client_disconnected = True
                 break
             pcm = message.get("bytes")
             if pcm is not None:
@@ -490,20 +558,27 @@ async def handle_asr_websocket(
                     return
             elif isinstance(control, AsrStopMessage):
                 close_code = 1000
+                finish_succeeded = not started
                 if started:
+                    adapter_lifecycle = AdapterLifecycle.FINALIZING
                     try:
-                        await sender.transcripts(await adapter.finish())
+                        final_results = await adapter.finish()
+                        await sender.transcripts(final_results)
+                        finish_succeeded = True
                     except AsrProviderError as exc:
+                        adapter_lifecycle = AdapterLifecycle.ABORTED
                         close_code = 1011
                         await sender.send(
                             "error",
                             code=exc.code,
                             message=exc.message,
-                            recoverable=exc.recoverable,
+                            recoverable=False,
                         )
                         reset_utterance = getattr(adapter, "reset_utterance", None)
                         if callable(reset_utterance):
                             await reset_utterance()
+                    else:
+                        adapter_lifecycle = AdapterLifecycle.FINISHED
                     if speaking:
                         await sender.send("speech_end")
                     if vad:
@@ -511,13 +586,60 @@ async def handle_asr_websocket(
                     reset_provider_vad = getattr(adapter, "reset_vad", None)
                     if callable(reset_provider_vad):
                         await reset_provider_vad()
-                await close_resources_or_raise()
+                graceful_completion = finish_succeeded and not sender.persistence_failed
+                if sender.persistence_failed:
+                    close_code = 1011
+                await close_resources_or_raise(completed=graceful_completion)
                 await websocket.close(code=close_code)
                 return
     except WebSocketDisconnect:
-        pass
+        client_disconnected = True
+    except BaseException as exc:
+        primary_failure = exc
+        raise
     finally:
-        await close_resources_or_raise()
+        failures: list[BaseException] = []
+        if (
+            client_disconnected
+            and started
+            and adapter is not None
+            and sender is not None
+            and adapter_lifecycle is AdapterLifecycle.OPEN
+        ):
+            adapter_lifecycle = AdapterLifecycle.FINALIZING
+            try:
+                final_results = await adapter.finish()
+            except AsrProviderError as exc:
+                adapter_lifecycle = AdapterLifecycle.ABORTED
+                failures.append(exc)
+                try:
+                    await sender.persist_terminal_error(exc)
+                except BaseException as persistence_exc:
+                    failures.append(persistence_exc)
+            except BaseException as exc:
+                adapter_lifecycle = AdapterLifecycle.ABORTED
+                failures.append(exc)
+            else:
+                adapter_lifecycle = AdapterLifecycle.FINISHED
+                try:
+                    await sender.persist_transcripts(final_results)
+                except BaseException as persistence_exc:
+                    failures.append(persistence_exc)
+        failures.extend(await close_resources(completed=graceful_completion))
+        if failures:
+            failures.extend(await report_cleanup_failure())
+            if isinstance(primary_failure, asyncio.CancelledError):
+                for failure in failures:
+                    primary_failure.add_note(f"ASR cleanup failure: {failure!r}")
+            elif primary_failure is not None:
+                raise BaseExceptionGroup(
+                    "ASR session and cleanup failed",
+                    [primary_failure, *failures],
+                ) from None
+            elif len(failures) == 1:
+                raise failures[0]
+            else:
+                raise BaseExceptionGroup("ASR session cleanup failed", failures)
 
 
 def _merge_hotwords(*groups: Sequence[str], limit: int = 500) -> tuple[str, ...]:

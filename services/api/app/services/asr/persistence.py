@@ -51,12 +51,20 @@ class SqlAlchemyAsrPersistence:
                 # The hook runs before the event is serialized, so the browser
                 # receives the exact durable row id that backs this transcript.
                 event.transcription_id = transcription.id
-            if event.type == "error" and event.recoverable is False:
+            if (
+                event.type == "error"
+                and event.recoverable is False
+                and voice_session.status != VoiceSessionStatus.FAILED
+            ):
                 voice_session.status = VoiceSessionStatus.FAILED
                 voice_session.error_message = event.message or event.code
 
-    async def close(self, session_id: str) -> None:
+    async def close(self, session_id: str, completed: bool) -> None:
         async with self._session_factory() as session, session.begin():
             voice_session = await session.get(VoiceSession, session_id)
             if voice_session is not None and voice_session.status != VoiceSessionStatus.FAILED:
-                voice_session.status = VoiceSessionStatus.COMPLETED
+                if completed:
+                    voice_session.status = VoiceSessionStatus.COMPLETED
+                else:
+                    voice_session.status = VoiceSessionStatus.FAILED
+                    voice_session.error_message = "asr_session_interrupted"
