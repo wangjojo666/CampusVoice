@@ -180,6 +180,10 @@ CAMPUSVOICE_ASR_PUNC_MODEL=ct-punc
 
 没有 GPU 时把设备改为 `cpu`。Whisper 基线需设置 `CAMPUSVOICE_ASR_PROVIDER=whisper`、`CAMPUSVOICE_ASR_MODEL=small`，不能沿用 Paraformer 模型名。首次使用会下载模型，请预留数 GB 空间。
 
+FunASR 和 Whisper 的模型执行位于 `spawn` 启动的受监督子进程中；finish 或其他模型操作超时、请求取消及服务关闭都会先 terminate/join，必要时再 kill/join。默认每个 API 进程最多运行 1 个 provider worker，最多排队 8 个会话，排队 5 秒、常规模型操作 120 秒、finish 30 秒后失败。可通过 `CAMPUSVOICE_ASR_PROVIDER_WORKER_LIMIT`、`CAMPUSVOICE_ASR_PROVIDER_QUEUE_LIMIT`、`CAMPUSVOICE_ASR_PROVIDER_ADMISSION_TIMEOUT_SECONDS`、`CAMPUSVOICE_ASR_PROVIDER_OPERATION_TIMEOUT_SECONDS` 和 `CAMPUSVOICE_ASR_PROVIDER_FINISH_TIMEOUT_SECONDS` 调整；terminate/kill 的 join 上限分别由 `CAMPUSVOICE_ASR_PROVIDER_TERMINATE_TIMEOUT_SECONDS` 和 `CAMPUSVOICE_ASR_PROVIDER_KILL_TIMEOUT_SECONDS` 控制。
+
+每个活动会话独占一个 worker。正常关闭后进程可进入有界热池复用进程内模型缓存，但会先销毁旧 adapter，再创建全新的音频缓冲、VAD cache、decoder 状态和锁，避免跨租户保留会话状态；超时、取消、异常关闭或被强杀的 worker 永不复用。提高 worker limit 会近似线性增加模型内存/显存占用；多 API worker 部署的总上限是 `CAMPUSVOICE_ASR_WORKER_COUNT × CAMPUSVOICE_ASR_PROVIDER_WORKER_LIMIT`，应按最坏模型占用预留容量。活动 worker、热 worker 与等待队列都受同一组上限约束；容量满时请求 fail-closed，不会创建无界后台模型任务。
+
 `.env.example` 为无模型下载的安全启动默认使用 `lexical` 检索。安装 AI 依赖后，可设置 `CAMPUSVOICE_KNOWLEDGE_RETRIEVER=embedding`，并按需把 `CAMPUSVOICE_EMBEDDING_DEVICE` 设为 `cpu` 或 `cuda:0`；首次检索会下载配置的中文 Embedding 模型。
 
 意图抽取与通知问答可接入任意 OpenAI-compatible `chat/completions` 服务：

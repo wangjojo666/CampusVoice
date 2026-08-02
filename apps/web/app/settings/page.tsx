@@ -22,7 +22,7 @@ import {
   Volume2,
   WandSparkles,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { PageHeader } from "@/components/layout/page-header";
 import { EmptyState } from "@/components/ui/empty-state";
@@ -50,7 +50,16 @@ const categoryLabel = {
 
 export default function SettingsPage() {
   const [settings, setSettings] = useState<UserSettings>(blankSettings);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const loadGeneration = useRef(0);
+  const loadInFlight = useRef(false);
+  const settingsWriteInFlight = useRef(false);
+  const settingsEditGeneration = useRef(0);
+  const hotwordsLoadInFlight = useRef(false);
   const [hotwords, setHotwords] = useState<Hotword[]>([]);
+  const [hotwordsLoaded, setHotwordsLoaded] = useState(false);
+  const [hotwordsLoading, setHotwordsLoading] = useState(false);
+  const [hotwordLoadError, setHotwordLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -69,37 +78,84 @@ export default function SettingsPage() {
   } | null>(null);
 
   const load = useCallback(async () => {
+    if (loadInFlight.current || settingsWriteInFlight.current) return;
+    loadInFlight.current = true;
+    const generation = ++loadGeneration.current;
     setLoading(true);
-    const [settingsResult, hotwordsResult] = await Promise.allSettled([
-      api.settings.get(),
-      api.hotwords.list(),
-    ]);
-    const failures: string[] = [];
-    if (settingsResult.status === "fulfilled") {
-      setSettings(settingsResult.value);
-      setCurrentUserSettings(settingsResult.value);
-    } else
-      failures.push(
-        settingsResult.reason instanceof ApiError
-          ? settingsResult.reason.userMessage
-          : "设置加载失败",
-      );
-    if (hotwordsResult.status === "fulfilled") setHotwords(hotwordsResult.value.items);
-    else
-      failures.push(
-        hotwordsResult.reason instanceof ApiError
-          ? hotwordsResult.reason.userMessage
-          : "热词加载失败",
-      );
-    setError(failures.length ? [...new Set(failures)].join(" ") : null);
-    setLoading(false);
+    setSettingsLoaded(false);
+    setHotwordsLoaded(false);
+    setHotwords([]);
+    setHotwordLoadError(null);
+    setError(null);
+    try {
+      const [settingsResult, hotwordsResult] = await Promise.allSettled([
+        api.settings.get(),
+        api.hotwords.list(),
+      ]);
+      if (generation !== loadGeneration.current) return;
+      if (settingsResult.status === "fulfilled") {
+        settingsEditGeneration.current = 0;
+        setSettings(settingsResult.value);
+        setCurrentUserSettings(settingsResult.value);
+        setSettingsLoaded(true);
+      } else {
+        setError(
+          settingsResult.reason instanceof ApiError
+            ? settingsResult.reason.userMessage
+            : "设置加载失败",
+        );
+      }
+      if (hotwordsResult.status === "fulfilled") {
+        setHotwords(hotwordsResult.value.items);
+        setHotwordsLoaded(true);
+      } else {
+        setHotwordLoadError(
+          hotwordsResult.reason instanceof ApiError
+            ? hotwordsResult.reason.userMessage
+            : "热词加载失败",
+        );
+      }
+    } finally {
+      if (generation === loadGeneration.current) {
+        loadInFlight.current = false;
+        setLoading(false);
+      }
+    }
   }, []);
   useEffect(() => {
     const timer = window.setTimeout(() => void load(), 0);
     return () => window.clearTimeout(timer);
   }, [load]);
 
+  const loadHotwords = useCallback(async () => {
+    if (loadInFlight.current || hotwordsLoadInFlight.current) return;
+    hotwordsLoadInFlight.current = true;
+    setHotwordsLoading(true);
+    setHotwordsLoaded(false);
+    setHotwordLoadError(null);
+    try {
+      const result = await api.hotwords.list();
+      setHotwords(result.items);
+      setHotwordsLoaded(true);
+    } catch (reason) {
+      setHotwords([]);
+      setHotwordLoadError(reason instanceof ApiError ? reason.userMessage : "热词加载失败");
+    } finally {
+      hotwordsLoadInFlight.current = false;
+      setHotwordsLoading(false);
+    }
+  }, []);
+
+  const editSettings = useCallback((update: (current: UserSettings) => UserSettings) => {
+    settingsEditGeneration.current += 1;
+    setSettings(update);
+  }, []);
+
   const saveSettings = async () => {
+    if (!settingsLoaded || loadInFlight.current || settingsWriteInFlight.current) return;
+    settingsWriteInFlight.current = true;
+    loadGeneration.current += 1;
+    const submittedEditGeneration = settingsEditGeneration.current;
     setBusy(true);
     setError(null);
     setNotice(null);
@@ -113,18 +169,27 @@ export default function SettingsPage() {
         timezone: settings.timezone,
       };
       const saved = await api.settings.update(update);
-      setSettings(saved);
+      const hasNewerDraft = settingsEditGeneration.current !== submittedEditGeneration;
+      if (!hasNewerDraft) {
+        settingsEditGeneration.current = 0;
+        setSettings(saved);
+      }
       setCurrentUserSettings(saved);
-      setNotice("设置已保存，后续日期解析、显示和新建日程会使用最新配置。");
+      setNotice(
+        hasNewerDraft
+          ? "设置已保存；保存期间的新修改仍保留在当前草稿中，请再次保存。"
+          : "设置已保存，后续日期解析、显示和新建日程会使用最新配置。",
+      );
     } catch (reason) {
       setError(reason instanceof ApiError ? reason.userMessage : "设置保存失败。");
     } finally {
+      settingsWriteInFlight.current = false;
       setBusy(false);
     }
   };
 
   const addHotword = async () => {
-    if (!newWord.trim()) return;
+    if (!hotwordsLoaded || hotwordsLoading || !newWord.trim()) return;
     setBusy(true);
     setError(null);
     try {
@@ -140,6 +205,7 @@ export default function SettingsPage() {
   };
 
   const beginRemoveHotword = async (word: Hotword) => {
+    if (!hotwordsLoaded || hotwordsLoading) return;
     setBusy(true);
     setError(null);
     try {
@@ -158,7 +224,7 @@ export default function SettingsPage() {
   };
 
   const finishRemoveHotword = async () => {
-    if (!pendingHotwordRemoval) return;
+    if (!hotwordsLoaded || hotwordsLoading || !pendingHotwordRemoval) return;
     setBusy(true);
     setError(null);
     try {
@@ -218,7 +284,7 @@ export default function SettingsPage() {
   const addCourse = () => {
     const value = courseInput.trim();
     if (!value || settings.current_courses.some((course) => course.name === value)) return;
-    setSettings((current) => ({
+    editSettings((current) => ({
       ...current,
       current_courses: [...current.current_courses, { name: value }],
     }));
@@ -227,7 +293,7 @@ export default function SettingsPage() {
   const addTeacher = () => {
     const value = teacherInput.trim();
     if (!value || settings.teacher_names.includes(value)) return;
-    setSettings((current) => ({
+    editSettings((current) => ({
       ...current,
       teacher_names: [...current.teacher_names, value],
     }));
@@ -247,7 +313,7 @@ export default function SettingsPage() {
     }
   };
   const applySyntheticPreset = () => {
-    setSettings((current) => ({
+    editSettings((current) => ({
       ...current,
       major: "人工智能",
       grade: "2024 级",
@@ -273,7 +339,7 @@ export default function SettingsPage() {
         actions={
           <button
             type="button"
-            disabled={busy || loading}
+            disabled={busy || loading || !settingsLoaded}
             onClick={() => void saveSettings()}
             className="btn-primary"
           >
@@ -284,7 +350,11 @@ export default function SettingsPage() {
       />
       {error ? (
         <div className="mb-5">
-          <ErrorState message={error} onRetry={() => void load()} compact />
+          <ErrorState
+            message={error}
+            onRetry={!settingsLoaded && !loading && !busy ? () => void load() : undefined}
+            compact
+          />
         </div>
       ) : null}
       {notice ? (
@@ -298,7 +368,7 @@ export default function SettingsPage() {
       ) : null}
       {loading ? (
         <LoadingState rows={6} />
-      ) : (
+      ) : !settingsLoaded ? null : (
         <>
           <section className="surface mb-6 overflow-hidden" aria-labelledby="settings-impact-title">
             <div className="border-b border-mist-100 p-5 sm:p-6">
@@ -453,7 +523,9 @@ export default function SettingsPage() {
                     <span className="mb-1.5 block text-sm font-bold text-ink-700">专业</span>
                     <input
                       value={settings.major ?? ""}
-                      onChange={(input) => setSettings({ ...settings, major: input.target.value })}
+                      onChange={(input) =>
+                        editSettings((current) => ({ ...current, major: input.target.value }))
+                      }
                       className="field"
                       placeholder="例如：人工智能"
                     />
@@ -462,7 +534,9 @@ export default function SettingsPage() {
                     <span className="mb-1.5 block text-sm font-bold text-ink-700">年级</span>
                     <input
                       value={settings.grade ?? ""}
-                      onChange={(input) => setSettings({ ...settings, grade: input.target.value })}
+                      onChange={(input) =>
+                        editSettings((current) => ({ ...current, grade: input.target.value }))
+                      }
                       className="field"
                       placeholder="例如：2024 级"
                     />
@@ -506,7 +580,7 @@ export default function SettingsPage() {
                             type="button"
                             aria-label={`移除课程${label}`}
                             onClick={() =>
-                              setSettings((current) => ({
+                              editSettings((current) => ({
                                 ...current,
                                 current_courses: current.current_courses.filter(
                                   (_, courseIndex) => courseIndex !== index,
@@ -558,7 +632,7 @@ export default function SettingsPage() {
                           type="button"
                           aria-label={`移除教师${teacher}`}
                           onClick={() =>
-                            setSettings((current) => ({
+                            editSettings((current) => ({
                               ...current,
                               teacher_names: current.teacher_names.filter(
                                 (item) => item !== teacher,
@@ -594,7 +668,10 @@ export default function SettingsPage() {
                     <select
                       value={settings.timezone}
                       onChange={(input) =>
-                        setSettings({ ...settings, timezone: input.target.value })
+                        editSettings((current) => ({
+                          ...current,
+                          timezone: input.target.value,
+                        }))
                       }
                       className="field"
                     >
@@ -607,10 +684,10 @@ export default function SettingsPage() {
                     <select
                       value={settings.default_reminder_minutes}
                       onChange={(input) =>
-                        setSettings({
-                          ...settings,
+                        editSettings((current) => ({
+                          ...current,
                           default_reminder_minutes: Number(input.target.value),
-                        })
+                        }))
                       }
                       className="field"
                     >
@@ -682,16 +759,27 @@ export default function SettingsPage() {
                     <p className="text-xs text-ink-400">按课程、教师和专业术语分类管理</p>
                   </div>
                 </div>
+                {hotwordLoadError ? (
+                  <div className="mb-4">
+                    <ErrorState
+                      message={hotwordLoadError}
+                      onRetry={!hotwordsLoading && !busy ? () => void loadHotwords() : undefined}
+                      compact
+                    />
+                  </div>
+                ) : null}
                 <form
                   onSubmit={(event) => {
                     event.preventDefault();
                     void addHotword();
                   }}
                   className="space-y-2"
+                  aria-busy={hotwordsLoading}
                 >
                   <input
                     value={newWord}
                     onChange={(input) => setNewWord(input.target.value)}
+                    disabled={!hotwordsLoaded || hotwordsLoading}
                     className="field"
                     placeholder="输入热词"
                     aria-label="新热词"
@@ -702,6 +790,7 @@ export default function SettingsPage() {
                       onChange={(input) =>
                         setNewCategory(input.target.value as Hotword["category"])
                       }
+                      disabled={!hotwordsLoaded || hotwordsLoading}
                       className="field"
                     >
                       <option value="custom">自定义</option>
@@ -712,7 +801,7 @@ export default function SettingsPage() {
                     </select>
                     <button
                       type="submit"
-                      disabled={busy || !newWord.trim()}
+                      disabled={busy || hotwordsLoading || !hotwordsLoaded || !newWord.trim()}
                       className="btn-primary shrink-0 !px-3"
                     >
                       <Plus size={17} />
@@ -721,7 +810,9 @@ export default function SettingsPage() {
                   </div>
                 </form>
                 <div className="mt-5 space-y-4">
-                  {hotwords.length === 0 ? (
+                  {hotwordsLoading ? (
+                    <LoadingState rows={3} />
+                  ) : !hotwordsLoaded ? null : hotwords.length === 0 ? (
                     <EmptyState title="还没有热词" description="添加后会同步到识别服务。" />
                   ) : (
                     byCategory.map(([category, words]) => (
