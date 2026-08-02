@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import NoticesPage from "@/app/notices/page";
@@ -7,6 +7,7 @@ import { useAssistantStore } from "@/stores/assistant-store";
 const mocks = vi.hoisted(() => ({
   push: vi.fn(),
   listDocuments: vi.fn(),
+  uploadDocument: vi.fn(),
   ask: vi.fn(),
   search: vi.fn(),
 }));
@@ -17,7 +18,7 @@ vi.mock("@/lib/api-client", () => ({
     userMessage = this.message;
   },
   api: {
-    documents: { list: mocks.listDocuments, upload: vi.fn() },
+    documents: { list: mocks.listDocuments, upload: mocks.uploadDocument },
     knowledge: { ask: mocks.ask, search: mocks.search },
   },
 }));
@@ -28,6 +29,7 @@ describe("NoticesPage source document handoff", () => {
     useAssistantStore.getState().reset();
     mocks.push.mockReset();
     mocks.listDocuments.mockReset().mockResolvedValue({ items: [], total: 0 });
+    mocks.uploadDocument.mockReset().mockResolvedValue({});
     mocks.ask.mockReset().mockResolvedValue({
       answer: "考试安排见原文。",
       sufficient: true,
@@ -151,5 +153,58 @@ describe("NoticesPage source document handoff", () => {
 
     expect(screen.getByRole("tab", { name: "证据问答" })).toHaveAttribute("aria-selected", "true");
     expect(screen.queryByText("没有找到相关原文")).not.toBeInTheDocument();
+  });
+  it("keeps the newest document snapshot when the initial load finishes after an upload reload", async () => {
+    let resolveInitial!: (value: { items: []; total: 0 }) => void;
+    let resolveReload!: (value: { items: Array<Record<string, unknown>>; total: 1 }) => void;
+    mocks.listDocuments
+      .mockReset()
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveInitial = resolve;
+        }),
+      )
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveReload = resolve;
+        }),
+      );
+    render(<NoticesPage />);
+    await waitFor(() => expect(mocks.listDocuments).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole("button", { name: /上传文档/ }));
+    const dialog = screen.getByRole("dialog");
+    const fileInput = dialog.querySelector<HTMLInputElement>('input[type="file"]');
+    if (!fileInput) throw new Error("Upload file input was not rendered");
+    fireEvent.change(fileInput, {
+      target: { files: [new File(["notice"], "fresh.md", { type: "text/markdown" })] },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /上传文档/ }));
+
+    await waitFor(() => expect(mocks.listDocuments).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      resolveReload({
+        items: [
+          {
+            id: "doc-fresh",
+            title: "Fresh upload",
+            department: null,
+            publish_date: null,
+            applicable_group: null,
+            source_url: null,
+            version: null,
+            file_type: "md",
+            status: "ready",
+            chunk_count: 1,
+            created_at: "2026-08-02T00:00:00.000Z",
+          },
+        ],
+        total: 1,
+      });
+    });
+    expect(await screen.findByText("Fresh upload")).toBeInTheDocument();
+
+    await act(async () => resolveInitial({ items: [], total: 0 }));
+    expect(screen.getByText("Fresh upload")).toBeInTheDocument();
   });
 });
