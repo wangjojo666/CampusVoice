@@ -1258,6 +1258,7 @@ _QUOTE_OPEN_TO_CLOSE = {
     "'": "'",
 }
 _QUOTE_CLOSE_CHARACTERS = frozenset(_QUOTE_OPEN_TO_CLOSE.values())
+_QUOTE_CHARACTERS = frozenset(_QUOTE_OPEN_TO_CLOSE) | _QUOTE_CLOSE_CHARACTERS
 _RENAME_MODIFIER_PATTERN = re.compile(r"(?:改名为|重命名为|标题改为)[：:，,]*")
 
 
@@ -1290,6 +1291,8 @@ def _paired_quote_spans(
     *,
     pair_ends: dict[int, int] | None = None,
 ) -> tuple[_QuotedSpan, ...] | None:
+    if _QUOTE_CHARACTERS.isdisjoint(text):
+        return ()
     spans: list[_QuotedSpan] = []
     stack: list[tuple[str, int]] = []
     for index, character in enumerate(text):
