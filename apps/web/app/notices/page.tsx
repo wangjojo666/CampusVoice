@@ -42,6 +42,7 @@ export default function NoticesPage() {
   const [searching, setSearching] = useState(false);
   const [hasSearched, setHasSearched] = useState(false);
   const searchGeneration = useRef(0);
+  const documentLoadGeneration = useRef(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [searchError, setSearchError] = useState<string | null>(null);
@@ -49,20 +50,26 @@ export default function NoticesPage() {
   const [uploadOpen, setUploadOpen] = useState(false);
 
   const load = useCallback(async () => {
+    const generation = ++documentLoadGeneration.current;
     setLoading(true);
     try {
       const response = await api.documents.list();
+      if (generation !== documentLoadGeneration.current) return;
       setDocuments(response.items);
       setError(null);
     } catch (reason) {
+      if (generation !== documentLoadGeneration.current) return;
       setError(reason instanceof ApiError ? reason.userMessage : "无法加载校园通知文档。");
     } finally {
-      setLoading(false);
+      if (generation === documentLoadGeneration.current) setLoading(false);
     }
   }, []);
   useEffect(() => {
     const timer = window.setTimeout(() => void load(), 0);
-    return () => window.clearTimeout(timer);
+    return () => {
+      window.clearTimeout(timer);
+      documentLoadGeneration.current += 1;
+    };
   }, [load]);
 
   const search = async () => {
