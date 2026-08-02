@@ -1,6 +1,7 @@
 "use client";
 
 import type { CalendarEvent } from "@campusvoice/shared-types";
+import type { DatesSetArg } from "@fullcalendar/core";
 import zhCnLocale from "@fullcalendar/core/locales/zh-cn";
 import dayGridPlugin from "@fullcalendar/daygrid";
 import interactionPlugin from "@fullcalendar/interaction";
@@ -9,15 +10,21 @@ import timeGridPlugin from "@fullcalendar/timegrid";
 
 import { fromLocalInputValue, toLocalInputValue } from "@/lib/format";
 import { useUserSettings } from "@/lib/user-settings";
+export type CalendarRange = {
+  start: string;
+  end: string;
+};
 
 export function CalendarView({
   events,
   onEventClick,
   onDateClick,
+  onRangeChange,
 }: Readonly<{
   events: CalendarEvent[];
   onEventClick: (event: CalendarEvent) => void;
   onDateClick: (date: Date) => void;
+  onRangeChange: (range: CalendarRange) => void;
 }>) {
   const userSettings = useUserSettings();
   const byId = new Map(events.map((event) => [event.id, event]));
@@ -45,6 +52,11 @@ export function CalendarView({
         backgroundColor: event.course ? "#159b82" : "#52636f",
         borderColor: event.course ? "#159b82" : "#52636f",
       }))}
+      datesSet={({ startStr, endStr }: DatesSetArg) => {
+        const start = fromLocalInputValue(`${startStr.slice(0, 10)}T00:00`, userSettings.timezone);
+        const end = fromLocalInputValue(`${endStr.slice(0, 10)}T00:00`, userSettings.timezone);
+        if (start && end) onRangeChange({ start, end });
+      }}
       eventClick={({ event }) => {
         const source = byId.get(event.id);
         if (source) onEventClick(source);

@@ -4030,7 +4030,11 @@ def _fallback_parse(
     if current.intent != IntentName.UNKNOWN:
         return current
     normalized = _normalized_intent_text(text)
-    safety_normalized = _safety_normalized_intent_text(text)
+    safety_normalized = (
+        _normalized_intent_text(safety_source_text)
+        if safety_source_text is not None
+        else _safety_normalized_intent_text(text)
+    )
     signals = _intent_signals(normalized)
     if (
         _explicitly_aborts(safety_normalized)

@@ -106,15 +106,17 @@ describe("reviewable mutation forms", () => {
     );
   });
 
-  it("submits a reviewed event only when no conflict exists", async () => {
+  it("submits a reviewed event only after the real conflict precheck succeeds", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn();
+    const onCheckConflicts = vi.fn().mockResolvedValue(true);
     render(
       <EventForm
         event={null}
         defaultStart={new Date("2026-07-21T01:00:00.000Z")}
         conflicts={[]}
         busy={false}
+        onCheckConflicts={onCheckConflicts}
         onSubmit={onSubmit}
         onCancel={vi.fn()}
       />,
@@ -125,6 +127,9 @@ describe("reviewable mutation forms", () => {
     await user.selectOptions(screen.getByLabelText("提前提醒"), "60");
     await user.click(screen.getByRole("button", { name: "检查冲突并核对" }));
 
+    expect(onCheckConflicts).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "项目例会", location: "B202" }),
+    );
     expect(screen.getByText("未检测到时间冲突")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "确认并保存" }));
     expect(onSubmit).toHaveBeenCalledWith(
@@ -137,6 +142,29 @@ describe("reviewable mutation forms", () => {
     );
   });
 
+  it("keeps the editor open when the real conflict precheck cannot complete", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    const onCheckConflicts = vi.fn().mockResolvedValue(false);
+    render(
+      <EventForm
+        event={null}
+        defaultStart={new Date("2026-07-21T01:00:00.000Z")}
+        conflicts={[]}
+        busy={false}
+        onCheckConflicts={onCheckConflicts}
+        onSubmit={onSubmit}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    await user.type(screen.getByLabelText("标题 *"), "需要重试检查的日程");
+    await user.click(screen.getByRole("button", { name: "检查冲突并核对" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("未能完成时间冲突检查");
+    expect(screen.queryByText("未检测到时间冲突")).not.toBeInTheDocument();
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
   it("uses the saved reminder only for new events and preserves an edited value", () => {
     const { rerender } = render(
       <EventForm
@@ -146,6 +174,7 @@ describe("reviewable mutation forms", () => {
         defaultReminderMinutes={60}
         conflicts={[]}
         busy={false}
+        onCheckConflicts={vi.fn().mockResolvedValue(true)}
         onSubmit={vi.fn()}
         onCancel={vi.fn()}
       />,
@@ -162,6 +191,7 @@ describe("reviewable mutation forms", () => {
         defaultReminderMinutes={60}
         conflicts={[]}
         busy={false}
+        onCheckConflicts={vi.fn().mockResolvedValue(true)}
         onSubmit={vi.fn()}
         onCancel={vi.fn()}
       />,
@@ -180,6 +210,7 @@ describe("reviewable mutation forms", () => {
         defaultReminderMinutes={60}
         conflicts={[]}
         busy={false}
+        onCheckConflicts={vi.fn().mockResolvedValue(true)}
         onSubmit={onSubmit}
         onCancel={vi.fn()}
       />,
@@ -194,22 +225,24 @@ describe("reviewable mutation forms", () => {
     expect(onSubmit.mock.calls[0]?.[0]).not.toHaveProperty("reminder_minutes");
   });
 
-  it("renders the conflicting event and blocks an edited event save", async () => {
+  it("clears a stale conflict before the user reviews edited times again", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn();
-    render(
+    const onConflictReset = vi.fn();
+    const conflict = {
+      event_id: "event-2",
+      title: "冲突课程",
+      start_at: "2026-07-20T01:30:00.000Z",
+      end_at: "2026-07-20T02:30:00.000Z",
+    };
+    const { rerender } = render(
       <EventForm
         event={event}
-        conflicts={[
-          {
-            event_id: "event-2",
-            title: "冲突课程",
-            start_at: "2026-07-20T01:30:00.000Z",
-            end_at: "2026-07-20T02:30:00.000Z",
-          },
-        ]}
+        conflicts={[conflict]}
         busy={false}
+        onCheckConflicts={vi.fn().mockResolvedValue(true)}
         onSubmit={onSubmit}
+        onConflictReset={onConflictReset}
         onCancel={vi.fn()}
       />,
     );
@@ -217,7 +250,25 @@ describe("reviewable mutation forms", () => {
     await user.click(screen.getByRole("button", { name: "检查冲突并核对" }));
     expect(screen.getByRole("alert")).toHaveTextContent("冲突课程");
     expect(screen.getByRole("button", { name: "确认并保存" })).toBeDisabled();
-    expect(onSubmit).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "返回修改" }));
+    expect(onConflictReset).toHaveBeenCalledOnce();
+    rerender(
+      <EventForm
+        event={event}
+        conflicts={[]}
+        busy={false}
+        onCheckConflicts={vi.fn().mockResolvedValue(true)}
+        onSubmit={onSubmit}
+        onConflictReset={onConflictReset}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "检查冲突并核对" }));
+    expect(screen.getByRole("button", { name: "确认并保存" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "确认并保存" }));
+    expect(onSubmit).toHaveBeenCalledOnce();
   });
 
   it("uploads a selected synthetic document with trimmed metadata", async () => {

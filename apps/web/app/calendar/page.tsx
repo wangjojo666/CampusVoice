@@ -9,18 +9,25 @@ import type {
 } from "@campusvoice/shared-types";
 import { CalendarPlus, Check, Clock3, Edit3, MapPin, Plus, RotateCcw, Trash2 } from "lucide-react";
 import dynamic from "next/dynamic";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { VerifiedFinish } from "@/components/actions/verified-finish";
+import type { CalendarRange } from "@/components/calendar/calendar-view";
 import { EventForm } from "@/components/calendar/event-form";
 import { PageHeader } from "@/components/layout/page-header";
 import { EmptyState } from "@/components/ui/empty-state";
 import { ErrorState } from "@/components/ui/error-state";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Modal } from "@/components/ui/modal";
+import {
+  confirmActionAndReconcile,
+  isActionExecutionRecoveryStatus,
+} from "@/lib/action-confirmation";
 import { ApiError, api } from "@/lib/api-client";
 import { latestUndoableEventAction } from "@/lib/calendar/undo";
+import { firstValidInstantOfLocalDay, localDateKey } from "@/lib/dashboard/local-days";
 import { formatDateTime } from "@/lib/format";
+import { collectAllPages } from "@/lib/pagination";
 import { useUserSettings } from "@/lib/user-settings";
 import { createVerifiedFinishEvent, type VerifiedFinishEvent } from "@/lib/verified-finish";
 
@@ -32,10 +39,35 @@ const CalendarView = dynamic(
   },
 );
 
+function currentMonthRange(timezone: string): CalendarRange {
+  const monthStart = `${localDateKey(new Date(), timezone).slice(0, 7)}-01`;
+  const nextMonth = new Date(`${monthStart}T00:00:00.000Z`);
+  nextMonth.setUTCMonth(nextMonth.getUTCMonth() + 1);
+  const nextMonthStart = nextMonth.toISOString().slice(0, 10);
+  return {
+    start: new Date(firstValidInstantOfLocalDay(monthStart, timezone)).toISOString(),
+    end: new Date(firstValidInstantOfLocalDay(nextMonthStart, timezone)).toISOString(),
+  };
+}
 export default function CalendarPage() {
   const userSettings = useUserSettings();
+  const timezone = userSettings.timezone;
+  const [rangeState, setRangeState] = useState<{
+    timezone: string;
+    range: CalendarRange;
+  }>(() => ({
+    timezone,
+    range: currentMonthRange(timezone),
+  }));
+  const visibleRange =
+    rangeState.timezone === timezone ? rangeState.range : currentMonthRange(timezone);
+  const visibleRangeRef = useRef(visibleRange);
+  const loadGenerationRef = useRef(0);
+  const deleteGenerationRef = useRef(0);
+  const pendingUndoActionIdRef = useRef<string | null>(null);
   const [events, setEvents] = useState<CalendarEvent[]>([]);
   const [loading, setLoading] = useState(true);
+  const [hasLoaded, setHasLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -47,23 +79,68 @@ export default function CalendarPage() {
   const [deleting, setDeleting] = useState<CalendarEvent | null>(null);
   const [deleteText, setDeleteText] = useState("");
   const [pendingDelete, setPendingDelete] = useState<PendingAction | null>(null);
+  const [deleteRetryBlocked, setDeleteRetryBlocked] = useState(false);
+  const deleteCanResumeExecution = isActionExecutionRecoveryStatus(pendingDelete?.status);
+  const deleteNeedsExecutionRecovery =
+    pendingDelete?.status === "executing" || pendingDelete?.status === "executed";
+  const deleteCancellationBlocked = !deleteRetryBlocked && deleteNeedsExecutionRecovery;
 
   const load = useCallback(async () => {
+    const generation = ++loadGenerationRef.current;
+    const range = visibleRangeRef.current;
     setLoading(true);
+    setError(null);
+    setEvents([]);
     try {
-      const response = await api.events.list();
-      setEvents(response.items);
-      setError(null);
+      const items = await collectAllPages(
+        ({ limit, offset }) =>
+          api.events.list({
+            start: range.start,
+            end: range.end,
+            limit,
+            offset,
+          }),
+        {
+          getKey: (event) => event.id,
+          shouldContinue: () => generation === loadGenerationRef.current,
+        },
+      );
+      if (generation !== loadGenerationRef.current) return;
+      setEvents(items);
     } catch (reason) {
+      if (generation !== loadGenerationRef.current) return;
       setError(reason instanceof ApiError ? reason.userMessage : "无法加载日历。");
     } finally {
-      setLoading(false);
+      if (generation === loadGenerationRef.current) {
+        setLoading(false);
+        setHasLoaded(true);
+      }
     }
   }, []);
   useEffect(() => {
+    visibleRangeRef.current = { start: visibleRange.start, end: visibleRange.end };
+  }, [visibleRange.end, visibleRange.start]);
+  useEffect(() => {
     const timer = window.setTimeout(() => void load(), 0);
-    return () => window.clearTimeout(timer);
-  }, [load]);
+    return () => {
+      window.clearTimeout(timer);
+      loadGenerationRef.current += 1;
+    };
+  }, [load, visibleRange.end, visibleRange.start]);
+
+  const updateVisibleRange = useCallback(
+    (range: CalendarRange) => {
+      visibleRangeRef.current = range;
+      setRangeState((current) =>
+        current.timezone === timezone &&
+        current.range.start === range.start &&
+        current.range.end === range.end
+          ? current
+          : { timezone, range },
+      );
+    },
+    [timezone],
+  );
 
   const openCreate = (date?: Date) => {
     setEditing(null);
@@ -80,6 +157,34 @@ export default function CalendarPage() {
     setEditorOpen(true);
     setNotice(null);
     setVerifiedFinish(null);
+  };
+
+  const checkConflictsForReview = async (
+    data: CalendarEventCreate | Omit<CalendarEventUpdate, "expected_version">,
+  ) => {
+    if (!data.start_at || !data.end_at) {
+      setError("请同时填写开始与结束时间，以便检查冲突。");
+      return false;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    setVerifiedFinish(null);
+    setConflicts([]);
+    try {
+      const result = await api.events.checkConflict({
+        start_at: data.start_at,
+        end_at: data.end_at,
+        exclude_event_id: editing?.id,
+      });
+      setConflicts(result.conflicts);
+      return true;
+    } catch (reason) {
+      setError(reason instanceof ApiError ? reason.userMessage : "无法完成时间冲突检查。");
+      return false;
+    } finally {
+      setBusy(false);
+    }
   };
 
   const save = async (
@@ -122,46 +227,132 @@ export default function CalendarPage() {
     }
   };
 
+  const setDeleteTarget = useCallback((target: CalendarEvent | null) => {
+    deleteGenerationRef.current += 1;
+    setDeleting(target);
+    setDeleteText("");
+    setPendingDelete(null);
+    setDeleteRetryBlocked(false);
+  }, []);
+
+  const dismissDeleteForReview = async () => {
+    const actionId = pendingDelete?.id;
+    setNotice(
+      actionId
+        ? `删除操作 ${actionId} 已停止自动重试，请核对当前数据。`
+        : "删除操作已停止自动重试，请核对当前数据。",
+    );
+    setBusy(false);
+    setDeleteTarget(null);
+    await load();
+  };
+
+  const cancelDelete = async () => {
+    const action = pendingDelete;
+    if (!action) {
+      setDeleteTarget(null);
+      return;
+    }
+    const generation = deleteGenerationRef.current;
+    const isCurrent = () => generation === deleteGenerationRef.current;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.actions.cancel(action.id);
+      if (!isCurrent()) return;
+      setBusy(false);
+      setDeleteTarget(null);
+    } catch (reason) {
+      if (!isCurrent()) return;
+      try {
+        const current = await api.actions.get(action.id);
+        if (!isCurrent()) return;
+        setPendingDelete(current);
+        if (current.status === "executing" || current.status === "executed") {
+          setError("删除已进入执行或验证恢复阶段，无法取消。请恢复同一操作并获取权威结果。");
+          return;
+        }
+        if (["cancelled", "expired", "undone"].includes(current.status)) {
+          setNotice("删除操作已结束，已重新加载当前数据。");
+          setBusy(false);
+          setDeleteTarget(null);
+          await load();
+          return;
+        }
+      } catch {
+        // Keep the original cancellation error when authoritative state cannot be read.
+      }
+      setError(reason instanceof ApiError ? reason.userMessage : "取消删除失败，请重试。");
+    } finally {
+      if (isCurrent()) setBusy(false);
+    }
+  };
+
   const remove = async () => {
-    if (!deleting || deleteText !== deleting.title) return;
+    const target = deleting;
+    if (!target || (!deleteCanResumeExecution && deleteText !== target.title)) return;
+    const generation = deleteGenerationRef.current;
+    const isCurrent = () => generation === deleteGenerationRef.current;
     setBusy(true);
     setError(null);
     setNotice(null);
     setVerifiedFinish(null);
     try {
-      const action = pendingDelete ?? (await api.events.remove(deleting.id));
-      const isFirstConfirmation = action.status === "awaiting_confirmation";
-      if (!isFirstConfirmation && action.status !== "awaiting_second_confirmation") {
-        throw new ApiError("删除操作不在可确认状态，请重新发起。", {
-          status: 409,
-          details: action,
-        });
+      let action = pendingDelete;
+      if (!action) {
+        action = await api.events.remove(target.id);
+        if (!isCurrent()) return;
+        setPendingDelete(action);
       }
 
-      if (pendingDelete === null) setPendingDelete(action);
-      const updated = await api.actions.confirm(action.id, true);
-      setPendingDelete(updated);
+      if (!isActionExecutionRecoveryStatus(action.status)) {
+        const isFirstConfirmation = action.status === "awaiting_confirmation";
+        if (!isFirstConfirmation && action.status !== "awaiting_second_confirmation") {
+          throw new ApiError("删除操作不在可确认状态，请重新发起。", {
+            status: 409,
+            details: action,
+          });
+        }
 
-      if (isFirstConfirmation) {
-        if (updated.status !== "awaiting_second_confirmation") {
+        const outcome = await confirmActionAndReconcile(action.id);
+        if (!isCurrent()) return;
+        const updated = outcome.action;
+
+        if (isFirstConfirmation) {
+          if (updated.status === "awaiting_second_confirmation") {
+            setPendingDelete(updated);
+            setDeleteText("");
+            setNotice("第一次确认已记录。请重新输入标题并完成第二次确认。");
+            return;
+          }
+          if (outcome.confirmationError) throw outcome.confirmationError;
           throw new ApiError("第一次确认后的状态不安全，未执行删除。", {
             status: 409,
             details: updated,
           });
         }
-        setDeleteText("");
-        setNotice("第一次确认已记录。请重新输入标题并完成第二次确认。");
-        return;
+
+        setPendingDelete(updated);
+        if (updated.status !== "ready" && updated.status !== "failed") {
+          if (outcome.confirmationError) throw outcome.confirmationError;
+          throw new ApiError("删除操作尚未获得全部确认，未执行。", {
+            status: 409,
+            details: updated,
+          });
+        }
+        action = updated;
       }
 
-      if (updated.status !== "ready") {
-        throw new ApiError("删除操作尚未获得全部确认，未执行。", {
-          status: 409,
-          details: updated,
-        });
+      const result = await api.actions.execute(action.id);
+      if (!isCurrent()) return;
+      if (!result.success) {
+        if (result.retryable === false) {
+          setDeleteRetryBlocked(true);
+          setError(`${result.message} 自动重试已停止，请人工核对当前数据。`);
+          return;
+        }
+        throw new ApiError(result.message, { status: 409, details: result });
       }
-      const result = await api.actions.execute(updated.id);
-      if (!result.success) throw new ApiError(result.message, { status: 409, details: result });
       setNotice(result.message);
       setVerifiedFinish(createVerifiedFinishEvent(result, "execute"));
       setDeleting(null);
@@ -169,9 +360,15 @@ export default function CalendarPage() {
       setPendingDelete(null);
       await load();
     } catch (reason) {
+      if (!isCurrent()) return;
+      if (reason instanceof ApiError && reason.code === "retry_limit_reached") {
+        setDeleteRetryBlocked(true);
+        setError(`${reason.userMessage} 自动重试已停止，请人工核对当前数据。`);
+        return;
+      }
       setError(reason instanceof ApiError ? reason.userMessage : "删除失败。");
     } finally {
-      setBusy(false);
+      if (isCurrent()) setBusy(false);
     }
   };
 
@@ -181,14 +378,26 @@ export default function CalendarPage() {
     setNotice(null);
     setVerifiedFinish(null);
     try {
-      const logs = await api.actionLogs.list(50);
-      const latest = latestUndoableEventAction(logs.items);
-      if (!latest?.action_id) {
-        setError("没有可撤销的最近日历操作。");
-        return;
+      let actionId = pendingUndoActionIdRef.current;
+      if (!actionId) {
+        const logs = await collectAllPages(
+          ({ limit, offset }) => api.actionLogs.list(limit, offset),
+          {
+            getKey: (log) => log.id,
+            shouldStop: (page) => Boolean(latestUndoableEventAction(page)),
+          },
+        );
+        const latest = latestUndoableEventAction(logs);
+        if (!latest?.action_id) {
+          setError("没有可撤销的最近日历操作。");
+          return;
+        }
+        actionId = latest.action_id;
+        pendingUndoActionIdRef.current = actionId;
       }
-      const result = await api.actions.undo(latest.action_id);
+      const result = await api.actions.undo(actionId);
       if (!result.success) throw new ApiError(result.message, { status: 409, details: result });
+      pendingUndoActionIdRef.current = null;
       setNotice(result.message);
       setVerifiedFinish(createVerifiedFinishEvent(result, "undo"));
       await load();
@@ -223,7 +432,7 @@ export default function CalendarPage() {
       />
       {error ? (
         <div className="mb-5">
-          <ErrorState message={error} onRetry={() => void load()} compact />
+          <ErrorState message={error} onRetry={loading ? undefined : () => void load()} compact />
         </div>
       ) : null}
       {notice ? (
@@ -241,22 +450,38 @@ export default function CalendarPage() {
           ) : null}
         </div>
       ) : null}
-      {loading ? (
+      {!hasLoaded ? (
         <LoadingState rows={6} />
-      ) : events.length === 0 ? (
-        <EmptyState
-          title="日历还是空的"
-          description="新建日程，或使用语音助手在确认后添加。"
-          action={
-            <button type="button" onClick={() => openCreate()} className="btn-primary">
-              <CalendarPlus size={16} /> 新建日程
-            </button>
-          }
-        />
       ) : (
-        <section className="surface overflow-hidden p-3 sm:p-5">
-          <CalendarView events={events} onEventClick={openEdit} onDateClick={openCreate} />
-        </section>
+        <>
+          {loading ? (
+            <p role="status" className="mb-3 text-sm font-semibold text-ink-500">
+              正在加载当前可见范围…
+            </p>
+          ) : null}
+          {!loading && !error && events.length === 0 ? (
+            <div className="mb-5">
+              <EmptyState
+                title="当前可见范围暂无日程"
+                description="可以切换月份或周继续查看，也可以直接新建日程。"
+                action={
+                  <button type="button" onClick={() => openCreate()} className="btn-primary">
+                    <CalendarPlus size={16} /> 新建日程
+                  </button>
+                }
+              />
+            </div>
+          ) : null}
+          <section className="surface overflow-hidden p-3 sm:p-5" aria-busy={loading}>
+            <CalendarView
+              key={timezone}
+              events={events}
+              onEventClick={openEdit}
+              onDateClick={openCreate}
+              onRangeChange={updateVisibleRange}
+            />
+          </section>
+        </>
       )}
 
       <Modal
@@ -274,7 +499,9 @@ export default function CalendarPage() {
           defaultReminderMinutes={userSettings.default_reminder_minutes}
           conflicts={conflicts}
           busy={busy}
+          onCheckConflicts={checkConflictsForReview}
           onSubmit={save}
+          onConflictReset={() => setConflicts([])}
           onCancel={() => setEditorOpen(false)}
         />
       </Modal>
@@ -283,15 +510,20 @@ export default function CalendarPage() {
         open={Boolean(deleting)}
         title="高风险：删除日程"
         description={
-          pendingDelete?.status === "awaiting_second_confirmation"
-            ? "第一次确认已记录。请重新核对目标，并通过独立的第二次交互确认删除。"
-            : "请输入完整标题并完成第一次确认。"
+          deleteRetryBlocked
+            ? `自动重试已停止。请人工核对当前数据；操作编号：${pendingDelete?.id ?? "未知"}。`
+            : deleteNeedsExecutionRecovery
+              ? "删除已进入执行或验证恢复阶段，无法取消。请恢复同一操作并获取权威结果。"
+              : pendingDelete?.status === "ready" || pendingDelete?.status === "failed"
+                ? "删除已完成两次确认，但执行或结果回传未成功。可安全重试同一操作。"
+                : pendingDelete?.status === "awaiting_second_confirmation"
+                  ? "第一次确认已记录。请重新核对目标，并通过独立的第二次交互确认删除。"
+                  : "请输入完整标题并完成第一次确认。"
         }
         onClose={() => {
-          if (!busy) {
-            setDeleting(null);
-            setDeleteText("");
-            setPendingDelete(null);
+          if (!busy && !deleteCancellationBlocked) {
+            if (deleteRetryBlocked) void dismissDeleteForReview();
+            else void cancelDelete();
           }
         }}
       >
@@ -314,13 +546,16 @@ export default function CalendarPage() {
             </div>
             <label className="mt-4 block">
               <span className="mb-1.5 block text-sm font-bold text-ink-700">
-                {pendingDelete?.status === "awaiting_second_confirmation"
-                  ? "重新输入完整标题进行第二次确认"
-                  : "输入完整标题进行第一次确认"}
+                {deleteCanResumeExecution
+                  ? "该操作已完成确认，无需再次输入标题"
+                  : pendingDelete?.status === "awaiting_second_confirmation"
+                    ? "重新输入完整标题进行第二次确认"
+                    : "输入完整标题进行第一次确认"}
               </span>
               <input
                 autoFocus
                 value={deleteText}
+                disabled={busy || deleteRetryBlocked || deleteCanResumeExecution}
                 onChange={(input) => setDeleteText(input.target.value)}
                 className="field"
                 placeholder={deleting.title}
@@ -334,29 +569,40 @@ export default function CalendarPage() {
             <div className="mt-5 flex justify-end gap-2">
               <button
                 type="button"
-                onClick={() => {
-                  setDeleting(null);
-                  setDeleteText("");
-                  setPendingDelete(null);
-                }}
+                disabled={busy || deleteCancellationBlocked}
+                onClick={() =>
+                  deleteRetryBlocked ? void dismissDeleteForReview() : void cancelDelete()
+                }
                 className="btn-secondary"
               >
-                取消
+                {deleteRetryBlocked ? "关闭并重新加载" : "取消"}
               </button>
               <button
                 type="button"
-                disabled={busy || deleteText !== deleting.title}
+                disabled={
+                  busy ||
+                  deleteRetryBlocked ||
+                  (!deleteCanResumeExecution && deleteText !== deleting.title)
+                }
                 onClick={() => void remove()}
                 className="btn-danger"
               >
                 <Trash2 size={16} />
                 {busy
-                  ? pendingDelete?.status === "awaiting_second_confirmation"
-                    ? "正在删除并验证"
-                    : "正在记录第一次确认"
-                  : pendingDelete?.status === "awaiting_second_confirmation"
-                    ? "第二次确认并删除"
-                    : "第一次确认删除"}
+                  ? deleteNeedsExecutionRecovery
+                    ? "正在恢复删除并验证"
+                    : pendingDelete?.status === "ready" || pendingDelete?.status === "failed"
+                      ? "正在重试删除并验证"
+                      : pendingDelete?.status === "awaiting_second_confirmation"
+                        ? "正在删除并验证"
+                        : "正在记录第一次确认"
+                  : deleteNeedsExecutionRecovery
+                    ? "恢复删除并验证"
+                    : pendingDelete?.status === "ready" || pendingDelete?.status === "failed"
+                      ? "重试删除并验证"
+                      : pendingDelete?.status === "awaiting_second_confirmation"
+                        ? "第二次确认并删除"
+                        : "第一次确认删除"}
               </button>
             </div>
           </div>
@@ -390,11 +636,8 @@ export default function CalendarPage() {
                       </button>
                       <button
                         type="button"
-                        onClick={() => {
-                          setDeleting(event);
-                          setDeleteText("");
-                          setPendingDelete(null);
-                        }}
+                        disabled={busy}
+                        onClick={() => setDeleteTarget(event)}
                         className="btn-ghost !size-8 !min-h-0 !p-0 text-coral-600"
                         aria-label={`删除${event.title}`}
                       >

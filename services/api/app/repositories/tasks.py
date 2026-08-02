@@ -31,7 +31,11 @@ class TaskRepository:
         result = await session.scalars(
             select(Task)
             .where(*filters)
-            .order_by(Task.due_at.asc().nullslast(), Task.created_at.desc())
+            .order_by(
+                Task.due_at.asc().nullslast(),
+                Task.created_at.desc(),
+                Task.id.asc(),
+            )
             .limit(limit)
             .offset(offset)
         )
