@@ -462,7 +462,7 @@ async function installApiMocks(page: Page, options: MockOptions = {}) {
 
 async function installSyntheticAudioAndWebSocket(page: Page) {
   await page.addInitScript(() => {
-    const telemetry = { events: [] as string[], audioBytes: 0 };
+    const telemetry = { events: [] as string[], audioBytes: 0, skipDrainAck: false };
     const NativeWebSocket = window.WebSocket;
     Object.defineProperty(window, "__campusvoiceE2E", { value: telemetry, configurable: true });
 
@@ -484,11 +484,23 @@ async function installSyntheticAudioAndWebSocket(page: Page) {
       disconnect() {}
     }
 
-    type PortMessage = { data: { type: string; level?: number; buffer?: ArrayBuffer } };
+    type PortMessage = {
+      data: { type: string; level?: number; buffer?: ArrayBuffer; requestId?: number };
+    };
     const port = {
       onmessage: null as ((message: PortMessage) => void) | null,
-      postMessage: (message: { type?: string }) =>
-        telemetry.events.push(`worklet:${message.type ?? "message"}`),
+      postMessage: (message: { type?: string; requestId?: number }) => {
+        telemetry.events.push(`worklet:${message.type ?? "message"}`);
+        if (message.type === "drain") {
+          if (telemetry.skipDrainAck) return;
+          window.setTimeout(() => {
+            const tail = new Int16Array([1, -1, 2, -2, 3, -3, 4]);
+            port.onmessage?.({ data: { type: "audio", buffer: tail.buffer } });
+            telemetry.events.push(`worklet:drained:${message.requestId}`);
+            port.onmessage?.({ data: { type: "drained", requestId: message.requestId } });
+          }, 100);
+        }
+      },
     };
 
     class MockAudioWorkletNode extends ConnectableNode {
@@ -851,6 +863,7 @@ test("10 合成 PCM 贯穿浏览器 AudioWorklet、WebSocket 与录音状态链"
   await page.getByRole("button", { name: "继续" }).click();
   await expect(page.getByText("正在聆听", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "停止并完成转写" }).click();
+  await expect(page.getByText("正在完成转写", { exact: true })).toBeVisible();
   await expect(page.getByText("转写已完成", { exact: true })).toBeVisible();
   await expect(page.getByLabel("最终转写（可编辑）")).toHaveValue("周五上午九点有机器学习考试。");
   await expect(page.getByText("置信度：94%", { exact: false })).toBeVisible();
@@ -871,4 +884,68 @@ test("10 合成 PCM 贯穿浏览器 AudioWorklet、WebSocket 与录音状态链"
   expect(telemetry.events).toContain("ws:control:flush");
   expect(telemetry.events).toContain("ws:control:stop");
   expect(telemetry.events.some((event) => event.startsWith("ws:pcm:"))).toBe(true);
+
+  const tailEvents = [
+    "worklet:drain",
+    "ws:pcm:14",
+    "worklet:drained:1",
+    "media-track:stop",
+    "audio-context:close",
+    "ws:control:stop",
+  ];
+  for (const event of tailEvents) {
+    expect(telemetry.events.filter((candidate) => candidate === event)).toHaveLength(1);
+  }
+  const orderedTail = tailEvents.map((event) => telemetry.events.indexOf(event));
+  expect(orderedTail).toEqual([...orderedTail].sort((left, right) => left - right));
+});
+test("10b AudioWorklet drain 超时后保持失败状态并仍释放资源", async ({ page }) => {
+  await installSyntheticAudioAndWebSocket(page);
+  await installApiMocks(page);
+  await page.goto("/voice");
+  await page.getByRole("button", { name: "开始录音" }).click();
+  await expect(page.getByText("正在聆听", { exact: true })).toBeVisible();
+  await page.evaluate(() => {
+    (
+      window as unknown as Window & {
+        __campusvoiceE2E: { skipDrainAck: boolean };
+      }
+    ).__campusvoiceE2E.skipDrainAck = true;
+  });
+
+  await page.getByRole("button", { name: "停止并完成转写" }).click();
+  await expect(page.getByText("识别遇到问题", { exact: true })).toBeVisible({ timeout: 4_000 });
+  await expect(page.getByText("录音尾段未能完整发送，本次转写未完成，请重试。")).toBeVisible();
+  await expect(page.getByText("转写已完成", { exact: true })).toHaveCount(0);
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (
+          window as unknown as Window & {
+            __campusvoiceE2E: { events: string[] };
+          }
+        ).__campusvoiceE2E.events.includes("ws:control:stop"),
+      ),
+    )
+    .toBe(true);
+
+  const telemetry = await page.evaluate(() => {
+    return (
+      window as unknown as Window & {
+        __campusvoiceE2E: { events: string[]; audioBytes: number; skipDrainAck: boolean };
+      }
+    ).__campusvoiceE2E;
+  });
+  const cleanupEvents = [
+    "worklet:drain",
+    "media-track:stop",
+    "audio-context:close",
+    "ws:control:stop",
+  ];
+  for (const event of cleanupEvents) {
+    expect(telemetry.events.filter((candidate) => candidate === event)).toHaveLength(1);
+  }
+  expect(telemetry.events).not.toContain("worklet:drained:1");
+  const orderedCleanup = cleanupEvents.map((event) => telemetry.events.indexOf(event));
+  expect(orderedCleanup).toEqual([...orderedCleanup].sort((left, right) => left - right));
 });

@@ -4,7 +4,10 @@ import vm from "node:vm";
 
 import { describe, expect, it } from "vitest";
 
-type WorkletMessage = { type: "audio"; buffer: ArrayBuffer } | { type: "level"; level: number };
+type WorkletMessage =
+  | { type: "audio"; buffer: ArrayBuffer }
+  | { type: "level"; level: number }
+  | { type: "drained"; requestId: number };
 
 type PostedMessage = { message: WorkletMessage; transfer?: Transferable[] };
 
@@ -152,5 +155,34 @@ describe("CampusVoice PCM AudioWorklet", () => {
         .filter(isAudioMessage)
         .map(({ message }) => new Int16Array(message.buffer).length),
     ).toEqual([1600, 214, 1600]);
+  });
+
+  it("drains the residual chunk before its ACK and ignores audio after final drain", () => {
+    const processor = createProcessor(44100);
+    expect(processor.process([[seededSignal(5000)]])).toBe(true);
+
+    processor.port.onmessage?.(
+      new MessageEvent("message", { data: { type: "drain", requestId: 73 } }),
+    );
+
+    expect(
+      processor.port.messages
+        .filter(isAudioMessage)
+        .map(({ message }) => new Int16Array(message.buffer).length),
+    ).toEqual([1600, 214]);
+    expect(processor.port.messages.at(-1)?.message).toEqual({
+      type: "drained",
+      requestId: 73,
+    });
+
+    expect(processor.process([[seededSignal(4410)]])).toBe(true);
+    processor.port.onmessage?.(
+      new MessageEvent("message", { data: { type: "drain", requestId: 74 } }),
+    );
+    expect(processor.port.messages.filter(isAudioMessage)).toHaveLength(2);
+    expect(processor.port.messages.at(-1)?.message).toEqual({
+      type: "drained",
+      requestId: 74,
+    });
   });
 });

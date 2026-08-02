@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from builtins import list as builtin_list
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.entities import Document, DocumentChunk
@@ -29,6 +29,22 @@ class DocumentRepository:
                 .order_by(Document.publish_date.desc().nullslast(), Document.created_at.desc())
             )
         )
+
+    async def list_with_chunk_counts(
+        self, session: AsyncSession, user_id: str
+    ) -> builtin_list[tuple[Document, int]]:
+        chunk_count = (
+            select(func.count(DocumentChunk.id))
+            .where(DocumentChunk.document_id == Document.id)
+            .correlate(Document)
+            .scalar_subquery()
+        )
+        rows = await session.execute(
+            select(Document, chunk_count)
+            .where(Document.user_id == user_id)
+            .order_by(Document.publish_date.desc().nullslast(), Document.created_at.desc())
+        )
+        return [(document, int(count)) for document, count in rows]
 
     async def chunks(
         self, session: AsyncSession, user_id: str, document_id: str
