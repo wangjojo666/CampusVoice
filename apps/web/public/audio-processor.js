@@ -10,8 +10,14 @@ class CampusVoicePcmProcessor extends AudioWorkletProcessor {
     this.resampleBuffer = new Float32Array(0);
     this.inputSampleCount = 0;
     this.outputSampleCount = 0;
+    this.acceptingAudio = true;
     this.port.onmessage = (event) => {
       if (event.data?.type === "flush") this.flush();
+      if (event.data?.type === "drain") {
+        this.acceptingAudio = false;
+        this.flush();
+        this.port.postMessage({ type: "drained", requestId: event.data.requestId });
+      }
     };
   }
 
@@ -72,6 +78,7 @@ class CampusVoicePcmProcessor extends AudioWorkletProcessor {
   }
 
   process(inputs) {
+    if (!this.acceptingAudio) return true;
     const input = inputs[0]?.[0];
     if (!input) return true;
     const downsampled = this.downsample(input);
