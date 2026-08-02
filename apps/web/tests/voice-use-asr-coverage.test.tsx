@@ -386,6 +386,26 @@ describe("useAsr orchestration", () => {
     unmount();
   });
 
+  it("releases the active recorder when the ready handshake rejects", async () => {
+    mocks.clientConnect.mockRejectedValueOnce(new Error("ASR WebSocket ready handshake timed out"));
+    const { result, unmount } = renderHook(() => useAsr());
+
+    await act(async () => result.current.start());
+
+    expect(result.current.state).toMatchObject({
+      phase: "error",
+      error: { retryable: true },
+    });
+    expect(result.current.state.error?.message).not.toContain("ws://");
+    expect(result.current.state.error?.message).not.toContain("one-time-ticket");
+    expect(mocks.recorderStop).toHaveBeenCalledOnce();
+
+    unmount();
+    await act(async () => Promise.resolve());
+    expect(mocks.clientClose).toHaveBeenCalledOnce();
+    expect(mocks.recorderStop).toHaveBeenCalledOnce();
+  });
+
   it("coalesces concurrent stop requests before notifying the server", async () => {
     const drain = deferred();
     const { result, unmount } = renderHook(() => useAsr());
