@@ -12,8 +12,8 @@ from app.repositories.documents import DocumentRepository
 from app.schemas.knowledge import (
     DocumentChunk,
     DocumentFileType,
-    DocumentMetadata,
     DocumentRecord,
+    StoredDocumentMetadata,
 )
 
 
@@ -146,7 +146,7 @@ class SqlAlchemyKnowledgeRepository:
         return DocumentRecord(
             id=entity.id,
             user_id=entity.user_id,
-            metadata=DocumentMetadata(
+            metadata=StoredDocumentMetadata(
                 title=entity.title,
                 department=entity.department,
                 publish_date=entity.publish_date,

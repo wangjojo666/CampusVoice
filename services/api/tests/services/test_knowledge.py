@@ -8,7 +8,9 @@ from sqlalchemy import event
 
 from app.db.base import Base
 from app.db.session import create_database_engine, create_session_factory
+from app.models.entities import Document as DocumentEntity
 from app.models.entities import User
+from app.models.enums import DocumentStatus
 from app.schemas.knowledge import (
     DocumentChunk,
     DocumentFileType,
@@ -391,4 +393,38 @@ async def test_document_list_uses_one_query_for_all_chunk_counts() -> None:
     assert len(documents) == 3
     assert [document.chunk_count for document in documents] == [1, 1, 1]
     assert len(select_statements) == 1
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_document_list_preserves_legacy_sqlite_metadata_lengths() -> None:
+    engine = create_database_engine("sqlite+aiosqlite:///:memory:")
+    factory = create_session_factory(engine)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    async with factory() as session, session.begin():
+        session.add(User(id="user_demo", display_name="Demo"))
+    async with factory() as session, session.begin():
+        session.add(
+            DocumentEntity(
+                id="legacy_document",
+                user_id="user_demo",
+                title="t" * 500,
+                department="d" * 300,
+                applicable_group="g" * 500,
+                version="v" * 100,
+                file_type=DocumentFileType.TXT.value,
+                storage_path="database://legacy",
+                content_sha256="b" * 64,
+                status=DocumentStatus.READY,
+            )
+        )
+
+    documents = await SqlAlchemyKnowledgeRepository(factory, "user_demo").list_documents()
+
+    assert len(documents) == 1
+    assert len(documents[0].metadata.title) == 500
+    assert len(documents[0].metadata.department or "") == 300
+    assert len(documents[0].metadata.applicable_group or "") == 500
+    assert len(documents[0].metadata.version or "") == 100
     await engine.dispose()

@@ -15,14 +15,25 @@ class DocumentFileType(StrEnum):
     MARKDOWN = "md"
 
 
-class DocumentMetadata(_StrictModel):
+class StoredDocumentMetadata(_StrictModel):
+    """Persisted metadata, including rows accepted before upload limits were tightened."""
+
+    title: str = Field(min_length=1, max_length=500)
+    department: str | None = Field(default=None, max_length=300)
+    publish_date: date | None = None
+    applicable_group: str | None = Field(default=None, max_length=500)
+    source_url: HttpUrl | None = None
+    version: str | None = Field(default=None, max_length=100)
+    file_type: DocumentFileType
+
+
+class DocumentMetadata(StoredDocumentMetadata):
+    """Metadata accepted for new document uploads."""
+
     title: str = Field(min_length=1, max_length=240)
     department: str | None = Field(default=None, max_length=160)
-    publish_date: date | None = None
     applicable_group: str | None = Field(default=None, max_length=240)
-    source_url: HttpUrl | None = None
     version: str | None = Field(default=None, max_length=80)
-    file_type: DocumentFileType
 
     @field_validator("title", mode="before")
     @classmethod
@@ -38,7 +49,7 @@ class DocumentMetadata(_StrictModel):
 class DocumentRecord(_StrictModel):
     id: str
     user_id: str
-    metadata: DocumentMetadata
+    metadata: StoredDocumentMetadata
     content_sha256: str
     status: str
     chunk_count: int = Field(ge=0)
