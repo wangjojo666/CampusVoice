@@ -70,7 +70,6 @@ export default function NoticesPage() {
     const generation = ++searchGeneration.current;
     const submittedMode = mode;
     setSearching(true);
-    setError(null);
     setSearchError(null);
     setAnswer(null);
     setEvidence([]);

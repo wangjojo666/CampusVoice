@@ -98,6 +98,27 @@ describe("NoticesPage source document handoff", () => {
     expect(screen.queryByText("检索失败，请重试。")).not.toBeInTheDocument();
   });
 
+  it("preserves document errors while modes change and searches run", async () => {
+    mocks.listDocuments.mockRejectedValueOnce(new Error("documents unavailable"));
+    render(<NoticesPage />);
+
+    const documentError = await screen.findByRole("alert");
+    expect(documentError).toBeInTheDocument();
+
+    const [, searchTab] = screen.getAllByRole("tab");
+    if (!searchTab) throw new Error("Search tab was not rendered");
+    fireEvent.click(searchTab);
+    expect(documentError).toBeInTheDocument();
+
+    const queryInput = document.querySelector<HTMLInputElement>('input[class~="!pl-10"]');
+    if (!queryInput) throw new Error("Search input was not rendered");
+    fireEvent.change(queryInput, { target: { value: "independent search" } });
+    fireEvent.submit(queryInput.closest("form")!);
+
+    await waitFor(() => expect(mocks.search).toHaveBeenCalled());
+    expect(documentError).toBeInTheDocument();
+  });
+
   it("ignores an original-text response after switching modes", async () => {
     let resolveSearch!: (value: {
       evidence: [];
