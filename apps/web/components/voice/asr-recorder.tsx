@@ -11,21 +11,28 @@ import { asrPhaseLabel } from "@/lib/asr/machine";
 
 export function AsrRecorder({
   compact = false,
+  disabled = false,
+  onStart,
   onTranscriptChange,
   onSessionChange,
   onSourceChange,
+  onActiveChange,
   onReset,
 }: Readonly<{
   compact?: boolean;
+  disabled?: boolean;
+  onStart?: () => boolean | void;
   onTranscriptChange?: (text: string, confidence: number | null) => void;
   onSessionChange?: (sessionId: string | null) => void;
   onSourceChange?: (source: AsrTranscriptReference) => void;
-  onReset?: () => void;
+  onActiveChange?: (active: boolean) => void;
+  onReset?: () => boolean | void;
 }>) {
   const { state, start, pause, resume, stop, reset, editTranscript } = useAsr();
   const transcriptCallback = useRef(onTranscriptChange);
   const sessionCallback = useRef(onSessionChange);
   const sourceCallback = useRef(onSourceChange);
+  const activeCallback = useRef(onActiveChange);
 
   useEffect(() => {
     transcriptCallback.current = onTranscriptChange;
@@ -38,6 +45,10 @@ export function AsrRecorder({
   useEffect(() => {
     sourceCallback.current = onSourceChange;
   }, [onSourceChange]);
+
+  useEffect(() => {
+    activeCallback.current = onActiveChange;
+  }, [onActiveChange]);
 
   useEffect(() => {
     if (state.editableTranscript) {
@@ -57,12 +68,29 @@ export function AsrRecorder({
     });
   }, [state.finalSegments, state.sessionId, state.transcriptionId]);
 
-  const resetAll = async () => {
-    await reset();
-    onReset?.();
-  };
   const active = state.phase === "recording";
   const busy = ["requesting_permission", "connecting", "finalizing"].includes(state.phase);
+  const lifecycleActive = [
+    "requesting_permission",
+    "connecting",
+    "recording",
+    "paused",
+    "finalizing",
+  ].includes(state.phase);
+
+  useEffect(() => {
+    activeCallback.current?.(lifecycleActive);
+  }, [lifecycleActive]);
+
+  const beginRecording = async () => {
+    if (disabled || onStart?.() === false) return;
+    await start();
+  };
+
+  const resetAll = async () => {
+    if (disabled || onReset?.() === false) return;
+    await reset();
+  };
   const canStart = ["idle", "completed", "error"].includes(state.phase);
 
   return (
@@ -89,7 +117,8 @@ export function AsrRecorder({
             {canStart ? (
               <button
                 type="button"
-                onClick={() => void start()}
+                onClick={() => void beginRecording()}
+                disabled={disabled}
                 className={`flex items-center justify-center rounded-full border-teal-100 bg-teal-600 text-white shadow-[0_12px_30px_rgba(14,127,109,.28)] transition-transform hover:scale-105 ${compact ? "size-20 border-[6px]" : "size-16 border-[5px]"}`}
                 aria-label={state.phase === "completed" ? "重新开始录音" : "开始录音"}
               >
@@ -148,7 +177,9 @@ export function AsrRecorder({
               title={state.phase === "error" ? "语音识别未完成" : "识别已自动恢复"}
               message={state.error.message}
               onRetry={
-                state.phase === "error" && state.error.retryable ? () => void start() : undefined
+                state.phase === "error" && state.error.retryable && !disabled
+                  ? () => void beginRecording()
+                  : undefined
               }
               compact
             />
@@ -176,7 +207,7 @@ export function AsrRecorder({
                 editTranscript(event.target.value);
                 onTranscriptChange?.(event.target.value, state.confidence);
               }}
-              readOnly={state.phase !== "completed"}
+              readOnly={state.phase !== "completed" || disabled}
               rows={4}
               placeholder="识别结果会在这里实时出现…"
               className="field resize-y text-base leading-7 read-only:bg-mist-50"
@@ -193,6 +224,7 @@ export function AsrRecorder({
               </div>
               <button
                 type="button"
+                disabled={disabled}
                 onClick={() => void resetAll()}
                 className="inline-flex items-center gap-1.5 font-bold text-ink-500 hover:text-ink-800"
               >
@@ -234,6 +266,7 @@ export function AsrRecorder({
                 </div>
                 <button
                   type="button"
+                  disabled={disabled}
                   onClick={() => void resetAll()}
                   className="inline-flex items-center gap-1.5 text-xs font-bold text-ink-500 hover:text-ink-800"
                 >

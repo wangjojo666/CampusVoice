@@ -11,11 +11,13 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import Link from "next/link";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { ExecutionResult } from "@/components/actions/execution-result";
+import { ErrorState } from "@/components/ui/error-state";
 import { ApiError, api } from "@/lib/api-client";
 import { createVerifiedFinishEvent, type VerifiedFinishEvent } from "@/lib/verified-finish";
+import { canInvokeAssistantUndo, isRetryableUndoFailure } from "@/lib/voice/workflow-recovery";
 import { useAssistantStore } from "@/stores/assistant-store";
 
 const intentLabels: Record<string, string> = {
@@ -39,6 +41,28 @@ function stateTone(ready: boolean) {
 export function WorkflowSnapshot() {
   const store = useAssistantStore();
   const [verifiedFinish, setVerifiedFinish] = useState<VerifiedFinishEvent | null>(null);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  const undoRetryActionId =
+    store.undoRecoveryActionId !== null && store.undoRecoveryActionId === store.lastExecutedActionId
+      ? store.undoRecoveryActionId
+      : null;
+  const undoBusy = store.workflowStatus === "executing" && undoRetryActionId !== null;
+  const undoRecoveryMatchesCurrent =
+    store.undoRecoveryActionId === null ||
+    store.undoRecoveryActionId === store.lastExecutedActionId;
+  const canOfferUndo =
+    store.execution?.success === true &&
+    store.lastExecutedActionId !== null &&
+    !store.error &&
+    undoRecoveryMatchesCurrent &&
+    (store.workflowStatus === "succeeded" || undoBusy);
+  const undoActionId = canOfferUndo ? store.lastExecutedActionId : null;
   const correctionReady = Boolean(store.correction);
   const intentReady = Boolean(store.intent);
   const confirmationReady = Boolean(store.pendingAction || store.execution?.success);
@@ -52,21 +76,47 @@ export function WorkflowSnapshot() {
     ...(store.pendingAction?.risk_reasons ?? []),
   ];
 
-  const undo = async () => {
-    const actionId = store.lastExecutedActionId;
-    if (!actionId) return;
+  const undo = async (expectedActionId: string, mode: "normal" | "recovery") => {
+    const currentState = useAssistantStore.getState();
+    const currentActionId = currentState.lastExecutedActionId;
+    if (!currentActionId || !canInvokeAssistantUndo(currentState, expectedActionId, mode)) return;
+    if (
+      currentState.workflowStatus === "executing" &&
+      currentState.undoRecoveryActionId === currentActionId
+    ) {
+      return;
+    }
+
+    const actionId = expectedActionId;
+    const operationId = crypto.randomUUID();
+    currentState.setActiveOperationId(operationId);
+    currentState.setUndoRecoveryActionId(actionId);
     setVerifiedFinish(null);
+    store.setError(null);
     store.setWorkflowStatus("executing");
     try {
       const result = await api.actions.undo(actionId);
+      const latest = useAssistantStore.getState();
+      if (latest.activeOperationId !== operationId || latest.lastExecutedActionId !== actionId) {
+        return;
+      }
+      const retryable = !result.success && result.retryable === true;
+      store.setUndoRecoveryActionId(retryable ? actionId : null);
       store.setExecution(result);
+      if (result.success || !retryable) store.setLastExecutedActionId(null);
       if (result.success) {
-        store.setLastExecutedActionId(null);
-        setVerifiedFinish(createVerifiedFinishEvent(result, "undo"));
+        if (mounted.current) setVerifiedFinish(createVerifiedFinishEvent(result, "undo"));
       }
       store.setWorkflowStatus(result.success ? "succeeded" : "error");
       if (!result.success) store.setError(result.message);
     } catch (reason) {
+      const latest = useAssistantStore.getState();
+      if (latest.activeOperationId !== operationId || latest.lastExecutedActionId !== actionId) {
+        return;
+      }
+      const retryable = isRetryableUndoFailure(reason);
+      store.setUndoRecoveryActionId(retryable ? actionId : null);
+      if (!retryable) store.setLastExecutedActionId(null);
       store.setWorkflowStatus("error");
       store.setError(reason instanceof ApiError ? reason.userMessage : "撤销失败，请重试。");
     }
@@ -162,24 +212,49 @@ export function WorkflowSnapshot() {
                 : "尚无执行回执"}
           </p>
         </li>
-        <li className={`rounded-xl border p-3 ${stateTone(Boolean(store.execution?.success))}`}>
+        <li className={`rounded-xl border p-3 ${stateTone(Boolean(undoActionId))}`}>
           <div className="flex items-center gap-2 text-xs font-bold">
             <RotateCcw size={14} /> 撤销
           </div>
           <p className="mt-1.5 text-xs leading-5 text-ink-700">
-            {store.execution?.success ? "已开放真实撤销入口" : "仅在验证成功后开放"}
+            {undoBusy
+              ? "正在撤销并等待数据库复验"
+              : undoRetryActionId
+                ? "上次撤销未完成，可安全重试"
+                : undoActionId
+                  ? "已开放真实撤销入口"
+                  : "当前状态未开放撤销"}
           </p>
         </li>
       </ol>
+
+      {store.error && store.execution?.success ? (
+        <div className="mt-4">
+          <ErrorState
+            title="流程尚未完成"
+            message={store.error}
+            onRetry={
+              undoRetryActionId && !undoBusy
+                ? () => void undo(undoRetryActionId, "recovery")
+                : undefined
+            }
+            compact
+          />
+        </div>
+      ) : null}
 
       {store.execution ? (
         <div className="mt-4">
           <ExecutionResult
             result={store.execution}
             verifiedFinish={verifiedFinish}
-            onUndo={
-              store.execution.success && store.lastExecutedActionId ? () => void undo() : undefined
+            undoBusy={undoBusy}
+            onRetry={
+              store.workflowStatus !== "executing" && store.execution.retryable && undoRetryActionId
+                ? () => void undo(undoRetryActionId, "recovery")
+                : undefined
             }
+            onUndo={undoActionId ? () => void undo(undoActionId, "normal") : undefined}
           />
         </div>
       ) : null}

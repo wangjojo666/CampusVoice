@@ -1258,6 +1258,7 @@ _QUOTE_OPEN_TO_CLOSE = {
     "'": "'",
 }
 _QUOTE_CLOSE_CHARACTERS = frozenset(_QUOTE_OPEN_TO_CLOSE.values())
+_QUOTE_CHARACTERS = frozenset(_QUOTE_OPEN_TO_CLOSE) | _QUOTE_CLOSE_CHARACTERS
 _RENAME_MODIFIER_PATTERN = re.compile(r"(?:改名为|重命名为|标题改为)[：:，,]*")
 
 
@@ -1290,6 +1291,8 @@ def _paired_quote_spans(
     *,
     pair_ends: dict[int, int] | None = None,
 ) -> tuple[_QuotedSpan, ...] | None:
+    if _QUOTE_CHARACTERS.isdisjoint(text):
+        return ()
     spans: list[_QuotedSpan] = []
     stack: list[tuple[str, int]] = []
     for index, character in enumerate(text):
@@ -3868,13 +3871,22 @@ def _fallback_parse_single(
     now: datetime,
     *,
     safety_source_text: str | None = None,
+    precomputed_semantic_text: str | None = None,
+    precomputed_safety_semantic_text: str | None = None,
 ) -> IntentResult:
-    semantic_text = _semantic_intent_text(text)
-    normalized = re.sub(r"\s+", "", semantic_text)
-    safety_source = (
-        safety_source_text if safety_source_text is not None else _safety_source_text(text)
+    semantic_text = (
+        precomputed_semantic_text
+        if precomputed_semantic_text is not None
+        else _semantic_intent_text(text)
     )
-    safety_semantic_text = _semantic_intent_text(safety_source)
+    normalized = re.sub(r"\s+", "", semantic_text)
+    safety_semantic_text = (
+        precomputed_safety_semantic_text
+        if precomputed_safety_semantic_text is not None
+        else _semantic_intent_text(
+            safety_source_text if safety_source_text is not None else _safety_source_text(text)
+        )
+    )
     safety_normalized = re.sub(r"\s+", "", safety_semantic_text)
     intent = _classify_intent(semantic_text)
     if intent == IntentName.UNKNOWN:
@@ -4025,15 +4037,33 @@ def _fallback_parse(
     context: Sequence[str] = (),
     *,
     safety_source_text: str | None = None,
+    precomputed_semantic_text: str | None = None,
+    precomputed_safety_semantic_text: str | None = None,
+    precomputed_normalized: str | None = None,
+    precomputed_safety_normalized: str | None = None,
 ) -> IntentResult:
-    current = _fallback_parse_single(text, now, safety_source_text=safety_source_text)
+    current = _fallback_parse_single(
+        text,
+        now,
+        safety_source_text=safety_source_text,
+        precomputed_semantic_text=precomputed_semantic_text,
+        precomputed_safety_semantic_text=precomputed_safety_semantic_text,
+    )
     if current.intent != IntentName.UNKNOWN:
         return current
-    normalized = _normalized_intent_text(text)
+    normalized = (
+        precomputed_normalized
+        if precomputed_normalized is not None
+        else _normalized_intent_text(text)
+    )
     safety_normalized = (
-        _normalized_intent_text(safety_source_text)
-        if safety_source_text is not None
-        else _safety_normalized_intent_text(text)
+        precomputed_safety_normalized
+        if precomputed_safety_normalized is not None
+        else (
+            _normalized_intent_text(safety_source_text)
+            if safety_source_text is not None
+            else _safety_normalized_intent_text(text)
+        )
     )
     signals = _intent_signals(normalized)
     if (
@@ -4338,9 +4368,11 @@ class IntentParser:
             return _enforce_policy(
                 _unknown_result(cleaned[:_MAX_PARSE_TEXT_CHARACTERS]), asr_confidence
             )
-        semantic_text = _semantic_intent_text(cleaned).strip()
+        fallback_semantic_text = _semantic_intent_text(cleaned)
+        semantic_text = fallback_semantic_text.strip()
         safety_source_text = _safety_source_text(cleaned)
-        safety_semantic_text = _semantic_intent_text(safety_source_text).strip()
+        fallback_safety_semantic_text = _semantic_intent_text(safety_source_text)
+        safety_semantic_text = fallback_safety_semantic_text.strip()
         if not semantic_text:
             raise IntentParseError("empty_text", "请输入或转写一段文本后再解析。")
         if len(semantic_text) > _MAX_PARSE_TEXT_CHARACTERS or _context_exceeds_limits(context):
@@ -4447,6 +4479,10 @@ class IntentParser:
                 current,
                 context,
                 safety_source_text=safety_source_text,
+                precomputed_semantic_text=fallback_semantic_text,
+                precomputed_safety_semantic_text=fallback_safety_semantic_text,
+                precomputed_normalized=normalized,
+                precomputed_safety_normalized=safety_normalized,
             ),
             semantic_text,
             current,

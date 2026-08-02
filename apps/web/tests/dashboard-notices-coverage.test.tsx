@@ -17,6 +17,13 @@ import { fromLocalInputValue, toLocalInputValue } from "@/lib/format";
 import { DEFAULT_USER_SETTINGS, setCurrentUserSettings } from "@/lib/user-settings";
 import { useAssistantStore } from "@/stores/assistant-store";
 
+interface HomeRecorderProps {
+  disabled?: boolean;
+  onStart?: () => boolean | void;
+  onTranscriptChange: (value: string) => void;
+  onReset?: () => boolean | void;
+}
+
 const mocks = vi.hoisted(() => ({
   push: vi.fn(),
   listTasks: vi.fn(),
@@ -28,6 +35,7 @@ const mocks = vi.hoisted(() => ({
   askKnowledge: vi.fn(),
   searchKnowledge: vi.fn(),
   undoAction: vi.fn(),
+  recorderProps: null as HomeRecorderProps | null,
 }));
 
 vi.mock("next/link", () => ({
@@ -51,11 +59,27 @@ vi.mock("next/link", () => ({
 vi.mock("next/navigation", () => ({ useRouter: () => ({ push: mocks.push }) }));
 
 vi.mock("@/components/voice/asr-recorder", () => ({
-  AsrRecorder: ({ onTranscriptChange }: { onTranscriptChange: (value: string) => void }) => (
-    <button type="button" onClick={() => onTranscriptChange("明天完成数据库作业")}>
-      模拟语音识别
-    </button>
-  ),
+  AsrRecorder: (props: HomeRecorderProps) => {
+    mocks.recorderProps = props;
+    const { disabled, onStart, onTranscriptChange, onReset } = props;
+    return (
+      <div>
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => {
+            if (onStart?.() === false) return;
+            onTranscriptChange("明天完成数据库作业");
+          }}
+        >
+          模拟语音识别
+        </button>
+        <button type="button" disabled={disabled} onClick={() => onReset?.()}>
+          模拟重置录音
+        </button>
+      </div>
+    );
+  },
 }));
 
 vi.mock("@/lib/api-client", () => ({
@@ -189,6 +213,7 @@ beforeEach(() => {
   mocks.askKnowledge.mockReset();
   mocks.searchKnowledge.mockReset();
   mocks.undoAction.mockReset();
+  mocks.recorderProps = null;
 });
 
 describe("dashboard business states", () => {
@@ -369,6 +394,7 @@ describe("dashboard business states", () => {
       }),
     });
     store.setLastExecutedActionId("action-verified");
+    store.setWorkflowStatus("succeeded");
 
     render(<HomePage />);
 
@@ -382,6 +408,233 @@ describe("dashboard business states", () => {
     expect(mocks.undoAction).toHaveBeenCalledWith("action-verified");
     expect(await screen.findByText("日程已撤销并复验")).toBeInTheDocument();
     expect(useAssistantStore.getState().lastExecutedActionId).toBeNull();
+  });
+
+  it("blocks Home ASR and new commands while the exact Voice undo is in flight", () => {
+    const store = useAssistantStore.getState();
+    store.setTranscript("创建机器学习考试日程");
+    store.setInputMode("voice");
+    store.setExecution({
+      success: true,
+      action: "create_event",
+      record_id: "event-verified",
+      verified_fields: { title: true },
+      side_effects: [],
+      message: "日程已写入并复验",
+    });
+    store.setLastExecutedActionId("action-verified");
+    store.setWorkflowStatus("succeeded");
+
+    render(<HomePage />);
+    const staleRecorderProps = mocks.recorderProps;
+    expect(staleRecorderProps).not.toBeNull();
+
+    act(() => {
+      const current = useAssistantStore.getState();
+      current.setUndoRecoveryActionId("action-verified");
+      current.setActiveOperationId("undo-in-flight");
+      current.setWorkflowStatus("executing");
+    });
+
+    const busyUndo = screen.getByRole("button", { name: "正在撤销" });
+    expect(busyUndo).toBeDisabled();
+    expect(screen.getByRole("button", { name: "模拟语音识别" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "模拟重置录音" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "盯住实验报告截止" })).toBeDisabled();
+    fireEvent.click(busyUndo);
+    fireEvent.click(screen.getByRole("button", { name: "模拟语音识别" }));
+    fireEvent.click(screen.getByRole("button", { name: "模拟重置录音" }));
+    fireEvent.click(screen.getByRole("button", { name: "盯住实验报告截止" }));
+    act(() => {
+      expect(staleRecorderProps?.onStart?.()).toBe(false);
+      expect(staleRecorderProps?.onReset?.()).toBe(false);
+      staleRecorderProps?.onTranscriptChange("过期语音转写");
+    });
+
+    expect(mocks.undoAction).not.toHaveBeenCalled();
+    expect(useAssistantStore.getState()).toMatchObject({
+      transcript: "创建机器学习考试日程",
+      inputMode: "voice",
+      workflowStatus: "executing",
+      activeOperationId: "undo-in-flight",
+      lastExecutedActionId: "action-verified",
+      undoRecoveryActionId: "action-verified",
+      execution: expect.objectContaining({
+        success: true,
+        record_id: "event-verified",
+      }),
+    });
+  });
+
+  it("retries a transient Home undo only while its recovery id is exact", async () => {
+    const user = userEvent.setup();
+    mocks.undoAction
+      .mockRejectedValueOnce(new ApiError("upstream unavailable", { status: 503 }))
+      .mockResolvedValueOnce({
+        success: true,
+        action: "undo_create_event",
+        record_id: "event-verified",
+        verified_fields: { deleted: true },
+        side_effects: [],
+        message: "日程已撤销并复验",
+        retryable: false,
+      });
+    const store = useAssistantStore.getState();
+    store.setTranscript("创建机器学习考试日程");
+    store.setExecution({
+      success: true,
+      action: "create_event",
+      record_id: "event-verified",
+      verified_fields: { title: true },
+      side_effects: [],
+      message: "日程已写入并复验",
+    });
+    store.setLastExecutedActionId("action-verified");
+    store.setWorkflowStatus("succeeded");
+
+    render(<HomePage />);
+    await user.click(screen.getByRole("button", { name: "撤销本次操作" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("服务暂时不可用，请稍后重试。");
+    expect(useAssistantStore.getState()).toMatchObject({
+      workflowStatus: "error",
+      lastExecutedActionId: "action-verified",
+      undoRecoveryActionId: "action-verified",
+    });
+
+    act(() => useAssistantStore.getState().setUndoRecoveryActionId("action-stale"));
+    expect(
+      within(screen.getByRole("alert")).queryByRole("button", { name: "重试" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "撤销本次操作" })).not.toBeInTheDocument();
+
+    act(() => useAssistantStore.getState().setUndoRecoveryActionId("action-verified"));
+    await user.click(within(screen.getByRole("alert")).getByRole("button", { name: "重试" }));
+
+    await waitFor(() => expect(mocks.undoAction).toHaveBeenCalledTimes(2));
+    expect(mocks.undoAction).toHaveBeenNthCalledWith(1, "action-verified");
+    expect(mocks.undoAction).toHaveBeenNthCalledWith(2, "action-verified");
+    expect(await screen.findByText("日程已撤销并复验")).toBeInTheDocument();
+    expect(useAssistantStore.getState()).toMatchObject({
+      lastExecutedActionId: null,
+      undoRecoveryActionId: null,
+      error: null,
+    });
+  });
+
+  it("fails a permanent 409 Home undo closed without any retry path", async () => {
+    const user = userEvent.setup();
+    mocks.undoAction.mockRejectedValueOnce(new ApiError("当前撤销状态不可重试", { status: 409 }));
+    const store = useAssistantStore.getState();
+    store.setTranscript("创建机器学习考试日程");
+    store.setExecution({
+      success: true,
+      action: "create_event",
+      record_id: "event-verified",
+      verified_fields: { title: true },
+      side_effects: [],
+      message: "日程已写入并复验",
+    });
+    store.setLastExecutedActionId("action-verified");
+    store.setWorkflowStatus("succeeded");
+
+    render(<HomePage />);
+    await user.click(screen.getByRole("button", { name: "撤销本次操作" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("当前撤销状态不可重试");
+    expect(within(alert).queryByRole("button", { name: "重试" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "重试一次" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "撤销本次操作" })).not.toBeInTheDocument();
+    expect(mocks.undoAction).toHaveBeenCalledTimes(1);
+    expect(mocks.undoAction).toHaveBeenCalledWith("action-verified");
+    expect(useAssistantStore.getState()).toMatchObject({
+      workflowStatus: "error",
+      lastExecutedActionId: null,
+      undoRecoveryActionId: null,
+      error: "当前撤销状态不可重试",
+    });
+  });
+
+  it("retries a recoverable undo verification failure from Home with the same action id", async () => {
+    mocks.undoAction.mockResolvedValue({
+      success: true,
+      action: "undo_create_event",
+      record_id: "event-verified",
+      verified_fields: { deleted: true },
+      side_effects: [],
+      message: "日程已撤销并复验",
+      retryable: false,
+    });
+    const store = useAssistantStore.getState();
+    store.setTranscript("创建机器学习考试日程");
+    store.setExecution({
+      success: false,
+      action: "undo_create_event",
+      record_id: "event-verified",
+      verified_fields: { deleted: false },
+      side_effects: [],
+      message: "撤销后的数据库复验失败",
+      retryable: true,
+    });
+    store.setLastExecutedActionId("action-verified");
+    store.setUndoRecoveryActionId("action-verified");
+    store.setWorkflowStatus("error");
+    store.setError("撤销后的数据库复验失败");
+
+    render(<HomePage />);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "重试一次" })).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "重试一次" }));
+
+    expect(mocks.undoAction).toHaveBeenCalledWith("action-verified");
+    expect(await screen.findByText("日程已撤销并复验")).toBeInTheDocument();
+    expect(useAssistantStore.getState()).toMatchObject({
+      lastExecutedActionId: null,
+      undoRecoveryActionId: null,
+      error: null,
+    });
+  });
+
+  it("fails a resolved permanent Home undo closed and clears its exact action id", async () => {
+    mocks.undoAction.mockResolvedValueOnce({
+      success: false,
+      action: "undo_create_event",
+      record_id: "event-verified",
+      verified_fields: { deleted: false },
+      side_effects: [],
+      message: "撤销状态已终止，不能重试",
+      retryable: false,
+    });
+    const store = useAssistantStore.getState();
+    store.setTranscript("创建机器学习考试日程");
+    store.setExecution({
+      success: true,
+      action: "create_event",
+      record_id: "event-verified",
+      verified_fields: { title: true },
+      side_effects: [],
+      message: "日程已写入并复验",
+    });
+    store.setLastExecutedActionId("action-verified");
+    store.setWorkflowStatus("succeeded");
+
+    render(<HomePage />);
+    fireEvent.click(screen.getByRole("button", { name: "撤销本次操作" }));
+
+    expect(await screen.findByText("撤销状态已终止，不能重试")).toBeInTheDocument();
+    expect(mocks.undoAction).toHaveBeenCalledWith("action-verified");
+    expect(useAssistantStore.getState()).toMatchObject({
+      workflowStatus: "error",
+      lastExecutedActionId: null,
+      undoRecoveryActionId: null,
+      execution: expect.objectContaining({ success: false, retryable: false }),
+    });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "重试" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "重试一次" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "撤销本次操作" })).not.toBeInTheDocument();
+    expect(screen.getByText("当前状态未开放撤销")).toBeInTheDocument();
   });
 
   it("shows upcoming work, progressively discloses verification records, and continues voice", async () => {
