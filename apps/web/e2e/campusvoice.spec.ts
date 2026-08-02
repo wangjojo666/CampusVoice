@@ -74,6 +74,7 @@ const citation = {
 type ApiCall = {
   method: string;
   path: string;
+  query: Record<string, string>;
   headers: Record<string, string>;
   body: unknown;
 };
@@ -84,6 +85,7 @@ type MockOptions = {
   documents?: ReturnType<typeof documentRecord>[];
   conflict?: boolean;
   sufficientAnswer?: boolean;
+  conflictResponses?: boolean[];
 };
 
 async function bodyFrom(request: Request) {
@@ -110,6 +112,7 @@ async function installApiMocks(page: Page, options: MockOptions = {}) {
         created_at: nowIso,
       },
     ],
+    conflictCheckCount: 0,
     calls: [] as ApiCall[],
     pending: null as null | {
       id: string;
@@ -165,7 +168,13 @@ async function installApiMocks(page: Page, options: MockOptions = {}) {
     const path = url.pathname;
     const method = request.method();
     const body = await bodyFrom(request);
-    state.calls.push({ method, path, headers: await request.allHeaders(), body });
+    state.calls.push({
+      method,
+      path,
+      query: Object.fromEntries(url.searchParams.entries()),
+      headers: await request.allHeaders(),
+      body,
+    });
 
     if (path === "/api/health")
       return fulfill(route, { status: "ok", service: "CampusVoice API", version: "0.3.0" });
@@ -199,8 +208,14 @@ async function installApiMocks(page: Page, options: MockOptions = {}) {
         expires_at: new Date(Date.now() + 60_000).toISOString(),
       });
 
-    if (path === "/api/tasks" && method === "GET")
-      return fulfill(route, { items: state.tasks, total: state.tasks.length });
+    if (path === "/api/tasks" && method === "GET") {
+      const offset = Number(url.searchParams.get("offset") ?? 0);
+      const limit = Number(url.searchParams.get("limit") ?? state.tasks.length);
+      return fulfill(route, {
+        items: state.tasks.slice(offset, offset + limit),
+        total: state.tasks.length,
+      });
+    }
     if (path === "/api/tasks" && method === "POST") {
       const payload = body as Record<string, unknown>;
       const created = {
@@ -236,13 +251,23 @@ async function installApiMocks(page: Page, options: MockOptions = {}) {
       });
     }
 
-    if (path === "/api/events/check-conflict" && method === "POST")
+    if (path === "/api/events/check-conflict" && method === "POST") {
+      const hasConflict =
+        options.conflictResponses?.[state.conflictCheckCount] ?? Boolean(options.conflict);
+      state.conflictCheckCount += 1;
       return fulfill(route, {
-        has_conflict: Boolean(options.conflict),
-        conflicts: options.conflict ? state.events : [],
+        has_conflict: hasConflict,
+        conflicts: hasConflict ? state.events : [],
       });
-    if (path === "/api/events" && method === "GET")
-      return fulfill(route, { items: state.events, total: state.events.length });
+    }
+    if (path === "/api/events" && method === "GET") {
+      const offset = Number(url.searchParams.get("offset") ?? 0);
+      const limit = Number(url.searchParams.get("limit") ?? state.events.length);
+      return fulfill(route, {
+        items: state.events.slice(offset, offset + limit),
+        total: state.events.length,
+      });
+    }
     if (path === "/api/events" && method === "POST") {
       const payload = body as Record<string, unknown>;
       const created = {
@@ -462,7 +487,7 @@ async function installApiMocks(page: Page, options: MockOptions = {}) {
 
 async function installSyntheticAudioAndWebSocket(page: Page) {
   await page.addInitScript(() => {
-    const telemetry = { events: [] as string[], audioBytes: 0 };
+    const telemetry = { events: [] as string[], audioBytes: 0, skipDrainAck: false };
     const NativeWebSocket = window.WebSocket;
     Object.defineProperty(window, "__campusvoiceE2E", { value: telemetry, configurable: true });
 
@@ -484,11 +509,23 @@ async function installSyntheticAudioAndWebSocket(page: Page) {
       disconnect() {}
     }
 
-    type PortMessage = { data: { type: string; level?: number; buffer?: ArrayBuffer } };
+    type PortMessage = {
+      data: { type: string; level?: number; buffer?: ArrayBuffer; requestId?: number };
+    };
     const port = {
       onmessage: null as ((message: PortMessage) => void) | null,
-      postMessage: (message: { type?: string }) =>
-        telemetry.events.push(`worklet:${message.type ?? "message"}`),
+      postMessage: (message: { type?: string; requestId?: number }) => {
+        telemetry.events.push(`worklet:${message.type ?? "message"}`);
+        if (message.type === "drain") {
+          if (telemetry.skipDrainAck) return;
+          window.setTimeout(() => {
+            const tail = new Int16Array([1, -1, 2, -2, 3, -3, 4]);
+            port.onmessage?.({ data: { type: "audio", buffer: tail.buffer } });
+            telemetry.events.push(`worklet:drained:${message.requestId}`);
+            port.onmessage?.({ data: { type: "drained", requestId: message.requestId } });
+          }, 100);
+        }
+      },
     };
 
     class MockAudioWorkletNode extends ConnectableNode {
@@ -670,6 +707,53 @@ test("02 待办列表在浏览器中完成关键词和状态筛选", async ({ pa
   await expect(page.getByRole("heading", { name: "复习机器学习" })).toBeHidden();
 });
 
+test("02a 待办页读取 offset=500 后页并显示仍需处理的任务", async ({ page }) => {
+  const completed = Array.from({ length: 500 }, (_, index) => ({
+    ...task(`completed-${index}`, `已完成待办 ${index}`),
+    status: "completed" as const,
+  }));
+  const state = await installApiMocks(page, {
+    tasks: [...completed, task("later-active", "第二页仍需处理的待办")],
+  });
+
+  await page.goto("/tasks");
+
+  await expect(page.getByRole("heading", { name: "第二页仍需处理的待办" })).toBeVisible();
+  const taskCalls = state.calls.filter(
+    (call) => call.method === "GET" && call.path === "/api/tasks",
+  );
+  expect(taskCalls).toHaveLength(2);
+  expect(taskCalls.map((call) => ({ limit: call.query.limit, offset: call.query.offset }))).toEqual(
+    [
+      { limit: "500", offset: "0" },
+      { limit: "500", offset: "500" },
+    ],
+  );
+});
+
+test("03a Modal 在浏览器中闭环焦点并由 Escape 恢复触发按钮", async ({ page }) => {
+  await installApiMocks(page, { tasks: [] });
+  await page.goto("/tasks");
+  const opener = page.getByRole("button", { name: "新增待办" }).first();
+  await opener.click();
+  const dialog = page.getByRole("dialog", { name: "新增待办" });
+  const title = dialog.getByLabel("标题 *");
+  await expect(title).toBeFocused();
+
+  const focusable = dialog.locator(
+    'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])',
+  );
+  const last = focusable.last();
+  await last.focus();
+  await page.keyboard.press("Tab");
+  await expect(dialog.getByRole("button", { name: "关闭" })).toBeFocused();
+  await page.keyboard.press("Shift+Tab");
+  await expect(last).toBeFocused();
+
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await expect(opener).toBeFocused();
+});
 test("03 新建待办经过 UI 核对并携带服务端写挑战", async ({ page }) => {
   await page.emulateMedia({ reducedMotion: "reduce" });
   const state = await installApiMocks(page, { tasks: [] });
@@ -730,22 +814,79 @@ test("04 删除待办要求输入标题且 REST 状态机完成两次确认", as
   expect(state.calls.filter((call) => call.path.endsWith("/execute"))).toHaveLength(1);
 });
 
-test("05 日历保存前检测冲突并阻止 POST 写入", async ({ page }) => {
+test("05 日历冲突返回修改后会清除旧冲突并重新检查", async ({ page }) => {
   const state = await installApiMocks(page, {
     events: [calendarEvent("event-conflict", "已存在的机器学习课")],
-    conflict: true,
+    conflictResponses: [true, false, false],
   });
   await page.goto("/calendar");
   await page.getByRole("button", { name: "新建日程" }).first().click();
   const dialog = page.getByRole("dialog", { name: "新建日程" });
   await dialog.getByLabel("标题 *").fill("冲突的考试复习");
   await dialog.getByRole("button", { name: "检查冲突并核对" }).click();
-  await dialog.getByRole("button", { name: "确认并保存" }).click();
   await expect(dialog.getByRole("alert")).toContainText("检测到时间冲突，已阻止保存");
   await expect(dialog.getByText("已存在的机器学习课", { exact: true })).toBeVisible();
   expect(state.calls.some((call) => call.method === "POST" && call.path === "/api/events")).toBe(
     false,
   );
+  await dialog.getByRole("button", { name: "返回修改" }).click();
+  await expect(dialog.getByRole("alert")).toHaveCount(0);
+  await dialog.getByLabel("标题 *").fill("调整后的考试复习");
+  await dialog.getByRole("button", { name: "检查冲突并核对" }).click();
+  await expect(dialog.getByText("未检测到时间冲突", { exact: true })).toBeVisible();
+  await dialog.getByRole("button", { name: "确认并保存" }).click();
+
+  await expect(dialog).toHaveCount(0);
+  await expect(page.getByRole("status")).toContainText("日程已保存并验证");
+  expect(
+    state.calls.filter((call) => call.method === "POST" && call.path === "/api/events"),
+  ).toHaveLength(1);
+  expect(state.conflictCheckCount).toBe(3);
+});
+
+test("05a 日历翻到下一月后保持视图并读取 offset=500 后页事件", async ({ page }) => {
+  await page.clock.setFixedTime(new Date("2026-07-15T04:00:00.000Z"));
+  const augustStart = "2026-08-15T02:00:00.000Z";
+  const augustEnd = "2026-08-15T03:00:00.000Z";
+  const firstPage = Array.from({ length: 500 }, (_, index) => ({
+    ...calendarEvent(`event-page-one-${index}`, `首批日程 ${index}`),
+    start_at: augustStart,
+    end_at: augustEnd,
+  }));
+  const laterEvent = {
+    ...calendarEvent("event-later-page", "第二页的重要日程"),
+    start_at: "2026-08-20T02:00:00.000Z",
+    end_at: "2026-08-20T03:00:00.000Z",
+  };
+  const state = await installApiMocks(page, { events: [...firstPage, laterEvent] });
+
+  await page.goto("/calendar");
+  await expect(page.locator(".fc-toolbar-title")).toContainText("2026年7月");
+  await page.locator(".fc-next-button").click();
+
+  await expect(page.locator(".fc-toolbar-title")).toContainText("2026年8月");
+  await expect(
+    page.locator(".fc-event").filter({ hasText: "第二页的重要日程" }).first(),
+  ).toBeVisible();
+  await expect(page.locator(".fc-toolbar-title")).toContainText("2026年8月");
+  const eventCalls = state.calls.filter(
+    (call) => call.method === "GET" && call.path === "/api/events",
+  );
+  const laterPageCall = [...eventCalls].reverse().find((call) => call.query.offset === "500");
+  const matchingFirstPageCall = eventCalls.find(
+    (call) =>
+      call.query.offset === "0" &&
+      call.query.starts_after === laterPageCall?.query.starts_after &&
+      call.query.starts_before === laterPageCall?.query.starts_before,
+  );
+  expect(laterPageCall).toBeTruthy();
+  expect(matchingFirstPageCall).toBeTruthy();
+  expect(laterPageCall?.query).toMatchObject({
+    starts_after: expect.any(String),
+    starts_before: expect.any(String),
+    limit: "500",
+    offset: "500",
+  });
 });
 
 test("06 通知问答在证据不足时显示原因和原文引用", async ({ page }) => {
@@ -851,6 +992,7 @@ test("10 合成 PCM 贯穿浏览器 AudioWorklet、WebSocket 与录音状态链"
   await page.getByRole("button", { name: "继续" }).click();
   await expect(page.getByText("正在聆听", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "停止并完成转写" }).click();
+  await expect(page.getByText("正在完成转写", { exact: true })).toBeVisible();
   await expect(page.getByText("转写已完成", { exact: true })).toBeVisible();
   await expect(page.getByLabel("最终转写（可编辑）")).toHaveValue("周五上午九点有机器学习考试。");
   await expect(page.getByText("置信度：94%", { exact: false })).toBeVisible();
@@ -871,4 +1013,68 @@ test("10 合成 PCM 贯穿浏览器 AudioWorklet、WebSocket 与录音状态链"
   expect(telemetry.events).toContain("ws:control:flush");
   expect(telemetry.events).toContain("ws:control:stop");
   expect(telemetry.events.some((event) => event.startsWith("ws:pcm:"))).toBe(true);
+
+  const tailEvents = [
+    "worklet:drain",
+    "ws:pcm:14",
+    "worklet:drained:1",
+    "media-track:stop",
+    "audio-context:close",
+    "ws:control:stop",
+  ];
+  for (const event of tailEvents) {
+    expect(telemetry.events.filter((candidate) => candidate === event)).toHaveLength(1);
+  }
+  const orderedTail = tailEvents.map((event) => telemetry.events.indexOf(event));
+  expect(orderedTail).toEqual([...orderedTail].sort((left, right) => left - right));
+});
+test("10b AudioWorklet drain 超时后保持失败状态并仍释放资源", async ({ page }) => {
+  await installSyntheticAudioAndWebSocket(page);
+  await installApiMocks(page);
+  await page.goto("/voice");
+  await page.getByRole("button", { name: "开始录音" }).click();
+  await expect(page.getByText("正在聆听", { exact: true })).toBeVisible();
+  await page.evaluate(() => {
+    (
+      window as unknown as Window & {
+        __campusvoiceE2E: { skipDrainAck: boolean };
+      }
+    ).__campusvoiceE2E.skipDrainAck = true;
+  });
+
+  await page.getByRole("button", { name: "停止并完成转写" }).click();
+  await expect(page.getByText("识别遇到问题", { exact: true })).toBeVisible({ timeout: 4_000 });
+  await expect(page.getByText("录音尾段未能完整发送，本次转写未完成，请重试。")).toBeVisible();
+  await expect(page.getByText("转写已完成", { exact: true })).toHaveCount(0);
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (
+          window as unknown as Window & {
+            __campusvoiceE2E: { events: string[] };
+          }
+        ).__campusvoiceE2E.events.includes("ws:control:stop"),
+      ),
+    )
+    .toBe(true);
+
+  const telemetry = await page.evaluate(() => {
+    return (
+      window as unknown as Window & {
+        __campusvoiceE2E: { events: string[]; audioBytes: number; skipDrainAck: boolean };
+      }
+    ).__campusvoiceE2E;
+  });
+  const cleanupEvents = [
+    "worklet:drain",
+    "media-track:stop",
+    "audio-context:close",
+    "ws:control:stop",
+  ];
+  for (const event of cleanupEvents) {
+    expect(telemetry.events.filter((candidate) => candidate === event)).toHaveLength(1);
+  }
+  expect(telemetry.events).not.toContain("worklet:drained:1");
+  const orderedCleanup = cleanupEvents.map((event) => telemetry.events.indexOf(event));
+  expect(orderedCleanup).toEqual([...orderedCleanup].sort((left, right) => left - right));
 });

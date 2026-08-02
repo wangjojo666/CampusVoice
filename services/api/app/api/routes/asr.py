@@ -11,6 +11,7 @@ from app.security.websocket_tickets import consume_websocket_ticket
 from app.services.asr import AsrAdapter, create_asr_adapter
 from app.services.asr.persistence import SqlAlchemyAsrPersistence
 from app.services.asr.session import handle_asr_websocket
+from app.services.asr.worker import ProcessAsrAdapter
 
 router = APIRouter(tags=["asr"])
 logger = logging.getLogger("campusvoice.asr")
@@ -54,11 +55,21 @@ async def asr_websocket(websocket: WebSocket) -> None:
         )
         await websocket.close(code=1008, reason="connection_limit_reached")
         return
-    factory: Callable[[], AsrAdapter] = getattr(
+    configured_factory: Callable[[], AsrAdapter] = getattr(
         websocket.app.state,
         "asr_adapter_factory",
-        lambda: create_asr_adapter(settings),
+        lambda: create_asr_adapter(
+            settings,
+            process_supervisor=websocket.app.state.asr_process_supervisor,
+        ),
     )
+    adapter: AsrAdapter | None = None
+
+    def factory() -> AsrAdapter:
+        nonlocal adapter
+        adapter = configured_factory()
+        return adapter
+
     try:
         async with session_factory() as session:
             user_settings = await session.get(UserSettings, user_id)
@@ -83,12 +94,17 @@ async def asr_websocket(websocket: WebSocket) -> None:
                 max_audio_seconds=settings.asr_max_audio_seconds,
             )
     finally:
-        try:
-            await registry.release(user_id, lease_id)
-        except Exception:
-            # Redis leases have a bounded TTL, so cleanup remains fail-closed.
-            # Do not include the user identifier or lease in logs.
-            logger.exception("asr_quota_release_failed")
+        if isinstance(adapter, ProcessAsrAdapter) and not adapter.resources_reclaimed:
+            # Never advertise capacity while a provider process may still own model
+            # state. Redis TTL remains the last-resort fail-closed recovery path.
+            logger.critical("asr_quota_retained_for_live_provider_worker")
+        else:
+            try:
+                await registry.release(user_id, lease_id)
+            except Exception:
+                # Redis leases have a bounded TTL, so cleanup remains fail-closed.
+                # Do not include the user identifier or lease in logs.
+                logger.exception("asr_quota_release_failed")
 
 
 def _settings_hotwords(settings: UserSettings | None) -> tuple[str, ...]:

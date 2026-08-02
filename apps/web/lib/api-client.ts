@@ -1153,6 +1153,10 @@ export const api = {
         method: "POST",
         ...jsonBody(data),
       }).then(normalizePendingAction),
+    get: (id: string) =>
+      request<WirePendingAction>(`/api/actions/${encodeURIComponent(id)}`, {
+        cache: "no-store",
+      }).then(normalizePendingAction),
     confirm: async (id: string, confirmed: boolean) => {
       const issued = await request<{ challenge: string; stage: number; expires_at: string }>(
         `/api/actions/${encodeURIComponent(id)}/challenge`,
@@ -1185,8 +1189,8 @@ export const api = {
   },
 
   actionLogs: {
-    list: (limit = 20) =>
-      request<ListResponse<WireActionLog>>(`/api/action-logs${asQuery({ limit })}`).then(
+    list: (limit = 20, offset = 0) =>
+      request<ListResponse<WireActionLog>>(`/api/action-logs${asQuery({ limit, offset })}`).then(
         (payload) => ({
           total: payload.total,
           items: payload.items.map((log): ActionLog => ({

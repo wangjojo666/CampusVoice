@@ -53,7 +53,10 @@ async def get_action(
     action_id: str,
     session: SessionDependency,
     user_id: UserIdDependency,
+    response: Response,
 ) -> PendingActionView:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
     action = await ActionRepository().get_pending(session, user_id, action_id)
     if action is None:
         raise NotFoundError("pending_action", action_id)

@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
 
 class _StrictModel(BaseModel):
@@ -15,7 +15,9 @@ class DocumentFileType(StrEnum):
     MARKDOWN = "md"
 
 
-class DocumentMetadata(_StrictModel):
+class StoredDocumentMetadata(_StrictModel):
+    """Persisted metadata, including rows accepted before upload limits were tightened."""
+
     title: str = Field(min_length=1, max_length=500)
     department: str | None = Field(default=None, max_length=300)
     publish_date: date | None = None
@@ -25,10 +27,29 @@ class DocumentMetadata(_StrictModel):
     file_type: DocumentFileType
 
 
+class DocumentMetadata(StoredDocumentMetadata):
+    """Metadata accepted for new document uploads."""
+
+    title: str = Field(min_length=1, max_length=240)
+    department: str | None = Field(default=None, max_length=160)
+    applicable_group: str | None = Field(default=None, max_length=240)
+    version: str | None = Field(default=None, max_length=80)
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def title_must_not_be_blank(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("title must not be blank")
+        return normalized
+
+
 class DocumentRecord(_StrictModel):
     id: str
     user_id: str
-    metadata: DocumentMetadata
+    metadata: StoredDocumentMetadata
     content_sha256: str
     status: str
     chunk_count: int = Field(ge=0)

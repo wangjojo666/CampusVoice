@@ -278,7 +278,7 @@ class ActionRepository:
         logs = await session.scalars(
             select(ActionLog)
             .where(*filters)
-            .order_by(ActionLog.created_at.desc())
+            .order_by(ActionLog.created_at.desc(), ActionLog.id.desc())
             .limit(limit)
             .offset(offset)
         )
@@ -290,7 +290,7 @@ class ActionRepository:
         log: ActionLog | None = await session.scalar(
             select(ActionLog)
             .where(ActionLog.pending_action_id == action_id, ActionLog.user_id == user_id)
-            .order_by(ActionLog.created_at.desc())
+            .order_by(ActionLog.created_at.desc(), ActionLog.id.desc())
         )
         return log
 

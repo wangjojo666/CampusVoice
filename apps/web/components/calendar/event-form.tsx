@@ -29,7 +29,9 @@ export function EventForm({
   defaultReminderMinutes,
   conflicts,
   busy,
+  onCheckConflicts,
   onSubmit,
+  onConflictReset = () => undefined,
   onCancel,
 }: Readonly<{
   event: CalendarEvent | null;
@@ -38,9 +40,13 @@ export function EventForm({
   defaultReminderMinutes?: number;
   conflicts: EventConflict[];
   busy: boolean;
+  onCheckConflicts: (
+    data: CalendarEventCreate | Omit<CalendarEventUpdate, "expected_version">,
+  ) => boolean | Promise<boolean>;
   onSubmit: (
     data: CalendarEventCreate | Omit<CalendarEventUpdate, "expected_version">,
   ) => void | Promise<void>;
+  onConflictReset?: () => void;
   onCancel: () => void;
 }>) {
   const currentSettings = useUserSettings();
@@ -64,6 +70,7 @@ export function EventForm({
   });
   const [reviewing, setReviewing] = useState(false);
   const [reminderTouched, setReminderTouched] = useState(false);
+  const [checkError, setCheckError] = useState<string | null>(null);
 
   const payload = {
     title: draft.title.trim(),
@@ -155,7 +162,11 @@ export function EventForm({
           <button
             type="button"
             disabled={busy}
-            onClick={() => setReviewing(false)}
+            onClick={() => {
+              onConflictReset();
+              setCheckError(null);
+              setReviewing(false);
+            }}
             className="btn-secondary"
           >
             <ArrowLeft size={16} /> 返回修改
@@ -180,104 +191,121 @@ export function EventForm({
 
   return (
     <form
-      onSubmit={(formEvent) => {
+      onSubmit={async (formEvent) => {
         formEvent.preventDefault();
-        if (draft.title.trim() && draft.start_at) setReviewing(true);
+        if (!draft.title.trim() || !draft.start_at) return;
+        setCheckError(null);
+        try {
+          if (await onCheckConflicts(payload)) setReviewing(true);
+          else setCheckError("未能完成时间冲突检查，请核对时间后重试。");
+        } catch {
+          setCheckError("未能完成时间冲突检查，请核对时间后重试。");
+        }
       }}
-      className="space-y-4"
+      aria-busy={busy}
     >
-      <label className="block">
-        <span className="mb-1.5 block text-sm font-bold text-ink-700">标题 *</span>
-        <input
-          autoFocus
-          required
-          value={draft.title}
-          onChange={(input) => setDraft({ ...draft, title: input.target.value })}
-          className="field"
-          placeholder="例如：机器学习期中考试"
-        />
-      </label>
-      <div className="grid gap-4 sm:grid-cols-2">
-        <label className="block">
-          <span className="mb-1.5 block text-sm font-bold text-ink-700">开始时间 *</span>
-          <input
-            required
-            type="datetime-local"
-            value={draft.start_at}
-            onChange={(input) => setDraft({ ...draft, start_at: input.target.value })}
-            className="field"
-          />
-        </label>
-        <label className="block">
-          <span className="mb-1.5 block text-sm font-bold text-ink-700">结束时间 *</span>
-          <input
-            required
-            type="datetime-local"
-            min={draft.start_at}
-            value={draft.end_at}
-            onChange={(input) => setDraft({ ...draft, end_at: input.target.value })}
-            className="field"
-          />
-        </label>
-      </div>
-      <div className="grid gap-4 sm:grid-cols-2">
-        <label className="block">
-          <span className="mb-1.5 block text-sm font-bold text-ink-700">课程</span>
-          <input
-            value={draft.course}
-            onChange={(input) => setDraft({ ...draft, course: input.target.value })}
-            className="field"
-            placeholder="可选"
-          />
-        </label>
-        <label className="block">
-          <span className="mb-1.5 block text-sm font-bold text-ink-700">地点</span>
-          <input
-            value={draft.location}
-            onChange={(input) => setDraft({ ...draft, location: input.target.value })}
-            className="field"
-            placeholder="例如：教学楼 A302"
-          />
-        </label>
-      </div>
-      <label className="block">
-        <span className="mb-1.5 block text-sm font-bold text-ink-700">说明</span>
-        <textarea
-          rows={3}
-          value={draft.description}
-          onChange={(input) => setDraft({ ...draft, description: input.target.value })}
-          className="field resize-y"
-        />
-      </label>
-      <label className="block">
-        <span className="mb-1.5 block text-sm font-bold text-ink-700">提前提醒</span>
-        <select
-          value={draft.reminder_minutes}
-          onChange={(input) => {
-            setReminderTouched(true);
-            setDraft({ ...draft, reminder_minutes: input.target.value });
-          }}
-          className="field"
+      {checkError ? (
+        <p
+          role="alert"
+          className="mb-4 rounded-xl border border-coral-100 bg-coral-50 p-3 text-sm font-semibold text-coral-600"
         >
-          <option value="0">不提醒</option>
-          <option value="10">10 分钟</option>
-          <option value="30">30 分钟</option>
-          <option value="60">1 小时</option>
-          <option value="1440">1 天</option>
-        </select>
-      </label>
-      <div className="flex flex-col-reverse gap-2 pt-2 sm:flex-row sm:justify-end">
-        <button type="button" onClick={onCancel} className="btn-secondary">
-          取消
-        </button>
-        <button
-          type="submit"
-          disabled={!draft.title.trim() || !draft.start_at}
-          className="btn-primary"
-        >
-          检查冲突并核对
-        </button>
-      </div>
+          {checkError}
+        </p>
+      ) : null}
+      <fieldset disabled={busy} className="space-y-4">
+        <label className="block">
+          <span className="mb-1.5 block text-sm font-bold text-ink-700">标题 *</span>
+          <input
+            autoFocus
+            required
+            value={draft.title}
+            onChange={(input) => setDraft({ ...draft, title: input.target.value })}
+            className="field"
+            placeholder="例如：机器学习期中考试"
+          />
+        </label>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <label className="block">
+            <span className="mb-1.5 block text-sm font-bold text-ink-700">开始时间 *</span>
+            <input
+              required
+              type="datetime-local"
+              value={draft.start_at}
+              onChange={(input) => setDraft({ ...draft, start_at: input.target.value })}
+              className="field"
+            />
+          </label>
+          <label className="block">
+            <span className="mb-1.5 block text-sm font-bold text-ink-700">结束时间 *</span>
+            <input
+              required
+              type="datetime-local"
+              min={draft.start_at}
+              value={draft.end_at}
+              onChange={(input) => setDraft({ ...draft, end_at: input.target.value })}
+              className="field"
+            />
+          </label>
+        </div>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <label className="block">
+            <span className="mb-1.5 block text-sm font-bold text-ink-700">课程</span>
+            <input
+              value={draft.course}
+              onChange={(input) => setDraft({ ...draft, course: input.target.value })}
+              className="field"
+              placeholder="可选"
+            />
+          </label>
+          <label className="block">
+            <span className="mb-1.5 block text-sm font-bold text-ink-700">地点</span>
+            <input
+              value={draft.location}
+              onChange={(input) => setDraft({ ...draft, location: input.target.value })}
+              className="field"
+              placeholder="例如：教学楼 A302"
+            />
+          </label>
+        </div>
+        <label className="block">
+          <span className="mb-1.5 block text-sm font-bold text-ink-700">说明</span>
+          <textarea
+            rows={3}
+            value={draft.description}
+            onChange={(input) => setDraft({ ...draft, description: input.target.value })}
+            className="field resize-y"
+          />
+        </label>
+        <label className="block">
+          <span className="mb-1.5 block text-sm font-bold text-ink-700">提前提醒</span>
+          <select
+            value={draft.reminder_minutes}
+            onChange={(input) => {
+              setReminderTouched(true);
+              setDraft({ ...draft, reminder_minutes: input.target.value });
+            }}
+            className="field"
+          >
+            <option value="0">不提醒</option>
+            <option value="10">10 分钟</option>
+            <option value="30">30 分钟</option>
+            <option value="60">1 小时</option>
+            <option value="1440">1 天</option>
+          </select>
+        </label>
+        <div className="flex flex-col-reverse gap-2 pt-2 sm:flex-row sm:justify-end">
+          <button type="button" onClick={onCancel} className="btn-secondary">
+            取消
+          </button>
+          <button
+            type="submit"
+            disabled={busy || !draft.title.trim() || !draft.start_at}
+            className="btn-primary"
+          >
+            检查冲突并核对
+          </button>
+        </div>
+      </fieldset>
     </form>
   );
 }
