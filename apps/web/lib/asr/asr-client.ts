@@ -74,6 +74,7 @@ function normalizeMessage(value: unknown): AsrServerMessage | null {
 export class AsrWebSocketClient {
   private static readonly DEFAULT_READY_TIMEOUT_MS = 15_000;
   private socket: WebSocket | null = null;
+  private pendingConnect: { socket: WebSocket; cancel: () => void } | null = null;
   private stopRequested = false;
   private readonly handlers: AsrClientHandlers;
   private readonly url: string;
@@ -93,38 +94,88 @@ export class AsrWebSocketClient {
   }
 
   connect(): Promise<void> {
-    if (this.socket) throw new Error("ASR WebSocket is already connected");
+    if (this.socket || this.pendingConnect) throw new Error("ASR WebSocket is already connected");
+    this.stopRequested = false;
     return new Promise((resolve, reject) => {
       let settled = false;
+      let readyTimeoutId: number | null = null;
+      let closeRequested = false;
       const socket = new WebSocket(this.url, websocketProtocols(this.ticket));
-      const readyTimeoutId = window.setTimeout(() => {
-        if (settled) return;
+
+      const clearReadyTimeout = () => {
+        if (readyTimeoutId === null) return;
+        window.clearTimeout(readyTimeoutId);
+        readyTimeoutId = null;
+      };
+      const settle = (reason?: Error) => {
+        if (settled) return false;
         settled = true;
+        clearReadyTimeout();
+        if (this.pendingConnect?.socket === socket) this.pendingConnect = null;
+        if (reason) reject(reason);
+        else resolve();
+        return true;
+      };
+      const detachSocket = () => {
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onerror = null;
+        socket.onclose = null;
+      };
+      const abandonSocket = (reason: string) => {
         if (this.socket === socket) this.socket = null;
-        socket.close(1000, "ready timeout");
-        reject(new Error("WebSocket ready handshake timed out"));
-      }, this.readyTimeoutMs);
+        detachSocket();
+        if (
+          closeRequested ||
+          socket.readyState === WebSocket.CLOSING ||
+          socket.readyState === WebSocket.CLOSED
+        )
+          return;
+        closeRequested = true;
+        try {
+          socket.close(1000, reason);
+        } catch {
+          // The promise has already settled; cleanup remains best-effort.
+        }
+      };
+      const rejectAndClose = (error: Error, closeReason: string) => {
+        if (!settle(error)) return;
+        abandonSocket(closeReason);
+      };
+
       socket.binaryType = "arraybuffer";
       this.socket = socket;
+      this.pendingConnect = {
+        socket,
+        cancel: () =>
+          rejectAndClose(new Error("ASR WebSocket connection cancelled"), "client closed"),
+      };
+      readyTimeoutId = window.setTimeout(
+        () => rejectAndClose(new Error("ASR WebSocket ready handshake timed out"), "ready timeout"),
+        this.readyTimeoutMs,
+      );
 
       socket.onopen = () => {
-        this.sendControl({
-          type: "start",
-          sample_rate_hz: 16000,
-          channels: 1,
-          sample_width_bytes: 2,
-          language: "zh",
-          hotwords: this.hotwords.slice(0, 500),
-        });
+        if (this.socket !== socket) return;
+        this.sendControl(
+          {
+            type: "start",
+            sample_rate_hz: 16000,
+            channels: 1,
+            sample_width_bytes: 2,
+            language: "zh",
+            hotwords: this.hotwords.slice(0, 500),
+          },
+          socket,
+        );
       };
       socket.onmessage = (event) => {
+        if (this.socket !== socket) return;
         try {
           const message = normalizeMessage(JSON.parse(String(event.data)));
           if (!message) return;
           if (message.type === "ready" && !settled) {
-            window.clearTimeout(readyTimeoutId);
-            settled = true;
-            resolve();
+            settle();
           }
           this.handlers.onMessage(message);
         } catch {
@@ -132,24 +183,23 @@ export class AsrWebSocketClient {
         }
       };
       socket.onerror = () => {
+        if (this.socket !== socket) return;
         this.handlers.onError("无法建立语音识别连接，请确认服务已启动。");
         if (!settled) {
-          window.clearTimeout(readyTimeoutId);
-          settled = true;
-          reject(new Error("WebSocket connection failed"));
+          rejectAndClose(new Error("WebSocket connection failed"), "connection failed");
         }
       };
       socket.onclose = (event) => {
-        if (this.socket === socket) this.socket = null;
+        if (this.socket !== socket) return;
+        this.socket = null;
+        detachSocket();
         this.handlers.onClose({
           stopRequested: this.stopRequested,
           code: event.code,
           wasClean: event.wasClean,
         });
         if (!settled) {
-          window.clearTimeout(readyTimeoutId);
-          settled = true;
-          reject(new Error("WebSocket closed before ready"));
+          settle(new Error("WebSocket closed before ready"));
         }
       };
     });
@@ -173,14 +223,24 @@ export class AsrWebSocketClient {
   }
 
   close() {
+    const pendingConnect = this.pendingConnect;
+    if (pendingConnect) {
+      pendingConnect.cancel();
+      return;
+    }
     const socket = this.socket;
     this.socket = null;
-    socket?.close(1000, "client closed");
+    if (!socket) return;
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onerror = null;
+    socket.onclose = null;
+    socket.close(1000, "client closed");
   }
 
-  private sendControl(message: AsrClientMessage) {
-    if (this.socket?.readyState !== WebSocket.OPEN) return false;
-    this.socket.send(JSON.stringify(message));
+  private sendControl(message: AsrClientMessage, socket = this.socket) {
+    if (!socket || socket !== this.socket || socket.readyState !== WebSocket.OPEN) return false;
+    socket.send(JSON.stringify(message));
     return true;
   }
 }
