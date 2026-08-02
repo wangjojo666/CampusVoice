@@ -1,18 +1,22 @@
 import hashlib
+import heapq
 import json
 import re
 from collections import defaultdict
-from dataclasses import dataclass
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import aliased
 
 from app.db.types import utc_now
 from app.models.entities import (
     CalendarEvent,
+    Course,
     Document,
     DocumentChunk,
     ImpactCase,
@@ -60,12 +64,45 @@ from app.services.notices.claims import (
 
 EntityName = Literal["task", "event"]
 ApplicabilityState = Literal["applicable", "not_applicable", "needs_review"]
+_RADAR_STREAM_BATCH_SIZE = 100
 
 
 @dataclass(frozen=True, slots=True)
 class ApplicabilityResult:
     state: ApplicabilityState
     reason: str
+
+
+@dataclass(slots=True)
+class _BoundedRadarCards:
+    limit: int
+    total: int = 0
+    _sequence: int = 0
+    _heap: list[tuple[datetime, int, dict[str, Any]]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.limit < 1:
+            raise ValueError("Radar card limit must be positive")
+
+    def add(self, *, created_at: datetime, **fields: Any) -> None:
+        candidate = (
+            created_at,
+            -self._sequence,
+            {"created_at": created_at, **fields},
+        )
+        self._sequence += 1
+        self.total += 1
+        heapq.heappush(self._heap, candidate)
+        if len(self._heap) > self.limit:
+            heapq.heappop(self._heap)
+
+    @property
+    def retained_count(self) -> int:
+        return len(self._heap)
+
+    def items(self) -> list[RadarCardView]:
+        ordered = sorted(self._heap, key=lambda candidate: candidate[:2], reverse=True)
+        return [RadarCardView.model_validate(candidate[2]) for candidate in ordered]
 
 
 class NoticeRadarService:
@@ -102,16 +139,38 @@ class NoticeRadarService:
     async def list_series(
         self, session: AsyncSession, user_id: str, *, limit: int, offset: int
     ) -> list[NoticeSeriesView]:
-        rows = list(
+        series_rows = list(
             await session.scalars(
                 select(NoticeSeries)
                 .where(NoticeSeries.user_id == user_id)
-                .order_by(NoticeSeries.updated_at.desc())
+                .order_by(NoticeSeries.updated_at.desc(), NoticeSeries.id.desc())
                 .limit(limit)
                 .offset(offset)
             )
         )
-        return [await self._series_view(session, row) for row in rows]
+        if not series_rows:
+            return []
+        series_ids = [row.id for row in series_rows]
+        stats_rows = await session.execute(
+            select(
+                Document.series_id,
+                func.count(Document.id),
+                func.max(case((Document.is_current.is_(True), Document.id), else_=None)),
+            )
+            .where(
+                Document.user_id == user_id,
+                Document.series_id.in_(series_ids),
+            )
+            .group_by(Document.series_id)
+        )
+        stats: dict[str, tuple[int, str | None]] = {
+            str(series_id): (int(version_count), current_document_id)
+            for series_id, version_count, current_document_id in stats_rows
+            if series_id is not None
+        }
+        return [
+            self._series_view_from_stats(row, *stats.get(row.id, (0, None))) for row in series_rows
+        ]
 
     async def add_version(
         self,
@@ -513,7 +572,21 @@ class NoticeRadarService:
                 statement.order_by(ImpactCase.detected_at.desc()).limit(limit).offset(offset)
             )
         )
-        return ImpactListView(items=[_impact_view(item) for item in rows], total=total)
+        item_views = await self._public_impact_views(session, user_id, rows)
+        return ImpactListView(items=item_views, total=total)
+
+    @staticmethod
+    async def _public_impact_views(
+        session: AsyncSession,
+        user_id: str,
+        items: list[ImpactCase],
+    ) -> list[ImpactCaseView]:
+        item_views = [_impact_view(item) for item in items]
+        payloads: list[Any] = []
+        for view in item_views:
+            payloads.extend((view.current_snapshot, view.proposed_patch))
+        owned_course_ids = await _owned_course_ids_for_payloads(session, user_id, payloads)
+        return [_sanitize_impact_view(view, owned_course_ids) for view in item_views]
 
     async def build_plan(
         self, session: AsyncSession, user_id: str, change_set_id: str
@@ -591,6 +664,13 @@ class NoticeRadarService:
         conflicts: list[dict[str, Any]] = []
         for (entity_type, entity_id), impacts in grouped.items():
             entity = await self._owned_entity(session, user_id, entity_type, entity_id)
+            await self._ensure_migration_course_references(
+                session,
+                user_id,
+                entity_type,
+                entity_id,
+                entity.course_id,
+            )
             before = _snapshot(entity_type, entity)
             patch: dict[str, Any] = {}
             source_claim_ids: list[str] = []
@@ -638,6 +718,14 @@ class NoticeRadarService:
                 )
             source_claim_ids = sorted(set(source_claim_ids))
             after = _patched_snapshot(before, patch, source_claim_ids)
+            await self._ensure_migration_course_references(
+                session,
+                user_id,
+                entity_type,
+                entity_id,
+                before.get("course_id"),
+                after.get("course_id"),
+            )
             if entity_type == "event":
                 conflicts.extend(await self._event_conflicts(session, user_id, entity_id, after))
             prepared.append((entity_type, entity_id, before, patch, source_claim_ids))
@@ -716,7 +804,7 @@ class NoticeRadarService:
                 .order_by(ImpactMigrationItem.entity_type, ImpactMigrationItem.entity_id)
             )
         )
-        return _plan_view(plan, items)
+        return await self._public_plan_view(session, user_id, plan, items)
 
     async def execute(
         self,
@@ -759,23 +847,41 @@ class NoticeRadarService:
                 f"This migration requires {required} confirmation stage(s)",
                 status_code=422,
             )
-        claimed = (
-            await session.execute(
-                update(ImpactMigrationPlan)
-                .where(
-                    ImpactMigrationPlan.id == plan.id,
-                    ImpactMigrationPlan.user_id == user_id,
-                    ImpactMigrationPlan.status == "ready",
-                    ImpactMigrationPlan.version == request.plan_version,
+        await self._ensure_migration_idempotency_key_available(
+            session,
+            user_id,
+            plan.id,
+            request.idempotency_key,
+            operation="execute",
+        )
+        try:
+            claimed = (
+                await session.execute(
+                    update(ImpactMigrationPlan)
+                    .where(
+                        ImpactMigrationPlan.id == plan.id,
+                        ImpactMigrationPlan.user_id == user_id,
+                        ImpactMigrationPlan.status == "ready",
+                        ImpactMigrationPlan.version == request.plan_version,
+                    )
+                    .values(
+                        status="executing",
+                        execution_idempotency_key=request.idempotency_key,
+                        updated_at=utc_now(),
+                    )
+                    .returning(ImpactMigrationPlan.id)
                 )
-                .values(
-                    status="executing",
-                    execution_idempotency_key=request.idempotency_key,
-                    updated_at=utc_now(),
-                )
-                .returning(ImpactMigrationPlan.id)
+            ).scalar_one_or_none()
+        except IntegrityError:
+            await session.rollback()
+            await self._ensure_migration_idempotency_key_available(
+                session,
+                user_id,
+                plan.id,
+                request.idempotency_key,
+                operation="execute",
             )
-        ).scalar_one_or_none()
+            raise
         if claimed is None:
             await session.rollback()
             fresh = await self._owned_plan(session, user_id, plan_id)
@@ -801,7 +907,9 @@ class NoticeRadarService:
                 )
             items = list(
                 await session.scalars(
-                    select(ImpactMigrationItem).where(ImpactMigrationItem.plan_id == plan.id)
+                    select(ImpactMigrationItem)
+                    .where(ImpactMigrationItem.plan_id == plan.id)
+                    .order_by(ImpactMigrationItem.entity_type, ImpactMigrationItem.entity_id)
                 )
             )
             await self._ensure_plan_impacts_executable(session, user_id, plan.id)
@@ -815,6 +923,15 @@ class NoticeRadarService:
                     item.entity_id,
                     for_update=True,
                 )
+                await self._ensure_migration_course_references(
+                    session,
+                    user_id,
+                    item.entity_type,
+                    item.entity_id,
+                    entity.course_id,
+                    item.before_snapshot.get("course_id"),
+                    for_update=True,
+                )
                 actual_before = _snapshot(item.entity_type, entity)
                 if not _snapshots_match(item.before_snapshot, actual_before, ignore_version=False):
                     raise ConflictError(
@@ -824,6 +941,14 @@ class NoticeRadarService:
                     )
                 predicted = _patched_snapshot(
                     actual_before, item.proposed_patch, item.source_claim_ids
+                )
+                await self._ensure_migration_course_references(
+                    session,
+                    user_id,
+                    item.entity_type,
+                    item.entity_id,
+                    predicted.get("course_id"),
+                    for_update=True,
                 )
                 if item.entity_type == "event":
                     current_conflicts.extend(
@@ -835,12 +960,21 @@ class NoticeRadarService:
             if _stable_json(_sorted_conflicts(current_conflicts)) != _stable_json(
                 _sorted_conflicts(plan.conflicts_json)
             ):
+                owned_course_ids = await _owned_course_ids_for_payloads(
+                    session,
+                    user_id,
+                    [plan.conflicts_json, current_conflicts],
+                )
                 raise ConflictError(
                     "calendar_conflicts_changed",
                     "Calendar conflicts changed after preview; regenerate the migration",
                     {
-                        "preview_conflicts": plan.conflicts_json,
-                        "current_conflicts": current_conflicts,
+                        "preview_conflicts": _sanitize_public_course_references(
+                            plan.conflicts_json, owned_course_ids
+                        ),
+                        "current_conflicts": _sanitize_public_course_references(
+                            current_conflicts, owned_course_ids
+                        ),
                     },
                 )
             if current_conflicts and not request.allow_conflicts:
@@ -897,25 +1031,43 @@ class NoticeRadarService:
                 "The migration receipt changed; reload it before undoing",
                 {"current_version": plan.version},
             )
-        claimed = (
-            await session.execute(
-                update(ImpactMigrationPlan)
-                .where(
-                    ImpactMigrationPlan.id == plan.id,
-                    ImpactMigrationPlan.user_id == user_id,
-                    ImpactMigrationPlan.status.in_(
-                        [
-                            "applied",
-                            "verified",
-                            "verification_failed",
-                        ]
-                    ),
-                    ImpactMigrationPlan.version == request.plan_version,
+        await self._ensure_migration_idempotency_key_available(
+            session,
+            user_id,
+            plan.id,
+            request.idempotency_key,
+            operation="undo",
+        )
+        try:
+            claimed = (
+                await session.execute(
+                    update(ImpactMigrationPlan)
+                    .where(
+                        ImpactMigrationPlan.id == plan.id,
+                        ImpactMigrationPlan.user_id == user_id,
+                        ImpactMigrationPlan.status.in_(
+                            [
+                                "applied",
+                                "verified",
+                                "verification_failed",
+                            ]
+                        ),
+                        ImpactMigrationPlan.version == request.plan_version,
+                    )
+                    .values(status="undoing", undo_idempotency_key=request.idempotency_key)
+                    .returning(ImpactMigrationPlan.id)
                 )
-                .values(status="undoing", undo_idempotency_key=request.idempotency_key)
-                .returning(ImpactMigrationPlan.id)
+            ).scalar_one_or_none()
+        except IntegrityError:
+            await session.rollback()
+            await self._ensure_migration_idempotency_key_available(
+                session,
+                user_id,
+                plan.id,
+                request.idempotency_key,
+                operation="undo",
             )
-        ).scalar_one_or_none()
+            raise
         if claimed is None:
             await session.rollback()
             fresh = await self._owned_plan(session, user_id, plan_id)
@@ -932,7 +1084,9 @@ class NoticeRadarService:
             plan.undo_idempotency_key = request.idempotency_key
             items = list(
                 await session.scalars(
-                    select(ImpactMigrationItem).where(ImpactMigrationItem.plan_id == plan.id)
+                    select(ImpactMigrationItem)
+                    .where(ImpactMigrationItem.plan_id == plan.id)
+                    .order_by(ImpactMigrationItem.entity_type, ImpactMigrationItem.entity_id)
                 )
             )
             locked: list[tuple[ImpactMigrationItem, Task | CalendarEvent]] = []
@@ -942,6 +1096,16 @@ class NoticeRadarService:
                     user_id,
                     item.entity_type,
                     item.entity_id,
+                    for_update=True,
+                )
+                await self._ensure_migration_course_references(
+                    session,
+                    user_id,
+                    item.entity_type,
+                    item.entity_id,
+                    entity.course_id,
+                    item.before_snapshot.get("course_id"),
+                    (item.after_snapshot or {}).get("course_id"),
                     for_update=True,
                 )
                 after_version = int((item.after_snapshot or {}).get("version", -1))
@@ -1003,20 +1167,15 @@ class NoticeRadarService:
                     .order_by(ImpactMigrationItem.entity_type, ImpactMigrationItem.entity_id)
                 )
             )
-            item_receipts = [
-                _operation_receipt(
-                    item.execute_verification_json
-                    if operation == "execute"
-                    else item.undo_verification_json,
-                    item.verification_json,
+            public_items = await self._public_migration_item_views(session, user_id, items)
+            item_views = []
+            for view in public_items:
+                item_receipt = _operation_receipt(
+                    view.execute_verification if operation == "execute" else view.undo_verification,
+                    view.verification,
                     operation,
                     receipt_type="item",
                 )
-                for item in items
-            ]
-            item_views = []
-            for item, item_receipt in zip(items, item_receipts, strict=True):
-                view = _migration_item_view(item)
                 item_views.append(view.model_copy(update={"verification": item_receipt}))
             return VerificationReceiptView(
                 plan_id=plan.id,
@@ -1029,25 +1188,254 @@ class NoticeRadarService:
                 verified_at=datetime.fromisoformat(str(receipt["verified_at"])),
             )
 
+    async def _change_radar_context(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        change_sets: list[NoticeChangeSet],
+        settings: UserSettings | None,
+    ) -> tuple[
+        dict[str, Document],
+        dict[str, ApplicabilityResult],
+        dict[str, tuple[int, bool]],
+        dict[str, tuple[int, int]],
+    ]:
+        if not change_sets:
+            return {}, {}, {}, {}
+
+        change_set_ids = [row.id for row in change_sets]
+        document_ids = {
+            document_id
+            for row in change_sets
+            for document_id in (row.from_document_id, row.to_document_id)
+        }
+        documents = {
+            row.id: row
+            for row in await session.scalars(
+                select(Document).where(
+                    Document.user_id == user_id,
+                    Document.id.in_(document_ids),
+                )
+            )
+        }
+        audiences = {
+            row.document_id: row
+            for row in await session.scalars(
+                select(NoticeClaim).where(
+                    NoticeClaim.user_id == user_id,
+                    NoticeClaim.document_id.in_(documents),
+                    NoticeClaim.claim_key == "audience",
+                    NoticeClaim.extractor_version == EXTRACTOR_VERSION,
+                )
+            )
+        }
+        applicability_by_document = {
+            document_id: self._applicability_from_context(
+                audiences.get(document_id),
+                settings,
+            )
+            for document_id in documents
+        }
+
+        change_rows = await session.execute(
+            select(
+                NoticeChangeItem.change_set_id,
+                func.count(NoticeChangeItem.id),
+                func.max(
+                    case(
+                        (NoticeChangeItem.review_state == "pending", 1),
+                        else_=0,
+                    )
+                ),
+            )
+            .where(
+                NoticeChangeItem.user_id == user_id,
+                NoticeChangeItem.change_set_id.in_(change_set_ids),
+            )
+            .group_by(NoticeChangeItem.change_set_id)
+        )
+        change_metrics = {
+            str(change_set_id): (int(change_count), bool(has_pending))
+            for change_set_id, change_count, has_pending in change_rows
+        }
+
+        impact_rows = await session.execute(
+            select(
+                NoticeChangeItem.change_set_id,
+                func.count(
+                    func.distinct(
+                        case(
+                            (ImpactCase.entity_type == "task", ImpactCase.entity_id),
+                            else_=None,
+                        )
+                    )
+                ),
+                func.count(
+                    func.distinct(
+                        case(
+                            (ImpactCase.entity_type == "event", ImpactCase.entity_id),
+                            else_=None,
+                        )
+                    )
+                ),
+            )
+            .join(ImpactCase, ImpactCase.change_item_id == NoticeChangeItem.id)
+            .where(
+                ImpactCase.user_id == user_id,
+                NoticeChangeItem.user_id == user_id,
+                NoticeChangeItem.change_set_id.in_(change_set_ids),
+            )
+            .group_by(NoticeChangeItem.change_set_id)
+        )
+        impact_metrics = {
+            str(change_set_id): (int(task_count), int(event_count))
+            for change_set_id, task_count, event_count in impact_rows
+        }
+        return (
+            documents,
+            applicability_by_document,
+            change_metrics,
+            impact_metrics,
+        )
+
+    async def _current_radar_rows(
+        self,
+        session: AsyncSession,
+        user_id: str,
+        settings: UserSettings | None,
+        limit: int,
+    ) -> AsyncIterator[tuple[Document, ApplicabilityResult, NoticeClaim | None]]:
+        audience_claim = aliased(NoticeClaim, name="radar_audience_claim")
+        deadline_claim = aliased(NoticeClaim, name="radar_deadline_claim")
+        latest_deadline_id = (
+            select(NoticeClaim.id)
+            .where(
+                NoticeClaim.user_id == user_id,
+                NoticeClaim.document_id == Document.id,
+                NoticeClaim.claim_key == "task.due_at",
+            )
+            .order_by(NoticeClaim.created_at.desc(), NoticeClaim.id.desc())
+            .limit(1)
+            .correlate(Document)
+            .scalar_subquery()
+        )
+        statement = (
+            select(Document, audience_claim, deadline_claim)
+            .outerjoin(
+                audience_claim,
+                (audience_claim.user_id == user_id)
+                & (audience_claim.document_id == Document.id)
+                & (audience_claim.claim_key == "audience")
+                & (audience_claim.extractor_version == EXTRACTOR_VERSION),
+            )
+            .outerjoin(deadline_claim, deadline_claim.id == latest_deadline_id)
+            .where(
+                Document.user_id == user_id,
+                Document.series_id.is_not(None),
+                Document.is_current.is_(True),
+            )
+            .order_by(Document.created_at.desc(), Document.id.desc())
+            .execution_options(yield_per=max(limit, _RADAR_STREAM_BATCH_SIZE))
+        )
+        rows = await session.stream(statement)
+        try:
+            async for document, audience, deadline in rows:
+                yield (
+                    document,
+                    self._applicability_from_context(audience, settings),
+                    deadline,
+                )
+        finally:
+            await rows.close()
+
+    @staticmethod
+    async def _public_plan_view(
+        session: AsyncSession,
+        user_id: str,
+        plan: ImpactMigrationPlan,
+        items: list[ImpactMigrationItem],
+    ) -> MigrationPlanView:
+        item_views = [_migration_item_view(item) for item in items]
+        payloads: list[Any] = [
+            plan.conflicts_json,
+            plan.verification_json,
+            plan.execute_receipt_json,
+            plan.undo_receipt_json,
+        ]
+        for view in item_views:
+            payloads.extend(
+                (
+                    view.before,
+                    view.after,
+                    view.verification,
+                    view.execute_verification,
+                    view.undo_verification,
+                )
+            )
+        owned_course_ids = await _owned_course_ids_for_payloads(session, user_id, payloads)
+        return _plan_view(
+            plan,
+            items,
+            item_views=[
+                _sanitize_migration_item_view(view, owned_course_ids) for view in item_views
+            ],
+            owned_course_ids=owned_course_ids,
+        )
+
+    @staticmethod
+    async def _public_migration_item_views(
+        session: AsyncSession,
+        user_id: str,
+        items: list[ImpactMigrationItem],
+    ) -> list[MigrationItemView]:
+        item_views = [_migration_item_view(item) for item in items]
+        payloads: list[Any] = []
+        for view in item_views:
+            payloads.extend(
+                (
+                    view.before,
+                    view.after,
+                    view.verification,
+                    view.execute_verification,
+                    view.undo_verification,
+                )
+            )
+        owned_course_ids = await _owned_course_ids_for_payloads(session, user_id, payloads)
+        return [_sanitize_migration_item_view(view, owned_course_ids) for view in item_views]
+
     async def radar(self, session: AsyncSession, user_id: str, *, limit: int) -> RadarView:
+        settings = await session.get(UserSettings, user_id)
+        # Preserve the existing radar contract: total includes cards from the
+        # newest limit * 3 change sets plus every qualifying current-document
+        # card, rather than every historical change set in the database.
         change_sets = list(
             await session.scalars(
                 select(NoticeChangeSet)
                 .where(NoticeChangeSet.user_id == user_id)
-                .order_by(NoticeChangeSet.created_at.desc())
+                .order_by(NoticeChangeSet.created_at.desc(), NoticeChangeSet.id.desc())
                 .limit(limit * 3)
             )
         )
-        cards: list[RadarCardView] = []
+        (
+            documents,
+            applicability_by_document,
+            change_metrics,
+            impact_metrics,
+        ) = await self._change_radar_context(
+            session,
+            user_id,
+            change_sets,
+            settings,
+        )
+        collector = _BoundedRadarCards(limit)
         for change_set in change_sets:
-            series = await session.get(NoticeSeries, change_set.series_id)
-            before = await session.get(Document, change_set.from_document_id)
-            after = await session.get(Document, change_set.to_document_id)
+            before = documents.get(change_set.from_document_id)
+            after = documents.get(change_set.to_document_id)
             if after is None:
                 continue
-            applicability = await self._applicability(session, user_id, after.id)
+            applicability = applicability_by_document[after.id]
             before_applicability = (
-                await self._applicability(session, user_id, before.id)
+                applicability_by_document[before.id]
                 if before is not None
                 else ApplicabilityResult("not_applicable", "No predecessor document")
             )
@@ -1057,107 +1445,64 @@ class NoticeRadarService:
             )
             if applicability.state == "not_applicable" and not de_scoped:
                 continue
-            changes = list(
-                await session.scalars(
-                    select(NoticeChangeItem).where(NoticeChangeItem.change_set_id == change_set.id)
-                )
-            )
-            impacts = list(
-                await session.scalars(
-                    select(ImpactCase)
-                    .join(NoticeChangeItem, NoticeChangeItem.id == ImpactCase.change_item_id)
-                    .where(
-                        ImpactCase.user_id == user_id,
-                        NoticeChangeItem.change_set_id == change_set.id,
-                    )
-                )
-            )
-            task_count = len({item.entity_id for item in impacts if item.entity_type == "task"})
-            event_count = len({item.entity_id for item in impacts if item.entity_type == "event"})
-            title = (
-                after.title
-                if after is not None
-                else (series.normalized_title if series else "通知")
-            )
-            needs_review = (
-                de_scoped
-                or applicability.state == "needs_review"
-                or any(item.review_state == "pending" for item in changes)
-            )
+            change_count, has_pending = change_metrics.get(change_set.id, (0, False))
+            task_count, event_count = impact_metrics.get(change_set.id, (0, 0))
+            title = after.title
+            needs_review = de_scoped or applicability.state == "needs_review" or has_pending
             message = (
                 f"《{title}》新版不再适用于当前档案；请人工决定保留或取消既有安排。"
                 if de_scoped
                 else f"《{title}》已更新，影响 {event_count} 个日程和 {task_count} 个待办。"
             )
-            cards.append(
-                RadarCardView(
-                    card_type="needs_review" if needs_review else "version_change",
-                    change_set_id=change_set.id,
-                    document_id=after.id,
-                    series_id=change_set.series_id,
-                    title=title,
-                    from_revision=(before.revision_number if before else 0) or 0,
-                    to_revision=(after.revision_number if after else 0) or 0,
-                    change_count=len(changes),
-                    affected_tasks=task_count,
-                    affected_events=event_count,
-                    needs_review=needs_review,
-                    applicability=applicability.state,
-                    applicability_reason=applicability.reason,
-                    message=message,
-                    created_at=change_set.created_at,
-                )
+            collector.add(
+                card_type="needs_review" if needs_review else "version_change",
+                change_set_id=change_set.id,
+                document_id=after.id,
+                series_id=change_set.series_id,
+                title=title,
+                from_revision=(before.revision_number if before else 0) or 0,
+                to_revision=(after.revision_number if after else 0) or 0,
+                change_count=change_count,
+                affected_tasks=task_count,
+                affected_events=event_count,
+                needs_review=needs_review,
+                applicability=applicability.state,
+                applicability_reason=applicability.reason,
+                message=message,
+                created_at=change_set.created_at,
             )
 
-        current_documents = list(
-            await session.scalars(
-                select(Document)
-                .where(
-                    Document.user_id == user_id,
-                    Document.series_id.is_not(None),
-                    Document.is_current.is_(True),
-                )
-                .order_by(Document.created_at.desc())
-            )
-        )
         now = utc_now()
         deadline_horizon = now + timedelta(days=14)
-        for document in current_documents:
+        async for document, applicability, deadline in self._current_radar_rows(
+            session,
+            user_id,
+            settings,
+            limit,
+        ):
             if document.series_id is None:
                 continue
-            applicability = await self._applicability(session, user_id, document.id)
             if applicability.state == "not_applicable":
                 continue
             if document.revision_number == 1:
                 needs_review = applicability.state == "needs_review"
-                cards.append(
-                    RadarCardView(
-                        card_type="needs_review" if needs_review else "new_notice",
-                        change_set_id=None,
-                        document_id=document.id,
-                        series_id=document.series_id,
-                        title=document.title,
-                        from_revision=0,
-                        to_revision=1,
-                        change_count=0,
-                        affected_tasks=0,
-                        affected_events=0,
-                        needs_review=needs_review,
-                        applicability=applicability.state,
-                        applicability_reason=applicability.reason,
-                        message=f"与我有关的新通知：《{document.title}》。",
-                        created_at=document.created_at,
-                    )
+                collector.add(
+                    card_type="needs_review" if needs_review else "new_notice",
+                    change_set_id=None,
+                    document_id=document.id,
+                    series_id=document.series_id,
+                    title=document.title,
+                    from_revision=0,
+                    to_revision=1,
+                    change_count=0,
+                    affected_tasks=0,
+                    affected_events=0,
+                    needs_review=needs_review,
+                    applicability=applicability.state,
+                    applicability_reason=applicability.reason,
+                    message=f"与我有关的新通知：《{document.title}》。",
+                    created_at=document.created_at,
                 )
-            deadline = await session.scalar(
-                select(NoticeClaim)
-                .where(
-                    NoticeClaim.user_id == user_id,
-                    NoticeClaim.document_id == document.id,
-                    NoticeClaim.claim_key == "task.due_at",
-                )
-                .order_by(NoticeClaim.created_at.desc())
-            )
             if deadline is None:
                 continue
             deadline_at = _as_datetime(deadline.normalized_value_json.get("iso"))
@@ -1166,28 +1511,25 @@ class NoticeRadarService:
             needs_review = (
                 applicability.state == "needs_review" or deadline.review_state != "approved"
             )
-            cards.append(
-                RadarCardView(
-                    card_type="upcoming_deadline",
-                    change_set_id=None,
-                    document_id=document.id,
-                    series_id=document.series_id,
-                    title=document.title,
-                    from_revision=0,
-                    to_revision=document.revision_number or 1,
-                    change_count=0,
-                    affected_tasks=0,
-                    affected_events=0,
-                    needs_review=needs_review,
-                    applicability=applicability.state,
-                    applicability_reason=applicability.reason,
-                    deadline_at=deadline_at,
-                    message=f"《{document.title}》即将截止。",
-                    created_at=document.created_at,
-                )
+            collector.add(
+                card_type="upcoming_deadline",
+                change_set_id=None,
+                document_id=document.id,
+                series_id=document.series_id,
+                title=document.title,
+                from_revision=0,
+                to_revision=document.revision_number or 1,
+                change_count=0,
+                affected_tasks=0,
+                affected_events=0,
+                needs_review=needs_review,
+                applicability=applicability.state,
+                applicability_reason=applicability.reason,
+                deadline_at=deadline_at,
+                message=f"《{document.title}》即将截止。",
+                created_at=document.created_at,
             )
-        cards.sort(key=lambda card: card.created_at, reverse=True)
-        return RadarView(items=cards[:limit], total=len(cards))
+        return RadarView(items=collector.items(), total=collector.total)
 
     async def _ensure_claim_version(
         self,
@@ -1459,22 +1801,15 @@ class NoticeRadarService:
                     )
         await session.flush()
 
-    async def _applicability(
-        self, session: AsyncSession, user_id: str, document_id: str
+    @staticmethod
+    def _applicability_from_context(
+        audience: NoticeClaim | None,
+        settings: UserSettings | None,
     ) -> ApplicabilityResult:
-        audience = await session.scalar(
-            select(NoticeClaim).where(
-                NoticeClaim.user_id == user_id,
-                NoticeClaim.document_id == document_id,
-                NoticeClaim.claim_key == "audience",
-                NoticeClaim.extractor_version == EXTRACTOR_VERSION,
-            )
-        )
         if audience is None:
             return ApplicabilityResult("applicable", "No audience restriction was extracted")
         if audience.review_state != "approved":
             return ApplicabilityResult("needs_review", "The audience claim has not been approved")
-        settings = await session.get(UserSettings, user_id)
         if settings is None:
             return ApplicabilityResult(
                 "needs_review", "The user profile needed for audience matching is missing"
@@ -1510,6 +1845,22 @@ class NoticeRadarService:
                 return ApplicabilityResult("not_applicable", "The course does not match")
         return ApplicabilityResult("applicable", "The explicit audience rule matches")
 
+    async def _applicability(
+        self, session: AsyncSession, user_id: str, document_id: str
+    ) -> ApplicabilityResult:
+        audience = await session.scalar(
+            select(NoticeClaim).where(
+                NoticeClaim.user_id == user_id,
+                NoticeClaim.document_id == document_id,
+                NoticeClaim.claim_key == "audience",
+                NoticeClaim.extractor_version == EXTRACTOR_VERSION,
+            )
+        )
+        if audience is None:
+            return self._applicability_from_context(None, None)
+        settings = await session.get(UserSettings, user_id)
+        return self._applicability_from_context(audience, settings)
+
     async def _is_applicable(self, session: AsyncSession, user_id: str, document_id: str) -> bool:
         return (await self._applicability(session, user_id, document_id)).state == "applicable"
 
@@ -1521,7 +1872,24 @@ class NoticeRadarService:
         operation: Literal["execute", "undo"],
     ) -> VerificationReceiptView:
         async with self._factory() as session:
-            plan = await self._owned_plan(session, user_id, plan_id)
+            # This no-op write is deliberately the first database statement. It
+            # serializes verification with execute/undo on PostgreSQL and reserves
+            # SQLite's single writer before any verification snapshot is read.
+            plan = (
+                await session.execute(
+                    update(ImpactMigrationPlan)
+                    .where(
+                        ImpactMigrationPlan.id == plan_id,
+                        ImpactMigrationPlan.user_id == user_id,
+                    )
+                    .values(updated_at=ImpactMigrationPlan.updated_at)
+                    .returning(ImpactMigrationPlan)
+                )
+            ).scalar_one_or_none()
+            if plan is None:
+                await session.rollback()
+                raise NotFoundError("impact migration plan", plan_id)
+
             existing_receipt = _operation_receipt(
                 plan.execute_receipt_json if operation == "execute" else plan.undo_receipt_json,
                 plan.verification_json,
@@ -1530,26 +1898,64 @@ class NoticeRadarService:
             )
             terminal_status = "verified" if operation == "execute" else "undone"
             if existing_receipt and plan.status == terminal_status:
+                await session.rollback()
                 return await self.receipt(user_id, plan_id, operation=operation)
+
+            allowed_statuses = (
+                {"applied", "verification_failed"}
+                if operation == "execute"
+                else {"undo_applied", "undo_verification_failed"}
+            )
+            if plan.status not in allowed_statuses:
+                current_status = plan.status
+                await session.rollback()
+                raise ConflictError(
+                    "migration_verification_state_conflict",
+                    "The migration state changed before verification could complete",
+                    {"operation": operation, "status": current_status},
+                )
+
             items = list(
                 await session.scalars(
-                    select(ImpactMigrationItem).where(ImpactMigrationItem.plan_id == plan.id)
+                    select(ImpactMigrationItem)
+                    .where(ImpactMigrationItem.plan_id == plan.id)
+                    .order_by(ImpactMigrationItem.entity_type, ImpactMigrationItem.entity_id)
                 )
             )
-            results: list[tuple[ImpactMigrationItem, bool, dict[str, Any]]] = []
+            results: list[tuple[ImpactMigrationItem, bool, dict[str, Any], str | None]] = []
             for item in items:
                 entity = await self._owned_entity(
-                    session, user_id, item.entity_type, item.entity_id
+                    session,
+                    user_id,
+                    item.entity_type,
+                    item.entity_id,
+                    for_update=True,
                 )
-                actual = _snapshot(item.entity_type, entity)
                 expected = item.after_snapshot if operation == "execute" else item.before_snapshot
-                verified = _snapshots_match(
+                failure_reason: str | None = None
+                try:
+                    await self._ensure_migration_course_references(
+                        session,
+                        user_id,
+                        item.entity_type,
+                        item.entity_id,
+                        entity.course_id,
+                        (expected or {}).get("course_id"),
+                        for_update=True,
+                    )
+                except ConflictError as error:
+                    if error.code != "migration_course_reference_invalid":
+                        raise
+                    failure_reason = error.code
+                actual = _snapshot(item.entity_type, entity)
+                verified = failure_reason is None and _snapshots_match(
                     expected or {}, actual, ignore_version=operation == "undo"
                 )
-                results.append((item, verified, actual))
+                results.append((item, verified, actual, failure_reason))
+
             all_verified = bool(results) and all(result[1] for result in results)
             now = utc_now()
-            for item, verified, actual in results:
+            for item, verified, actual, failure_reason in results:
                 expected = item.after_snapshot if operation == "execute" else item.before_snapshot
                 item_receipt = {
                     "operation": operation,
@@ -1559,7 +1965,9 @@ class NoticeRadarService:
                     "database_snapshot": actual,
                 }
                 if not verified:
-                    item_receipt["reason"] = "database_snapshot_mismatch"
+                    item_receipt["reason"] = failure_reason or "database_snapshot_mismatch"
+                if failure_reason == "migration_course_reference_invalid":
+                    item_receipt = _redact_course_verification_receipt(item_receipt)
                 item.verification_json = item_receipt
                 if operation == "execute":
                     item.execute_verification_json = item_receipt
@@ -1568,7 +1976,7 @@ class NoticeRadarService:
             receipt = {
                 "operation": operation,
                 "verified": all_verified,
-                "verified_count": sum(1 for _, verified, _ in results if verified),
+                "verified_count": sum(1 for _, verified, _, _ in results if verified),
                 "total_count": len(results),
                 "verified_at": now.isoformat(),
             }
@@ -1597,11 +2005,15 @@ class NoticeRadarService:
         end = _as_datetime(after.get("end_at"))
         if start is None or end is None:
             return []
-        statement = select(CalendarEvent).where(
-            CalendarEvent.user_id == user_id,
-            CalendarEvent.id != event_id,
-            CalendarEvent.start_at < end,
-            CalendarEvent.end_at > start,
+        statement = (
+            select(CalendarEvent)
+            .where(
+                CalendarEvent.user_id == user_id,
+                CalendarEvent.id != event_id,
+                CalendarEvent.start_at < end,
+                CalendarEvent.end_at > start,
+            )
+            .order_by(CalendarEvent.id)
         )
         if for_update:
             statement = statement.with_for_update()
@@ -1677,6 +2089,24 @@ class NoticeRadarService:
                 "An impact or its evidence review changed after preview",
                 {"impact_ids": invalid},
             )
+
+    @staticmethod
+    def _series_view_from_stats(
+        series: NoticeSeries,
+        version_count: int,
+        current_document_id: str | None,
+    ) -> NoticeSeriesView:
+        return NoticeSeriesView(
+            id=series.id,
+            canonical_key=series.canonical_key,
+            normalized_title=series.normalized_title,
+            department=series.department,
+            source_key=series.source_key,
+            version_count=version_count,
+            current_document_id=current_document_id,
+            created_at=series.created_at,
+            updated_at=series.updated_at,
+        )
 
     async def _series_view(self, session: AsyncSession, series: NoticeSeries) -> NoticeSeriesView:
         count = int(
@@ -1848,6 +2278,73 @@ class NoticeRadarService:
         if row is None:
             raise NotFoundError("impact migration plan", plan_id)
         return row
+
+    @staticmethod
+    async def _ensure_migration_idempotency_key_available(
+        session: AsyncSession,
+        user_id: str,
+        plan_id: str,
+        idempotency_key: str,
+        *,
+        operation: Literal["execute", "undo"],
+    ) -> None:
+        key_column = (
+            ImpactMigrationPlan.execution_idempotency_key
+            if operation == "execute"
+            else ImpactMigrationPlan.undo_idempotency_key
+        )
+        existing_plan_id = await session.scalar(
+            select(ImpactMigrationPlan.id).where(
+                ImpactMigrationPlan.user_id == user_id,
+                ImpactMigrationPlan.id != plan_id,
+                key_column == idempotency_key,
+            )
+        )
+        if existing_plan_id is not None:
+            raise ConflictError(
+                "migration_idempotency_key_conflict",
+                "This idempotency key belongs to another migration",
+                {"operation": operation},
+            )
+
+    @staticmethod
+    async def _ensure_migration_course_references(
+        session: AsyncSession,
+        user_id: str,
+        entity_type: str,
+        entity_id: str,
+        *course_ids: object,
+        for_update: bool = False,
+    ) -> None:
+        raw_references = [course_id for course_id in course_ids if course_id is not None]
+        if not raw_references:
+            return
+        if any(
+            not isinstance(course_id, str) or not course_id.strip() for course_id in raw_references
+        ):
+            raise ConflictError(
+                "migration_course_reference_invalid",
+                "An affected object contains an invalid course reference",
+                {"entity_type": entity_type, "entity_id": entity_id},
+            )
+        string_references = set(raw_references)
+        statement = (
+            select(Course.id)
+            .where(
+                Course.user_id == user_id,
+                Course.id.in_(string_references),
+            )
+            .order_by(Course.id)
+        )
+        if for_update:
+            statement = statement.with_for_update(read=True)
+        owned = set(await session.scalars(statement))
+        if owned != string_references:
+            raise ConflictError(
+                "migration_course_reference_invalid",
+                "An affected object references a course outside the migration owner boundary",
+                {"entity_type": entity_type, "entity_id": entity_id},
+            )
 
     async def _owned_entity(
         self,
@@ -2134,18 +2631,33 @@ def _restore_snapshot(entity: Task | CalendarEvent, snapshot: dict[str, Any]) ->
     entity.version += 1
 
 
-def _plan_view(plan: ImpactMigrationPlan, items: list[ImpactMigrationItem]) -> MigrationPlanView:
+def _plan_view(
+    plan: ImpactMigrationPlan,
+    items: list[ImpactMigrationItem],
+    *,
+    item_views: list[MigrationItemView] | None = None,
+    owned_course_ids: set[str] | None = None,
+) -> MigrationPlanView:
+    owned_course_ids = owned_course_ids or set()
     return MigrationPlanView(
         id=plan.id,
         change_set_id=plan.change_set_id,
         status=plan.status,
         risk_level=plan.risk_level,
         required_confirmations=_required_confirmations(plan),
-        conflicts=plan.conflicts_json,
-        items=[_migration_item_view(item) for item in items],
-        verification=plan.verification_json,
-        execute_receipt=plan.execute_receipt_json,
-        undo_receipt=plan.undo_receipt_json,
+        conflicts=_sanitize_public_course_references(plan.conflicts_json, owned_course_ids),
+        items=(
+            item_views
+            if item_views is not None
+            else [
+                _sanitize_migration_item_view(_migration_item_view(item), set()) for item in items
+            ]
+        ),
+        verification=_sanitize_public_course_references(plan.verification_json, owned_course_ids),
+        execute_receipt=_sanitize_public_course_references(
+            plan.execute_receipt_json, owned_course_ids
+        ),
+        undo_receipt=_sanitize_public_course_references(plan.undo_receipt_json, owned_course_ids),
         generation=plan.generation,
         version=plan.version,
         executed_at=plan.executed_at,
@@ -2171,6 +2683,76 @@ def _migration_item_view(item: ImpactMigrationItem) -> MigrationItemView:
     )
 
 
+def _course_reference_candidates(value: Any) -> set[str]:
+    references: set[str] = set()
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if key == "course_id":
+                if isinstance(nested, str) and nested.strip():
+                    references.add(nested)
+            else:
+                references.update(_course_reference_candidates(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            references.update(_course_reference_candidates(nested))
+    return references
+
+
+async def _owned_course_ids_for_payloads(
+    session: AsyncSession,
+    user_id: str,
+    payloads: list[Any],
+) -> set[str]:
+    references: set[str] = set()
+    for payload in payloads:
+        references.update(_course_reference_candidates(payload))
+    if not references:
+        return set()
+    return set(
+        await session.scalars(
+            select(Course.id)
+            .where(
+                Course.user_id == user_id,
+                Course.id.in_(references),
+            )
+            .order_by(Course.id)
+        )
+    )
+
+
+def _sanitize_public_course_references(value: Any, owned_course_ids: set[str]) -> Any:
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, nested in value.items():
+            if key == "course_id":
+                if nested is None or (isinstance(nested, str) and nested in owned_course_ids):
+                    sanitized[key] = nested
+            else:
+                sanitized[key] = _sanitize_public_course_references(nested, owned_course_ids)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_public_course_references(nested, owned_course_ids) for nested in value]
+    return value
+
+
+def _sanitize_migration_item_view(
+    view: MigrationItemView, owned_course_ids: set[str]
+) -> MigrationItemView:
+    return view.model_copy(
+        update={
+            "before": _sanitize_public_course_references(view.before, owned_course_ids),
+            "after": _sanitize_public_course_references(view.after, owned_course_ids),
+            "verification": _sanitize_public_course_references(view.verification, owned_course_ids),
+            "execute_verification": _sanitize_public_course_references(
+                view.execute_verification, owned_course_ids
+            ),
+            "undo_verification": _sanitize_public_course_references(
+                view.undo_verification, owned_course_ids
+            ),
+        }
+    )
+
+
 def _impact_view(item: ImpactCase) -> ImpactCaseView:
     return ImpactCaseView(
         id=item.id,
@@ -2191,12 +2773,40 @@ def _impact_view(item: ImpactCase) -> ImpactCaseView:
     )
 
 
+def _sanitize_impact_view(view: ImpactCaseView, owned_course_ids: set[str]) -> ImpactCaseView:
+    return view.model_copy(
+        update={
+            "current_snapshot": _sanitize_public_course_references(
+                view.current_snapshot, owned_course_ids
+            ),
+            "proposed_patch": _sanitize_public_course_references(
+                view.proposed_patch, owned_course_ids
+            ),
+        }
+    )
+
+
 def _normalize_title(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip().casefold()
 
 
 def _content_hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _redact_course_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    redacted = dict(snapshot)
+    redacted.pop("course_id", None)
+    return redacted
+
+
+def _redact_course_verification_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
+    redacted = dict(receipt)
+    for key in ("expected_snapshot", "database_snapshot"):
+        snapshot = redacted.get(key)
+        if isinstance(snapshot, dict):
+            redacted[key] = _redact_course_snapshot(snapshot)
+    return redacted
 
 
 def _operation_receipt(
