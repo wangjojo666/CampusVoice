@@ -682,6 +682,29 @@ test("02 待办列表在浏览器中完成关键词和状态筛选", async ({ pa
   await expect(page.getByRole("heading", { name: "复习机器学习" })).toBeHidden();
 });
 
+test("03a Modal 在浏览器中闭环焦点并由 Escape 恢复触发按钮", async ({ page }) => {
+  await installApiMocks(page, { tasks: [] });
+  await page.goto("/tasks");
+  const opener = page.getByRole("button", { name: "新增待办" }).first();
+  await opener.click();
+  const dialog = page.getByRole("dialog", { name: "新增待办" });
+  const title = dialog.getByLabel("标题 *");
+  await expect(title).toBeFocused();
+
+  const focusable = dialog.locator(
+    'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])',
+  );
+  const last = focusable.last();
+  await last.focus();
+  await page.keyboard.press("Tab");
+  await expect(dialog.getByRole("button", { name: "关闭" })).toBeFocused();
+  await page.keyboard.press("Shift+Tab");
+  await expect(last).toBeFocused();
+
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await expect(opener).toBeFocused();
+});
 test("03 新建待办经过 UI 核对并携带服务端写挑战", async ({ page }) => {
   await page.emulateMedia({ reducedMotion: "reduce" });
   const state = await installApiMocks(page, { tasks: [] });
