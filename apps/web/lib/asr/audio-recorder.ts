@@ -153,9 +153,11 @@ export class PcmAudioRecorder {
         requestId?: number;
       }>,
     ) => {
-      if (event.data.type === "level" && typeof event.data.level === "number")
+      const active = !interrupted && (this.lifecycle === lifecycle || this.pendingDrain !== null);
+      if (active && event.data.type === "level" && typeof event.data.level === "number")
         handlers.onLevel(event.data.level);
-      if (event.data.type === "audio" && event.data.buffer) handlers.onChunk(event.data.buffer);
+      if (active && event.data.type === "audio" && event.data.buffer)
+        handlers.onChunk(event.data.buffer);
       if (
         event.data.type === "drained" &&
         typeof event.data.requestId === "number" &&
@@ -209,8 +211,8 @@ export class PcmAudioRecorder {
   }
 
   async resume() {
-    await this.context?.resume();
     this.intentionalSuspension = false;
+    await this.context?.resume();
   }
 
   stop(): Promise<void> {
