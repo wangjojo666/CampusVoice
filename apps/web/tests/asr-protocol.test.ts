@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { AsrWebSocketClient } from "@/lib/asr/asr-client";
+import { AsrWebSocketClient, resolveAsrWebSocketUrl } from "@/lib/asr/asr-client";
 
 class FakeWebSocket {
   static readonly OPEN = 1;
@@ -48,6 +48,30 @@ afterEach(() => {
   FakeWebSocket.instance = null;
 });
 
+describe("ASR WebSocket URL security", () => {
+  it.each([
+    ["WS://voice.example/ws/asr", "http://app.example/tasks", "ws://voice.example/ws/asr"],
+    ["/ws/asr", "https://app.example/tasks", "wss://app.example/ws/asr"],
+    ["https://app.example/ws/asr/", "https://app.example/tasks", "wss://app.example/ws/asr/"],
+    ["WSS://voice.example/ws/asr", "https://app.example/tasks", "wss://voice.example/ws/asr"],
+  ])("normalizes %s against %s", (configured, pageUrl, expected) => {
+    expect(resolveAsrWebSocketUrl(configured, pageUrl)).toBe(expected);
+  });
+
+  it("rejects mixed content and credentials in the URL", () => {
+    expect(() =>
+      resolveAsrWebSocketUrl("ws://voice.example/ws/asr", "https://app.example/tasks"),
+    ).toThrow("secure WSS");
+    for (const parameter of ["token", "access_token", "ticket"]) {
+      expect(() =>
+        resolveAsrWebSocketUrl(
+          `wss://voice.example/ws/asr?${parameter}=long-lived-secret`,
+          "https://app.example/tasks",
+        ),
+      ).toThrow("must not be included");
+    }
+  });
+});
 describe("ASR WebSocket protocol", () => {
   it("starts the real server protocol with 16 kHz mono PCM and configured hotwords", async () => {
     vi.stubGlobal("WebSocket", FakeWebSocket);
