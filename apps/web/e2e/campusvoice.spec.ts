@@ -1078,3 +1078,105 @@ test("10b AudioWorklet drain 超时后保持失败状态并仍释放资源", asy
   const orderedCleanup = cleanupEvents.map((event) => telemetry.events.indexOf(event));
   expect(orderedCleanup).toEqual([...orderedCleanup].sort((left, right) => left - right));
 });
+
+test("PWA manifest declares install and icon boundaries", async ({ page }) => {
+  await installApiMocks(page);
+  const response = await page.request.get("/manifest.webmanifest");
+  expect(response.ok()).toBeTruthy();
+  const manifest = await response.json();
+  expect(manifest).toMatchObject({
+    name: "声程 CampusVoice",
+    short_name: "声程",
+    start_url: "/",
+    scope: "/",
+    display: "standalone",
+    theme_color: "#0e7f6d",
+    background_color: "#f7faf9",
+  });
+  expect(manifest.icons).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ sizes: "192x192", type: "image/png" }),
+      expect.objectContaining({ sizes: "512x512", purpose: "any" }),
+      expect.objectContaining({ sizes: "512x512", purpose: "maskable" }),
+    ]),
+  );
+});
+
+test("mobile device projects expose settings without horizontal overflow", async ({
+  page,
+}, testInfo) => {
+  test.skip(
+    ![
+      "mobile-320-chromium",
+      "mobile-360-chromium",
+      "mobile-375-webkit",
+      "android-pixel-7",
+      "iphone-13-webkit",
+      "tablet-768-webkit",
+    ].includes(testInfo.project.name),
+    "mobile project only",
+  );
+  await installApiMocks(page, {
+    tasks: [
+      task(
+        "task-long",
+        "超长课程名称与异常Unicode（数据结构）🧭／／／不会推动页面产生意外横向滚动",
+      ),
+    ],
+  });
+  await page.goto("/tasks");
+  await expect(page.getByRole("navigation", { name: "移动端主导航" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "设置" })).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(() => ({
+        viewport: document.documentElement.clientWidth,
+        content: document.documentElement.scrollWidth,
+      })),
+    )
+    .toEqual(
+      expect.objectContaining({
+        viewport: page.viewportSize()?.width,
+        content: page.viewportSize()?.width,
+      }),
+    );
+
+  const nav = await page.getByRole("navigation", { name: "移动端主导航" }).boundingBox();
+  const main = await page.locator("#main-content").boundingBox();
+  expect(nav).not.toBeNull();
+  expect(main).not.toBeNull();
+  const mainPaddingBottom = await page
+    .locator("#main-content")
+    .evaluate((element) => Number.parseFloat(getComputedStyle(element).paddingBottom));
+  expect(mainPaddingBottom).toBeGreaterThanOrEqual(nav?.height ?? 0);
+});
+
+test("mobile calendar uses compact day controls and reachable modal actions", async ({
+  page,
+}, testInfo) => {
+  test.skip(
+    ![
+      "mobile-320-chromium",
+      "mobile-360-chromium",
+      "mobile-375-webkit",
+      "android-pixel-7",
+      "iphone-13-webkit",
+    ].includes(testInfo.project.name),
+    "mobile project only",
+  );
+  await installApiMocks(page);
+  await page.goto("/calendar");
+  await expect(page.getByRole("button", { name: "日" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "周" })).toHaveCount(0);
+
+  await page.getByRole("button", { name: "新建日程" }).first().click();
+  const dialog = page.getByRole("dialog", { name: "新建日程" });
+  await expect(dialog).toBeVisible();
+  const cancel = dialog.getByRole("button", { name: "取消" });
+  await cancel.scrollIntoViewIfNeeded();
+  const box = await cancel.boundingBox();
+  expect(box).not.toBeNull();
+  expect((box?.y ?? 0) + (box?.height ?? 0)).toBeLessThanOrEqual(
+    page.viewportSize()?.height ?? Number.POSITIVE_INFINITY,
+  );
+});

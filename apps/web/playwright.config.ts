@@ -17,15 +17,34 @@ export default defineConfig({
     screenshot: "only-on-failure",
     video: "retain-on-failure",
   },
-  projects: [
-    {
-      name: channel ?? "chromium",
-      use: {
-        ...devices["Desktop Chrome"],
-        ...(channel ? { channel } : {}),
-      },
-    },
-  ],
+  projects: channel
+    ? [
+        {
+          name: channel,
+          use: { ...devices["Desktop Chrome"], channel },
+        },
+      ]
+    : [
+        { name: "desktop-chromium", use: { ...devices["Desktop Chrome"] } },
+        {
+          name: "mobile-320-chromium",
+          use: { ...devices["Pixel 7"], viewport: { width: 320, height: 720 } },
+        },
+        {
+          name: "mobile-360-chromium",
+          use: { ...devices["Pixel 7"], viewport: { width: 360, height: 800 } },
+        },
+        {
+          name: "mobile-375-webkit",
+          use: { ...devices["iPhone 13"], viewport: { width: 375, height: 812 } },
+        },
+        { name: "android-pixel-7", use: { ...devices["Pixel 7"] } },
+        { name: "iphone-13-webkit", use: { ...devices["iPhone 13"] } },
+        {
+          name: "tablet-768-webkit",
+          use: { ...devices["iPad (gen 7)"], viewport: { width: 768, height: 1024 } },
+        },
+      ],
   webServer: {
     command: "pnpm dev --hostname 127.0.0.1 --port 3100",
     url: "http://127.0.0.1:3100",
