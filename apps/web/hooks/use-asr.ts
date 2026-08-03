@@ -155,10 +155,8 @@ export function useAsr() {
         );
       if (!active) return Promise.resolve();
 
-      const operation = cleanup().then(() => {
-        if (!mountedRef.current || interruptionRef.current !== operation) return;
-        dispatch({ type: "FAIL", code, message, retryable: true });
-      });
+      if (mountedRef.current) dispatch({ type: "FAIL", code, message, retryable: true });
+      const operation = cleanup();
       interruptionRef.current = operation;
       void operation.finally(() => {
         if (interruptionRef.current === operation) interruptionRef.current = null;
@@ -175,6 +173,9 @@ export function useAsr() {
         "页面已进入后台或锁屏，本次录音已停止。返回后请手动重新开始。",
       );
     };
+    const pageShown = (event: PageTransitionEvent) => {
+      if (event.persisted) pageHidden();
+    };
     const visibilityChanged = () => {
       if (document.visibilityState === "hidden") pageHidden();
     };
@@ -188,11 +189,13 @@ export function useAsr() {
     document.addEventListener("visibilitychange", visibilityChanged);
     window.addEventListener("pagehide", pageHidden);
     window.addEventListener("beforeunload", pageHidden);
+    window.addEventListener("pageshow", pageShown);
     window.addEventListener("offline", offline);
     return () => {
       document.removeEventListener("visibilitychange", visibilityChanged);
       window.removeEventListener("pagehide", pageHidden);
       window.removeEventListener("beforeunload", pageHidden);
+      window.removeEventListener("pageshow", pageShown);
       window.removeEventListener("offline", offline);
     };
   }, [interruptActiveSession]);

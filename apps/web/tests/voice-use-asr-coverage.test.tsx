@@ -889,6 +889,51 @@ describe("useAsr orchestration", () => {
     unmount();
   });
 
+  it("fails closed immediately across BFCache restore while asynchronous cleanup is pending", async () => {
+    const pendingCleanup = deferred();
+    const { result, unmount } = renderHook(() => useAsr());
+    await act(async () => result.current.start());
+    mocks.recorderStop.mockReturnValueOnce(pendingCleanup.promise);
+
+    act(() => window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true })));
+    expect(result.current.state.phase).toBe("error");
+    expect(result.current.state.error?.code).toBe("page_hidden");
+
+    act(() => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+    expect(mocks.recorderStart).toHaveBeenCalledOnce();
+    expect(mocks.clientConstructed).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      pendingCleanup.resolve();
+      await Promise.resolve();
+    });
+    expect(result.current.state.phase).toBe("error");
+    expect(mocks.recorderStart).toHaveBeenCalledOnce();
+    unmount();
+  });
+
+  it("keeps a reset newer than simultaneous page and network interruptions", async () => {
+    const pendingCleanup = deferred();
+    const { result, unmount } = renderHook(() => useAsr());
+    await act(async () => result.current.start());
+    mocks.recorderStop.mockReturnValueOnce(pendingCleanup.promise);
+
+    act(() => {
+      window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+      window.dispatchEvent(new Event("offline"));
+    });
+    const resetOperation = result.current.reset();
+    await act(async () => {
+      pendingCleanup.resolve();
+      await resetOperation;
+    });
+
+    expect(result.current.state).toMatchObject({ phase: "idle", error: null });
+    act(() => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+    expect(result.current.state).toMatchObject({ phase: "idle", error: null });
+    expect(mocks.recorderStart).toHaveBeenCalledOnce();
+    unmount();
+  });
   it("stays stopped after reconnecting until a new user start", async () => {
     const { result, unmount } = renderHook(() => useAsr());
     await act(async () => result.current.start());
