@@ -31,7 +31,7 @@ jobs:
           test -z "$(git status --porcelain --untracked-files=all)"
       - run: pnpm test
       - run: pnpm test:coverage
-      - run: pnpm --filter @campusvoice/web exec playwright install --with-deps chromium
+      - run: pnpm --filter @campusvoice/web exec playwright install --with-deps chromium webkit
       - run: pnpm test:e2e
       - run: pnpm build
 
