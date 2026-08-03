@@ -33,7 +33,7 @@ export function Modal({
   return createPortal(
     <div
       ref={backdropRef}
-      className="fixed inset-0 z-50 flex items-end justify-center bg-ink-950/35 p-0 backdrop-blur-sm sm:items-center sm:p-5"
+      className="modal-backdrop fixed inset-0 z-50 flex min-h-dvh items-end justify-center bg-ink-950/35 p-0 backdrop-blur-sm sm:items-center sm:p-5"
       onMouseDown={onClose}
     >
       <section
@@ -43,10 +43,10 @@ export function Modal({
         aria-labelledby={titleId}
         aria-describedby={description ? descriptionId : undefined}
         tabIndex={-1}
-        className={`max-h-[92vh] w-full overflow-y-auto rounded-t-3xl bg-white p-5 shadow-2xl sm:rounded-3xl sm:p-6 ${wide ? "max-w-3xl" : "max-w-xl"}`}
+        className={`modal-panel flex w-full min-w-0 flex-col overflow-hidden rounded-t-3xl bg-white p-5 shadow-2xl sm:rounded-3xl sm:p-6 ${wide ? "max-w-3xl" : "max-w-xl"}`}
         onMouseDown={(event) => event.stopPropagation()}
       >
-        <header className="mb-5 flex items-start justify-between gap-4">
+        <header className="mb-5 flex shrink-0 items-start justify-between gap-4">
           <div>
             <h2 id={titleId} className="text-xl font-extrabold tracking-tight text-ink-950">
               {title}
@@ -61,12 +61,14 @@ export function Modal({
             type="button"
             onClick={onClose}
             aria-label="关闭"
-            className="btn-ghost !size-9 !min-h-0 !p-0"
+            className="btn-ghost !min-h-11 !min-w-11 !p-0"
           >
             <X size={19} />
           </button>
         </header>
-        {children}
+        <div className="modal-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain px-0.5">
+          {children}
+        </div>
       </section>
     </div>,
     document.body,

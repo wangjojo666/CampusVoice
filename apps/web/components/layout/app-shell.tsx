@@ -8,6 +8,7 @@ import {
   ListTodo,
   LogOut,
   Mic2,
+  Settings,
   Waves,
 } from "lucide-react";
 import Link from "next/link";
@@ -100,14 +101,14 @@ export function AppShell({
   }
 
   return (
-    <div className="min-h-screen lg:grid lg:grid-cols-[264px_minmax(0,1fr)]">
+    <div className="min-h-dvh lg:grid lg:grid-cols-[264px_minmax(0,1fr)]">
       <a
         href="#main-content"
         className="sr-only fixed top-3 left-3 z-50 rounded-xl bg-ink-950 px-4 py-3 font-bold text-white focus:fixed focus:not-sr-only"
       >
         跳到主要内容
       </a>
-      <aside className="sticky top-0 hidden h-screen border-r border-mist-200/80 bg-white/72 px-5 py-6 backdrop-blur-xl lg:flex lg:flex-col">
+      <aside className="sticky top-0 hidden h-dvh border-r border-mist-200/80 bg-white/72 px-5 py-6 backdrop-blur-xl lg:flex lg:flex-col">
         <Link href="/" className="mb-9 flex items-center gap-3 rounded-xl px-2 py-1">
           <span className="flex size-11 items-center justify-center rounded-2xl bg-teal-600 text-white shadow-[0_8px_24px_rgba(14,127,109,.2)]">
             <Waves size={23} strokeWidth={2.3} />
@@ -171,14 +172,22 @@ export function AppShell({
       </aside>
 
       <div className="min-w-0">
-        <header className="sticky top-0 z-30 flex h-16 items-center justify-between border-b border-mist-200/80 bg-white/80 px-4 backdrop-blur-xl lg:hidden">
+        <header className="mobile-app-header sticky top-0 z-30 flex items-center justify-between border-b border-mist-200/80 bg-white/80 px-4 backdrop-blur-xl lg:hidden">
           <Link href="/" className="flex items-center gap-2.5">
             <span className="flex size-9 items-center justify-center rounded-xl bg-teal-600 text-white">
               <Waves size={20} />
             </span>
             <span className="font-extrabold tracking-tight">声程</span>
           </Link>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5">
+            <Link
+              href="/settings"
+              aria-label="设置"
+              title="设置"
+              className="flex min-h-11 min-w-11 items-center justify-center rounded-xl border border-mist-200 bg-white/70 text-ink-600"
+            >
+              <Settings size={19} />
+            </Link>
             <HealthStatus compact />
             {oidcEnabled ? (
               <button
@@ -187,7 +196,7 @@ export function AppShell({
                 title="退出登录"
                 onClick={() => void logout()}
                 disabled={loggingOut}
-                className="flex size-9 items-center justify-center rounded-xl border border-mist-200 text-ink-500"
+                className="flex min-h-11 min-w-11 items-center justify-center rounded-xl border border-mist-200 text-ink-500"
               >
                 <LogOut size={17} />
               </button>
@@ -197,7 +206,7 @@ export function AppShell({
         <main
           id="main-content"
           tabIndex={-1}
-          className="mx-auto w-full max-w-[1480px] px-4 py-6 pb-28 outline-none sm:px-6 lg:px-9 lg:py-9 lg:pb-12"
+          className="mobile-main-content mx-auto w-full max-w-[1480px] min-w-0 break-words px-4 py-6 outline-none sm:px-6 lg:px-9 lg:py-9 lg:pb-12"
         >
           {authError ? (
             <div
@@ -239,7 +248,7 @@ export function AppShell({
 
       <nav
         aria-label="移动端主导航"
-        className="fixed inset-x-3 bottom-3 z-40 grid grid-cols-5 rounded-2xl border border-mist-200 bg-white/94 p-1.5 shadow-[0_16px_45px_rgba(18,27,34,.18)] backdrop-blur-xl lg:hidden"
+        className="mobile-bottom-nav fixed inset-x-0 bottom-0 z-40 grid grid-cols-5 rounded-t-2xl border border-mist-200 bg-white/94 px-1.5 pt-1.5 shadow-[0_16px_45px_rgba(18,27,34,.18)] backdrop-blur-xl lg:hidden"
       >
         {navigation.map(({ href, label, icon: Icon }) => {
           const active = isActive(pathname, href);

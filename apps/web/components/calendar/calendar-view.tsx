@@ -7,6 +7,7 @@ import dayGridPlugin from "@fullcalendar/daygrid";
 import interactionPlugin from "@fullcalendar/interaction";
 import FullCalendar from "@fullcalendar/react";
 import timeGridPlugin from "@fullcalendar/timegrid";
+import { useEffect, useRef, useState } from "react";
 
 import { fromLocalInputValue, toLocalInputValue } from "@/lib/format";
 import { useUserSettings } from "@/lib/user-settings";
@@ -27,9 +28,30 @@ export function CalendarView({
   onRangeChange: (range: CalendarRange) => void;
 }>) {
   const userSettings = useUserSettings();
+  const calendarRef = useRef<FullCalendar>(null);
+  const [compact, setCompact] = useState(
+    () =>
+      typeof window !== "undefined" && Boolean(window.matchMedia?.("(max-width: 640px)").matches),
+  );
+
+  useEffect(() => {
+    const query = window.matchMedia?.("(max-width: 640px)");
+    if (!query) return;
+    const update = () => setCompact(query.matches);
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
+
+  useEffect(() => {
+    const api = calendarRef.current?.getApi();
+    if (compact && api?.view.type === "timeGridWeek") api.changeView("dayGridDay");
+  }, [compact]);
+
   const byId = new Map(events.map((event) => [event.id, event]));
   return (
     <FullCalendar
+      ref={calendarRef}
       plugins={[dayGridPlugin, timeGridPlugin, interactionPlugin]}
       initialView="dayGridMonth"
       locale={zhCnLocale}
@@ -38,12 +60,12 @@ export function CalendarView({
       nowIndicator
       selectable
       dayMaxEvents
-      headerToolbar={{
-        left: "prev,next today",
-        center: "title",
-        right: "dayGridMonth,timeGridWeek",
-      }}
-      buttonText={{ today: "今天", month: "月", week: "周" }}
+      headerToolbar={
+        compact
+          ? { left: "prev,title,next", center: "", right: "today dayGridMonth,dayGridDay" }
+          : { left: "prev,next today", center: "title", right: "dayGridMonth,timeGridWeek" }
+      }
+      buttonText={{ today: "今天", month: "月", week: "周", day: "日" }}
       events={events.map((event) => ({
         id: event.id,
         title: event.title,

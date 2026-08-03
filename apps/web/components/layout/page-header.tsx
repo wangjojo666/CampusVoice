@@ -10,8 +10,8 @@ export function PageHeader({
   actions?: React.ReactNode;
 }>) {
   return (
-    <header className="mb-7 flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
-      <div className="max-w-3xl">
+    <header className="mb-7 flex min-w-0 flex-col justify-between gap-4 sm:flex-row sm:items-end">
+      <div className="min-w-0 max-w-3xl">
         {eyebrow ? (
           <p className="mb-2 text-xs font-bold tracking-[0.14em] text-teal-600 uppercase">
             {eyebrow}
@@ -24,7 +24,9 @@ export function PageHeader({
           {description}
         </p>
       </div>
-      {actions ? <div className="flex shrink-0 flex-wrap gap-2">{actions}</div> : null}
+      {actions ? (
+        <div className="flex w-full min-w-0 flex-wrap gap-2 sm:w-auto sm:shrink-0">{actions}</div>
+      ) : null}
     </header>
   );
 }
