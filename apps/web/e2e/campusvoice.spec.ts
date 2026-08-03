@@ -1,6 +1,28 @@
 import { expect, test, type Page, type Request } from "@playwright/test";
 
 const now = new Date();
+
+const browserFailures = new WeakMap<Page, string[]>();
+
+test.beforeEach(async ({ page }) => {
+  const failures: string[] = [];
+  browserFailures.set(page, failures);
+  page.on("console", (message) => {
+    if (message.type() === "error" || message.type() === "warning") {
+      failures.push(`console.${message.type()}: ${message.text()}`);
+    }
+  });
+  page.on("pageerror", (error) => failures.push(`pageerror: ${error.message}`));
+});
+
+test.afterEach(async ({ page }) => {
+  expect(browserFailures.get(page) ?? [], "browser console/page errors").toEqual([]);
+});
+
+function pngDimensions(bytes: Buffer) {
+  expect(Array.from(bytes.subarray(0, 8))).toEqual([137, 80, 78, 71, 13, 10, 26, 10]);
+  return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
+}
 const nowIso = now.toISOString();
 const laterIso = new Date(now.getTime() + 60 * 60_000).toISOString();
 
@@ -1079,11 +1101,34 @@ test("10b AudioWorklet drain 超时后保持失败状态并仍释放资源", asy
   expect(orderedCleanup).toEqual([...orderedCleanup].sort((left, right) => left - right));
 });
 
-test("PWA manifest declares install and icon boundaries", async ({ page }) => {
-  await installApiMocks(page);
-  const response = await page.request.get("/manifest.webmanifest");
-  expect(response.ok()).toBeTruthy();
-  const manifest = await response.json();
+test("PWA runtime assets, metadata, safe area, and offline boundaries are production-valid", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 375, height: 812 });
+  await page.addInitScript(() => {
+    const original = window.matchMedia.bind(window);
+    window.matchMedia = (query: string) =>
+      query === "(display-mode: standalone)"
+        ? ({
+            matches: true,
+            media: query,
+            onchange: null,
+            addEventListener() {},
+            removeEventListener() {},
+            addListener() {},
+            removeListener() {},
+            dispatchEvent: () => true,
+          } as MediaQueryList)
+        : original(query);
+  });
+  await installApiMocks(page, { tasks: [] });
+
+  const manifestResponse = await page.request.get("/manifest.webmanifest");
+  expect(manifestResponse.status()).toBe(200);
+  expect(manifestResponse.headers()["content-type"]).toMatch(
+    /^application\/(?:manifest\+json|json)(?:;|$)/,
+  );
+  const manifest = await manifestResponse.json();
   expect(manifest).toMatchObject({
     name: "声程 CampusVoice",
     short_name: "声程",
@@ -1093,13 +1138,89 @@ test("PWA manifest declares install and icon boundaries", async ({ page }) => {
     theme_color: "#0e7f6d",
     background_color: "#f7faf9",
   });
-  expect(manifest.icons).toEqual(
-    expect.arrayContaining([
-      expect.objectContaining({ sizes: "192x192", type: "image/png" }),
-      expect.objectContaining({ sizes: "512x512", purpose: "any" }),
-      expect.objectContaining({ sizes: "512x512", purpose: "maskable" }),
-    ]),
+
+  for (const expected of [
+    { path: "/pwa/icon-192", width: 192, height: 192 },
+    { path: "/pwa/icon-512", width: 512, height: 512 },
+    { path: "/pwa/maskable-512", width: 512, height: 512 },
+  ]) {
+    const response = await page.request.get(expected.path);
+    expect(response.status()).toBe(200);
+    expect(response.headers()["content-type"]).toMatch(/^image\/png(?:;|$)/);
+    const bytes = await response.body();
+    expect(bytes.byteLength).toBeGreaterThan(100);
+    expect(pngDimensions(bytes)).toEqual({ width: expected.width, height: expected.height });
+  }
+
+  await page.goto("/tasks");
+  await expect(page.locator('link[rel="manifest"]')).toHaveAttribute(
+    "href",
+    "/manifest.webmanifest",
   );
+  await expect(page.locator('meta[name="theme-color"]')).toHaveAttribute("content", "#0e7f6d");
+  await expect(page.locator('meta[name="viewport"]')).toHaveAttribute(
+    "content",
+    /viewport-fit=cover/,
+  );
+  await expect(page.locator('meta[name="apple-mobile-web-app-capable"]')).toHaveAttribute(
+    "content",
+    "yes",
+  );
+  await expect(page.locator('link[rel="apple-touch-icon"]')).toHaveAttribute(
+    "href",
+    "/pwa/icon-192",
+  );
+
+  const maskableBounds = await page.evaluate(async () => {
+    const image = new Image();
+    image.src = "/pwa/maskable-512";
+    await image.decode();
+    const canvas = document.createElement("canvas");
+    canvas.width = image.naturalWidth;
+    canvas.height = image.naturalHeight;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("2D canvas is unavailable");
+    context.drawImage(image, 0, 0);
+    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    const background = Array.from(pixels.subarray(0, 4));
+    let minX = canvas.width;
+    let minY = canvas.height;
+    let maxX = -1;
+    let maxY = -1;
+    for (let y = 0; y < canvas.height; y += 1) {
+      for (let x = 0; x < canvas.width; x += 1) {
+        const offset = (y * canvas.width + x) * 4;
+        const distance =
+          Math.abs(pixels[offset]! - background[0]!) +
+          Math.abs(pixels[offset + 1]! - background[1]!) +
+          Math.abs(pixels[offset + 2]! - background[2]!);
+        if (distance < 24) continue;
+        minX = Math.min(minX, x);
+        minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x);
+        maxY = Math.max(maxY, y);
+      }
+    }
+    return { minX, minY, maxX, maxY, size: canvas.width };
+  });
+  expect(maskableBounds.minX).toBeGreaterThanOrEqual(maskableBounds.size * 0.1);
+  expect(maskableBounds.minY).toBeGreaterThanOrEqual(maskableBounds.size * 0.1);
+  expect(maskableBounds.maxX).toBeLessThanOrEqual(maskableBounds.size * 0.9);
+  expect(maskableBounds.maxY).toBeLessThanOrEqual(maskableBounds.size * 0.9);
+
+  expect(
+    await page.evaluate(
+      async () => (await navigator.serviceWorker?.getRegistrations())?.length ?? 0,
+    ),
+  ).toBe(0);
+  expect(await page.locator('script[src*="service-worker"],script[src*="sw.js"]').count()).toBe(0);
+  await expect(page.getByRole("navigation", { name: "移动端主导航" })).toBeVisible();
+  await page.getByRole("button", { name: "新增待办" }).first().click();
+  const dialog = page.getByRole("dialog", { name: "新增待办" });
+  const dialogBox = await dialog.boundingBox();
+  expect(dialogBox).not.toBeNull();
+  expect((dialogBox?.y ?? 0) + (dialogBox?.height ?? 0)).toBeLessThanOrEqual(812);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(375);
 });
 
 test("mobile device projects expose settings without horizontal overflow", async ({
