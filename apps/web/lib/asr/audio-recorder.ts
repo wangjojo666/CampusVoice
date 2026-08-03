@@ -1,6 +1,7 @@
 export interface RecorderHandlers {
   onChunk: (chunk: ArrayBuffer) => void;
   onLevel: (level: number) => void;
+  onInterruption?: (code: string, message: string) => void;
 }
 
 const DRAIN_TIMEOUT_MS = 2_000;
@@ -12,6 +13,7 @@ interface RecorderResources {
   source: MediaStreamAudioSourceNode | null;
   worklet: AudioWorkletNode | null;
   mutedOutput: GainNode | null;
+  listenerCleanups: Array<() => void>;
 }
 
 function withTimeout<T>(label: string, timeoutMs: number, operation: () => Promise<T>): Promise<T> {
@@ -48,6 +50,8 @@ export class PcmAudioRecorder {
     complete: () => void;
   } | null = null;
   private lifecycle = 0;
+  private listenerCleanups: Array<() => void> = [];
+  private intentionalSuspension = false;
 
   async start(handlers: RecorderHandlers) {
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -76,6 +80,59 @@ export class PcmAudioRecorder {
     this.stream = stream;
     const context = new AudioContext({ latencyHint: "interactive" });
     this.context = context;
+    this.intentionalSuspension = false;
+
+    let interrupted = false;
+    const interrupt = (code: string, message: string) => {
+      if (interrupted || this.lifecycle !== lifecycle) return;
+      interrupted = true;
+      handlers.onInterruption?.(code, message);
+    };
+    const listen = (
+      target: {
+        addEventListener?: EventTarget["addEventListener"];
+        removeEventListener?: EventTarget["removeEventListener"];
+      },
+      type: string,
+      handler: EventListener,
+    ) => {
+      const addEventListener = target.addEventListener;
+      const removeEventListener = target.removeEventListener;
+      if (typeof addEventListener !== "function" || typeof removeEventListener !== "function")
+        return;
+      addEventListener.call(target, type, handler);
+      this.listenerCleanups.push(() => removeEventListener.call(target, type, handler));
+    };
+    for (const track of stream.getTracks()) {
+      listen(track, "mute", () =>
+        interrupt("microphone_muted", "麦克风采集已中断。本次录音已停止，请返回前台后重新开始。"),
+      );
+      listen(track, "unmute", () =>
+        interrupt(
+          "microphone_state_changed",
+          "麦克风状态发生变化。为避免续接旧录音，请手动重新开始。",
+        ),
+      );
+      listen(track, "ended", () =>
+        interrupt("microphone_ended", "麦克风权限或设备连接已结束，本次录音未完成。"),
+      );
+    }
+    listen(navigator.mediaDevices, "devicechange", () =>
+      interrupt("audio_device_changed", "音频设备发生变化。本次录音已停止，请选择设备后重新开始。"),
+    );
+    listen(context, "statechange", () => {
+      const contextState = context.state as string;
+      if (
+        !this.intentionalSuspension &&
+        ["suspended", "interrupted", "closed"].includes(contextState)
+      ) {
+        interrupt(
+          "audio_context_interrupted",
+          "浏览器中断了音频处理。本次录音已停止，请手动重新开始。",
+        );
+      }
+    });
+
     await context.audioWorklet.addModule("/audio-processor.js");
     if (this.lifecycle !== lifecycle || this.context !== context || this.stream !== stream) {
       throw startCancelled();
@@ -147,11 +204,13 @@ export class PcmAudioRecorder {
   }
 
   async pause() {
+    this.intentionalSuspension = true;
     await this.context?.suspend();
   }
 
   async resume() {
     await this.context?.resume();
+    this.intentionalSuspension = false;
   }
 
   stop(): Promise<void> {
@@ -168,12 +227,15 @@ export class PcmAudioRecorder {
       source: this.source,
       worklet: this.worklet,
       mutedOutput: this.mutedOutput,
+      listenerCleanups: this.listenerCleanups,
     };
     this.context = null;
     this.stream = null;
     this.source = null;
     this.worklet = null;
     this.mutedOutput = null;
+    this.listenerCleanups = [];
+    this.intentionalSuspension = false;
     return resources;
   }
 
@@ -183,6 +245,7 @@ export class PcmAudioRecorder {
     source,
     worklet,
     mutedOutput,
+    listenerCleanups,
   }: RecorderResources) {
     const errors: unknown[] = [];
 
@@ -209,6 +272,29 @@ export class PcmAudioRecorder {
       }
     }
 
+    for (const cleanup of listenerCleanups) {
+      try {
+        cleanup();
+      } catch (reason) {
+        errors.push(reason);
+      }
+    }
+
+    let tracks: MediaStreamTrack[] = [];
+    if (stream) {
+      try {
+        tracks = stream.getTracks();
+      } catch (reason) {
+        errors.push(reason);
+      }
+    }
+    for (const track of tracks) {
+      try {
+        track.stop();
+      } catch (reason) {
+        errors.push(reason);
+      }
+    }
     const capture = (operation: () => void) => {
       try {
         operation();
@@ -222,13 +308,6 @@ export class PcmAudioRecorder {
         worklet.port.onmessage = null;
       });
     }
-    let tracks: MediaStreamTrack[] = [];
-    if (stream) {
-      capture(() => {
-        tracks = stream.getTracks();
-      });
-    }
-    for (const track of tracks) capture(() => track.stop());
     if (source) capture(() => source.disconnect());
     if (worklet) capture(() => worklet.disconnect());
     if (mutedOutput) capture(() => mutedOutput.disconnect());

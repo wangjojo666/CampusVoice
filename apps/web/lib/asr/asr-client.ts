@@ -13,11 +13,24 @@ export interface AsrCloseInfo {
   wasClean: boolean;
 }
 
+function assertSecureAsrUrl(value: string) {
+  if (
+    typeof window !== "undefined" &&
+    window.location.protocol === "https:" &&
+    value.startsWith("ws:")
+  ) {
+    throw new Error("HTTPS 页面必须使用 WSS 语音连接");
+  }
+  return value;
+}
+
 function defaultAsrUrl() {
   const explicit = process.env.NEXT_PUBLIC_ASR_WS_URL;
-  if (explicit) return explicit;
-  const httpBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
-  return `${httpBase.replace(/^http/, "ws").replace(/\/$/, "")}/ws/asr`;
+  if (explicit) return assertSecureAsrUrl(explicit);
+  const httpBase =
+    process.env.NEXT_PUBLIC_API_BASE_URL ??
+    (typeof window !== "undefined" ? window.location.origin : "http://127.0.0.1:8000");
+  return assertSecureAsrUrl(`${httpBase.replace(/^http/, "ws").replace(/\/$/, "")}/ws/asr`);
 }
 
 function normalizeMessage(value: unknown): AsrServerMessage | null {
