@@ -59,9 +59,14 @@ export function useAsr() {
   const recorderRef = useRef<PcmAudioRecorder | null>(null);
   const clientRef = useRef<AsrWebSocketClient | null>(null);
   const mountedRef = useRef(true);
+  const stateRef = useRef(state);
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
   const lifecycleRef = useRef(0);
   const stopOperationRef = useRef<StopOperation | null>(null);
   const resourceCleanupRef = useRef<Promise<void> | null>(null);
+  const interruptionRef = useRef<Promise<void> | null>(null);
 
   const registerResourceCleanup = useCallback(
     (recorder: PcmAudioRecorder | null, stopOperation: Promise<void> | null) => {
@@ -139,6 +144,62 @@ export function useAsr() {
     return registerResourceCleanup(recorder, pendingStop);
   }, [registerResourceCleanup]);
 
+  const interruptActiveSession = useCallback(
+    (code: string, message: string) => {
+      if (interruptionRef.current) return interruptionRef.current;
+      const active =
+        recorderRef.current !== null ||
+        clientRef.current !== null ||
+        ["requesting_permission", "connecting", "recording", "paused", "finalizing"].includes(
+          stateRef.current.phase,
+        );
+      if (!active) return Promise.resolve();
+
+      if (mountedRef.current) dispatch({ type: "FAIL", code, message, retryable: true });
+      const operation = cleanup();
+      interruptionRef.current = operation;
+      void operation.finally(() => {
+        if (interruptionRef.current === operation) interruptionRef.current = null;
+      });
+      return operation;
+    },
+    [cleanup],
+  );
+
+  useEffect(() => {
+    const pageHidden = () => {
+      void interruptActiveSession(
+        "page_hidden",
+        "页面已进入后台或锁屏，本次录音已停止。返回后请手动重新开始。",
+      );
+    };
+    const pageShown = (event: PageTransitionEvent) => {
+      if (event.persisted) pageHidden();
+    };
+    const visibilityChanged = () => {
+      if (document.visibilityState === "hidden") pageHidden();
+    };
+    const offline = () => {
+      void interruptActiveSession(
+        "network_offline",
+        "网络连接已中断，本次录音未完成。联网后请手动重新开始。",
+      );
+    };
+
+    document.addEventListener("visibilitychange", visibilityChanged);
+    window.addEventListener("pagehide", pageHidden);
+    window.addEventListener("beforeunload", pageHidden);
+    window.addEventListener("pageshow", pageShown);
+    window.addEventListener("offline", offline);
+    return () => {
+      document.removeEventListener("visibilitychange", visibilityChanged);
+      window.removeEventListener("pagehide", pageHidden);
+      window.removeEventListener("beforeunload", pageHidden);
+      window.removeEventListener("pageshow", pageShown);
+      window.removeEventListener("offline", offline);
+    };
+  }, [interruptActiveSession]);
+
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -174,6 +235,9 @@ export function useAsr() {
         },
         onLevel: (level) => {
           if (!startWasCancelled()) dispatch({ type: "LEVEL", level });
+        },
+        onInterruption: (code, message) => {
+          if (!startWasCancelled()) void interruptActiveSession(code, message);
         },
       });
       if (startWasCancelled()) {
@@ -235,7 +299,7 @@ export function useAsr() {
           });
       }
     }
-  }, [cleanup, handleMessage, state.phase, terminateCurrent]);
+  }, [cleanup, handleMessage, interruptActiveSession, state.phase, terminateCurrent]);
 
   const pause = useCallback(async () => {
     if (state.phase !== "recording") return;

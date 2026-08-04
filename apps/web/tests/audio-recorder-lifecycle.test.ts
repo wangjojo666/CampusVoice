@@ -9,6 +9,7 @@ class FakeAudioNode {
 
 class FakeWorkletNode extends FakeAudioNode {
   static instance: FakeWorkletNode | null = null;
+  static instances: FakeWorkletNode[] = [];
   readonly port = {
     onmessage: null as ((event: MessageEvent) => void) | null,
     postMessage: vi.fn((message: { type: string; requestId?: number }) => {
@@ -31,11 +32,13 @@ class FakeWorkletNode extends FakeAudioNode {
   ) {
     super();
     FakeWorkletNode.instance = this;
+    FakeWorkletNode.instances.push(this);
   }
 }
 
-class FakeAudioContext {
+class FakeAudioContext extends EventTarget {
   static instance: FakeAudioContext | null = null;
+  static instances: FakeAudioContext[] = [];
   static moduleLoad: Promise<void> = Promise.resolve();
   state = "running";
   readonly destination = new FakeAudioNode();
@@ -55,8 +58,41 @@ class FakeAudioContext {
   });
 
   constructor(readonly options: unknown) {
+    super();
     FakeAudioContext.instance = this;
+    FakeAudioContext.instances.push(this);
   }
+}
+
+class FakeTrack extends EventTarget {
+  readonly operations: string[] = [];
+  readonly stop = vi.fn(() => {
+    this.operations.push("stop");
+    this.dispatchEvent(new Event("ended"));
+  });
+
+  override removeEventListener(
+    type: string,
+    callback: EventListenerOrEventListenerObject | null,
+    options?: EventListenerOptions | boolean,
+  ) {
+    this.operations.push(`remove:${type}`);
+    super.removeEventListener(type, callback, options);
+  }
+}
+
+class FakeMediaDevices extends EventTarget {
+  readonly getUserMedia: ReturnType<typeof vi.fn>;
+
+  constructor(streams: MediaStream[]) {
+    super();
+    this.getUserMedia = vi.fn();
+    for (const stream of streams) this.getUserMedia.mockResolvedValueOnce(stream);
+  }
+}
+
+function fakeStream(track: FakeTrack) {
+  return { getTracks: () => [track] } as unknown as MediaStream;
 }
 
 function deferred<T = void>() {
@@ -76,8 +112,10 @@ describe("PCM recorder lifecycle", () => {
     FakeAudioContext.instance = null;
     FakeAudioContext.moduleLoad = Promise.resolve();
     FakeWorkletNode.instance = null;
+    FakeAudioContext.instances = [];
     vi.stubGlobal("AudioContext", FakeAudioContext);
     vi.stubGlobal("AudioWorkletNode", FakeWorkletNode);
+    FakeWorkletNode.instances = [];
   });
 
   afterEach(() => {
@@ -245,6 +283,130 @@ describe("PCM recorder lifecycle", () => {
     expect(FakeAudioContext.instance?.close).toHaveBeenCalledOnce();
   });
 
+  it("fails closed exactly once for simultaneous real media events and removes listeners before stop", async () => {
+    const track = new FakeTrack();
+    const mediaDevices = new FakeMediaDevices([fakeStream(track)]);
+    Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: mediaDevices });
+    const recorder = new PcmAudioRecorder();
+    const onChunk = vi.fn();
+    const onLevel = vi.fn();
+    const stopFailures: unknown[] = [];
+    const onInterruption = vi.fn((code: string) => {
+      void recorder.stop().catch((reason: unknown) => stopFailures.push(reason));
+      expect(code).toBe("microphone_muted");
+    });
+    await recorder.start({ onChunk, onLevel, onInterruption });
+    const context = FakeAudioContext.instance!;
+    const worklet = FakeWorkletNode.instance!;
+
+    track.dispatchEvent(new Event("mute"));
+    track.dispatchEvent(new Event("unmute"));
+    track.dispatchEvent(new Event("ended"));
+    mediaDevices.dispatchEvent(new Event("devicechange"));
+    context.state = "interrupted";
+    context.dispatchEvent(new Event("statechange"));
+    worklet.port.onmessage?.(new MessageEvent("message", { data: { type: "level", level: 0.8 } }));
+    worklet.port.onmessage?.(
+      new MessageEvent("message", { data: { type: "audio", buffer: new ArrayBuffer(8) } }),
+    );
+    await vi.waitFor(() => expect(context.close).toHaveBeenCalledOnce());
+
+    expect(onInterruption).toHaveBeenCalledOnce();
+    expect(onChunk).not.toHaveBeenCalled();
+    expect(onLevel).not.toHaveBeenCalled();
+    expect(stopFailures).toEqual([]);
+    expect(track.stop).toHaveBeenCalledOnce();
+    expect(track.operations.slice(0, 4)).toEqual([
+      "remove:mute",
+      "remove:unmute",
+      "remove:ended",
+      "stop",
+    ]);
+    expect(context.source.disconnect).toHaveBeenCalledOnce();
+    expect(worklet.disconnect).toHaveBeenCalledOnce();
+    expect(context.gain.disconnect).toHaveBeenCalledOnce();
+  });
+
+  it("interrupts active capture on a real devicechange without selecting or restarting", async () => {
+    const track = new FakeTrack();
+    const mediaDevices = new FakeMediaDevices([fakeStream(track)]);
+    Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: mediaDevices });
+    const recorder = new PcmAudioRecorder();
+    const onInterruption = vi.fn(() => void recorder.stop());
+    await recorder.start({ onChunk: vi.fn(), onLevel: vi.fn(), onInterruption });
+
+    mediaDevices.dispatchEvent(new Event("devicechange"));
+    await vi.waitFor(() => expect(track.stop).toHaveBeenCalledOnce());
+
+    expect(onInterruption).toHaveBeenCalledWith("audio_device_changed", expect.any(String));
+    expect(mediaDevices.getUserMedia).toHaveBeenCalledOnce();
+  });
+
+  it("ignores intentional pause but detects state changes while resume is pending", async () => {
+    const track = new FakeTrack();
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: new FakeMediaDevices([fakeStream(track)]),
+    });
+    const recorder = new PcmAudioRecorder();
+    const onInterruption = vi.fn(() => void recorder.stop().catch(() => undefined));
+    await recorder.start({ onChunk: vi.fn(), onLevel: vi.fn(), onInterruption });
+    const context = FakeAudioContext.instance!;
+
+    await recorder.pause();
+    context.dispatchEvent(new Event("statechange"));
+    expect(onInterruption).not.toHaveBeenCalled();
+
+    const pendingResume = deferred<void>();
+    context.resume.mockImplementationOnce(() => pendingResume.promise);
+    const resumeOperation = recorder.resume();
+    context.state = "closed";
+    context.dispatchEvent(new Event("statechange"));
+    await vi.waitFor(() => expect(onInterruption).toHaveBeenCalledOnce());
+    pendingResume.resolve();
+    await resumeOperation;
+  });
+
+  it("invalidates every callback and event listener from a previous start generation", async () => {
+    const firstTrack = new FakeTrack();
+    const secondTrack = new FakeTrack();
+    const mediaDevices = new FakeMediaDevices([fakeStream(firstTrack), fakeStream(secondTrack)]);
+    Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: mediaDevices });
+    const recorder = new PcmAudioRecorder();
+    const firstChunk = vi.fn();
+    const firstLevel = vi.fn();
+    const firstInterruption = vi.fn();
+    await recorder.start({
+      onChunk: firstChunk,
+      onLevel: firstLevel,
+      onInterruption: firstInterruption,
+    });
+    const firstContext = FakeAudioContext.instance!;
+    const firstWorkletCallback = FakeWorkletNode.instance!.port.onmessage;
+    await recorder.stop();
+    firstChunk.mockClear();
+    firstLevel.mockClear();
+
+    const secondInterruption = vi.fn(() => void recorder.stop());
+    await recorder.start({
+      onChunk: vi.fn(),
+      onLevel: vi.fn(),
+      onInterruption: secondInterruption,
+    });
+    firstTrack.dispatchEvent(new Event("mute"));
+    firstContext.state = "interrupted";
+    firstContext.dispatchEvent(new Event("statechange"));
+    firstWorkletCallback?.(new MessageEvent("message", { data: { type: "level", level: 0.9 } }));
+    firstWorkletCallback?.(
+      new MessageEvent("message", { data: { type: "audio", buffer: new ArrayBuffer(4) } }),
+    );
+
+    expect(firstInterruption).not.toHaveBeenCalled();
+    expect(secondInterruption).not.toHaveBeenCalled();
+    expect(firstChunk).not.toHaveBeenCalled();
+    expect(firstLevel).not.toHaveBeenCalled();
+    await recorder.stop();
+  });
   it("times out a missing drain acknowledgement and still releases every resource", async () => {
     vi.useFakeTimers();
     const stopTrack = vi.fn();

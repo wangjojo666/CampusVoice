@@ -160,9 +160,23 @@ export function useModalDialog({
           returnFocusRef.current = focused;
       });
     };
+    const rememberInteraction = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const candidate = target.closest<HTMLElement>(FOCUSABLE_SELECTOR);
+      if (candidate?.isConnected && !dialogRef.current?.contains(candidate))
+        returnFocusRef.current = candidate;
+    };
+
     rememberFocus();
     document.addEventListener("focusin", rememberFocus);
-    return () => document.removeEventListener("focusin", rememberFocus);
+    document.addEventListener("pointerdown", rememberInteraction, true);
+    document.addEventListener("click", rememberInteraction, true);
+    return () => {
+      document.removeEventListener("focusin", rememberFocus);
+      document.removeEventListener("pointerdown", rememberInteraction, true);
+      document.removeEventListener("click", rememberInteraction, true);
+    };
   }, [dialogRef, open]);
 
   useEffect(() => {
@@ -261,7 +275,7 @@ export function useModalDialog({
       const returnFocus = returnFocusCandidates.find(
         (candidate) => candidate.isConnected && !candidate.closest("[inert]"),
       );
-      if (returnFocus) returnFocus.focus();
+      if (returnFocus) returnFocus.focus({ preventScroll: true });
       else topModal()?.dialog.focus();
     };
   }, [backdropRef, dialogRef, open]);

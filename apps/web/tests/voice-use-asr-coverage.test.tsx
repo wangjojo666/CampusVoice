@@ -21,6 +21,7 @@ import { useAssistantStore } from "@/stores/assistant-store";
 interface RecorderHandlers {
   onChunk: (chunk: ArrayBuffer) => void;
   onLevel: (level: number) => void;
+  onInterruption?: (code: string, message: string) => void;
 }
 
 interface ClientHandlers {
@@ -861,6 +862,123 @@ describe("useAsr orchestration", () => {
       error: { code: "socket_closed_during_finalize", retryable: true },
     });
     expect(mocks.recorderStop).toHaveBeenCalledOnce();
+    unmount();
+  });
+  it("coalesces simultaneous background lifecycle events into one fail-closed cleanup", async () => {
+    const { result, unmount } = renderHook(() => useAsr());
+    await act(async () => result.current.start());
+
+    await act(async () => {
+      window.dispatchEvent(new Event("pagehide"));
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        value: "hidden",
+      });
+      document.dispatchEvent(new Event("visibilitychange"));
+      window.dispatchEvent(new Event("offline"));
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(result.current.state.phase).toBe("error"));
+    expect(result.current.state.error).toMatchObject({
+      code: "page_hidden",
+      retryable: true,
+    });
+    expect(mocks.clientClose).toHaveBeenCalledOnce();
+    expect(mocks.recorderStop).toHaveBeenCalledOnce();
+    unmount();
+  });
+
+  it("fails closed immediately across BFCache restore while asynchronous cleanup is pending", async () => {
+    const pendingCleanup = deferred();
+    const { result, unmount } = renderHook(() => useAsr());
+    await act(async () => result.current.start());
+    mocks.recorderStop.mockReturnValueOnce(pendingCleanup.promise);
+
+    act(() => window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true })));
+    expect(result.current.state.phase).toBe("error");
+    expect(result.current.state.error?.code).toBe("page_hidden");
+
+    act(() => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+    expect(mocks.recorderStart).toHaveBeenCalledOnce();
+    expect(mocks.clientConstructed).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      pendingCleanup.resolve();
+      await Promise.resolve();
+    });
+    expect(result.current.state.phase).toBe("error");
+    expect(mocks.recorderStart).toHaveBeenCalledOnce();
+    unmount();
+  });
+
+  it("keeps a reset newer than simultaneous page and network interruptions", async () => {
+    const pendingCleanup = deferred();
+    const { result, unmount } = renderHook(() => useAsr());
+    await act(async () => result.current.start());
+    mocks.recorderStop.mockReturnValueOnce(pendingCleanup.promise);
+
+    act(() => {
+      window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+      window.dispatchEvent(new Event("offline"));
+    });
+    const resetOperation = result.current.reset();
+    await act(async () => {
+      pendingCleanup.resolve();
+      await resetOperation;
+    });
+
+    expect(result.current.state).toMatchObject({ phase: "idle", error: null });
+    act(() => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+    expect(result.current.state).toMatchObject({ phase: "idle", error: null });
+    expect(mocks.recorderStart).toHaveBeenCalledOnce();
+    unmount();
+  });
+  it("stays stopped after reconnecting until a new user start", async () => {
+    const { result, unmount } = renderHook(() => useAsr());
+    await act(async () => result.current.start());
+
+    await act(async () => {
+      window.dispatchEvent(new Event("offline"));
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.state.phase).toBe("error"));
+    expect(result.current.state.error?.code).toBe("network_offline");
+
+    act(() => window.dispatchEvent(new Event("online")));
+    expect(mocks.recorderStart).toHaveBeenCalledOnce();
+    expect(mocks.clientConstructed).toHaveBeenCalledOnce();
+
+    await act(async () => result.current.start());
+    expect(mocks.recorderStart).toHaveBeenCalledTimes(2);
+    expect(mocks.clientConstructed).toHaveBeenCalledTimes(2);
+    unmount();
+  });
+
+  it("invalidates recorder-owned callbacks after a media interruption", async () => {
+    const { result, unmount } = renderHook(() => useAsr());
+    await act(async () => result.current.start());
+    const staleHandlers = mocks.recorderHandlers;
+
+    await act(async () => {
+      staleHandlers?.onInterruption?.("microphone_ended", "麦克风已结束");
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(result.current.state.phase).toBe("error"));
+    expect(result.current.state.error).toMatchObject({
+      code: "microphone_ended",
+      retryable: true,
+    });
+    expect(mocks.clientClose).toHaveBeenCalledOnce();
+    expect(mocks.recorderStop).toHaveBeenCalledOnce();
+
+    act(() => {
+      staleHandlers?.onLevel(0.9);
+      staleHandlers?.onChunk(new ArrayBuffer(4));
+    });
+    expect(result.current.state.level).toBe(0);
+    expect(mocks.clientSendAudio).not.toHaveBeenCalled();
     unmount();
   });
 });

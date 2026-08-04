@@ -13,11 +13,34 @@ export interface AsrCloseInfo {
   wasClean: boolean;
 }
 
+export function resolveAsrWebSocketUrl(
+  value: string,
+  pageUrl = typeof window !== "undefined" ? window.location.href : "http://127.0.0.1/",
+) {
+  const page = new URL(pageUrl);
+  const url = new URL(value, page);
+  if (url.protocol === "http:") url.protocol = "ws:";
+  if (url.protocol === "https:") url.protocol = "wss:";
+  if (url.protocol !== "ws:" && url.protocol !== "wss:") {
+    throw new Error("ASR endpoint must use HTTP(S) or WebSocket protocol");
+  }
+  if (page.protocol === "https:" && url.protocol === "ws:") {
+    throw new Error("HTTPS pages require a secure WSS speech connection");
+  }
+  for (const parameter of ["access_token", "token", "ticket"]) {
+    if (url.searchParams.has(parameter)) {
+      throw new Error("ASR credentials must not be included in the WebSocket URL");
+    }
+  }
+  return url.href;
+}
+
 function defaultAsrUrl() {
+  const pageUrl = typeof window !== "undefined" ? window.location.href : "http://127.0.0.1:8000/";
   const explicit = process.env.NEXT_PUBLIC_ASR_WS_URL;
-  if (explicit) return explicit;
-  const httpBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
-  return `${httpBase.replace(/^http/, "ws").replace(/\/$/, "")}/ws/asr`;
+  if (explicit) return resolveAsrWebSocketUrl(explicit, pageUrl);
+  const httpBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? new URL(pageUrl).origin;
+  return resolveAsrWebSocketUrl(new URL("/ws/asr", new URL(httpBase, pageUrl)).href, pageUrl);
 }
 
 function normalizeMessage(value: unknown): AsrServerMessage | null {
@@ -87,7 +110,7 @@ export class AsrWebSocketClient {
     options: { ticket: string; url?: string; hotwords?: string[]; readyTimeoutMs?: number },
   ) {
     this.handlers = handlers;
-    this.url = options.url ?? defaultAsrUrl();
+    this.url = resolveAsrWebSocketUrl(options.url ?? defaultAsrUrl());
     this.hotwords = options.hotwords ?? [];
     this.ticket = options.ticket;
     this.readyTimeoutMs = options.readyTimeoutMs ?? AsrWebSocketClient.DEFAULT_READY_TIMEOUT_MS;
