@@ -75,8 +75,9 @@ describe("ASR WebSocket URL security", () => {
 describe("ASR WebSocket protocol", () => {
   it("starts the real server protocol with 16 kHz mono PCM and configured hotwords", async () => {
     vi.stubGlobal("WebSocket", FakeWebSocket);
+    const onMessage = vi.fn();
     const client = new AsrWebSocketClient(
-      { onMessage: vi.fn(), onClose: vi.fn(), onError: vi.fn() },
+      { onMessage, onClose: vi.fn(), onError: vi.fn() },
       { url: "ws://localhost/ws/asr", hotwords: ["机器学习"], ticket: "short-lived-ticket" },
     );
     const connected = client.connect();
@@ -94,6 +95,20 @@ describe("ASR WebSocket protocol", () => {
     });
     socket?.onmessage?.({ data: JSON.stringify({ type: "ready", session_id: "voice-1" }) });
     await connected;
+    socket?.onmessage?.({
+      data: JSON.stringify({
+        type: "finalizing",
+        session_id: "voice-1",
+        sequence: 2,
+        provider: "funasr",
+      }),
+    });
+    expect(onMessage).toHaveBeenLastCalledWith({
+      type: "finalizing",
+      session_id: "voice-1",
+      sequence: 2,
+      provider: "funasr",
+    });
     client.pause();
     expect(JSON.parse(String(socket?.sent[1]))).toEqual({ type: "flush" });
   });

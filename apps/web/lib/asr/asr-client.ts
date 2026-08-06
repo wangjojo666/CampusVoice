@@ -53,7 +53,7 @@ function normalizeMessage(value: unknown): AsrServerMessage | null {
     sequence: typeof message.sequence === "number" ? message.sequence : undefined,
     provider: typeof message.provider === "string" ? message.provider : undefined,
   };
-  if (type === "ready")
+  if (type === "ready" || type === "finalizing")
     return {
       ...metadata,
       type,

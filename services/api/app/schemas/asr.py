@@ -4,6 +4,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 AsrEventType = Literal[
     "ready",
+    "finalizing",
     "speech_start",
     "interim",
     "final",
@@ -19,6 +20,7 @@ class _StrictModel(BaseModel):
 
 class AsrStartMessage(_StrictModel):
     type: Literal["start"] = "start"
+    audio_format: Literal["pcm_s16le", "mp3"] = "pcm_s16le"
     sample_rate_hz: Literal[16000] = 16000
     channels: Literal[1] = 1
     sample_width_bytes: Literal[2] = 2

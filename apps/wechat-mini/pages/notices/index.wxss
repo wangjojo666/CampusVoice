@@ -1,0 +1,41 @@
+.hero.compact {
+  padding: 32rpx;
+}
+.hero.compact .hero-title {
+  font-size: 42rpx;
+}
+.notice-list {
+  margin-top: 28rpx;
+}
+.notice-card.review {
+  border-color: #e9b8b4;
+}
+.time {
+  font-size: 22rpx;
+}
+.notice-title {
+  margin-top: 22rpx;
+  font-size: 34rpx;
+  font-weight: 850;
+}
+.notice-message {
+  margin-top: 14rpx;
+  color: #425e6b;
+  line-height: 1.7;
+}
+.meta-box {
+  margin-top: 18rpx;
+  padding: 16rpx 18rpx;
+  border-radius: 14rpx;
+  color: #285660;
+  background: #eef6f7;
+}
+.deadline {
+  margin-top: 18rpx;
+  color: #9f5228;
+  font-weight: 700;
+}
+.review-note {
+  margin-top: 18rpx;
+  color: #9f2d28;
+}

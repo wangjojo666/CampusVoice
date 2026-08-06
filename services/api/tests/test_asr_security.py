@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any
@@ -158,6 +159,94 @@ def test_connection_limit_rejects_second_session_and_releases_after_close(
         item for item in component_metrics if item["component"] == "asr" and item["outcome"] == "ok"
     )
     assert asr_ok["count"] >= 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scenario", "hang_operation"),
+    [
+        ("origin", "close"),
+        ("missing_ticket", "close"),
+        ("invalid_ticket", "close"),
+        ("connection_limit", "accept"),
+        ("connection_limit", "send"),
+        ("connection_limit", "close"),
+    ],
+)
+async def test_route_rejections_bound_every_websocket_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    hang_operation: str,
+) -> None:
+    class DummySession:
+        async def __aenter__(self) -> "DummySession":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+    class DummySessionFactory:
+        def __call__(self) -> DummySession:
+            return DummySession()
+
+    class RejectingRegistry:
+        async def acquire(self, _user_id: str, _limit: int) -> None:
+            return None
+
+    class HangingSocket:
+        def __init__(self) -> None:
+            settings = Settings(env="test", database_auto_create=True)
+            self.app = SimpleNamespace(
+                state=SimpleNamespace(
+                    settings=settings,
+                    session_factory=DummySessionFactory(),
+                    asr_connections=RejectingRegistry(),
+                )
+            )
+            origin = "https://evil.example" if scenario == "origin" else ORIGIN
+            protocols = (
+                "campusvoice"
+                if scenario == "missing_ticket"
+                else "campusvoice, campusvoice.ticket.route-timeout"
+            )
+            self.headers = {"origin": origin, "sec-websocket-protocol": protocols}
+            self.accept_calls = 0
+            self.send_calls = 0
+            self.close_calls = 0
+
+        async def _maybe_hang(self, operation: str) -> None:
+            if operation == hang_operation:
+                await asyncio.Event().wait()
+
+        async def accept(self, *, subprotocol: str | None = None) -> None:
+            assert subprotocol == "campusvoice"
+            self.accept_calls += 1
+            await self._maybe_hang("accept")
+
+        async def send_json(self, payload: dict[str, Any]) -> None:
+            assert payload["code"] == "connection_limit_reached"
+            self.send_calls += 1
+            await self._maybe_hang("send")
+
+        async def close(self, *, code: int, reason: str = "") -> None:
+            assert code == 1008
+            assert reason
+            self.close_calls += 1
+            await self._maybe_hang("close")
+
+    async def consume_ticket(*_args: object, **_kwargs: object) -> str | None:
+        return None if scenario == "invalid_ticket" else "route-user"
+
+    monkeypatch.setattr(asr_route, "_REJECTION_IO_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(asr_route, "consume_websocket_ticket", consume_ticket)
+    socket = HangingSocket()
+
+    await asyncio.wait_for(asr_route.asr_websocket(socket), timeout=0.2)  # type: ignore[arg-type]
+
+    if scenario == "connection_limit":
+        assert (socket.accept_calls, socket.send_calls, socket.close_calls) == (1, 1, 1)
+    else:
+        assert (socket.accept_calls, socket.send_calls, socket.close_calls) == (0, 0, 1)
 
 
 @pytest.mark.asyncio

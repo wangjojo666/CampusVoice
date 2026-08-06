@@ -13,6 +13,7 @@
     "test:e2e": "playwright test",
     "test:e2e:smoke": "playwright test --config playwright.smoke.config.ts",
     "test:e2e:edge": "cross-env PLAYWRIGHT_CHANNEL=msedge playwright test",
+    "test:pwa:standalone": "node scripts/verify-standalone-pwa.mjs",
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {

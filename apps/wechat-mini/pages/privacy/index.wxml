@@ -1,0 +1,36 @@
+<view class="page">
+  <view class="hero compact">
+    <view class="hero-kicker">PRIVACY</view>
+    <view class="hero-title">隐私保护说明</view>
+    <view class="hero-copy">版本 {{privacyVersion}}。我们只在实现你主动使用的功能时处理必要信息。</view>
+  </view>
+
+  <view wx:if="{{message}}" class="success-box">{{message}}</view>
+  <view wx:if="{{error}}" class="error-box">{{error}}</view>
+
+  <view class="section-title">我们处理的信息</view>
+  <view class="card policy">
+    <view class="card-title">微信身份凭证</view>
+    <view class="muted">使用 wx.login 的短期 code 在服务端换取 OpenID。AppSecret 与 session_key 只保存在服务端；小程序仅保存有期限的随机会话凭证。</view>
+  </view>
+  <view class="card policy">
+    <view class="card-title">麦克风与语音转写</view>
+    <view class="muted">仅在你点击“开始录音”并授权后采集。录音过程中，音频帧实时发送给 CampusVoice ASR，并在停止后由服务端解码识别；默认不持久化原始音频。转写文本按服务端保留策略保存，用于你确认的任务、日程或查询。</view>
+  </view>
+  <view class="card policy">
+    <view class="card-title">任务、日程与校园通知</view>
+    <view class="muted">用于同步你的待办、日历、通知证据及可靠操作记录。不同用户的数据在服务端按身份隔离。</view>
+  </view>
+
+  <view class="section-title">你的控制权</view>
+  <view class="card">
+    <view class="muted">你可以拒绝或在微信设置中撤销麦克风权限。离开录音页、进入后台或网络中断时，当前录音会停止且不会自动恢复。</view>
+    <button class="danger-outline action" loading="{{deleting}}" disabled="{{!configured || deleting}}" bindtap="requestDeletion">永久删除我的业务数据</button>
+    <view wx:if="{{!configured}}" class="hint">配置服务后可使用在线删除功能。</view>
+  </view>
+
+  <view class="card">
+    <view class="card-title">发布前平台配置</view>
+    <view class="muted">运营者还必须在微信公众平台补充并发布《小程序用户隐私保护指引》，准确声明麦克风、网络请求和所收集字段；本页面不能替代平台指引。</view>
+  </view>
+</view>

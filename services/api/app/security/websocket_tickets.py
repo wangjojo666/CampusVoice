@@ -13,6 +13,10 @@ def ticket_hash(ticket: str) -> str:
     return hashlib.sha256(ticket.encode()).hexdigest()
 
 
+def wechat_miniprogram_origin(app_id: str) -> str:
+    return f"wechat-miniprogram://{app_id}"
+
+
 def issue_websocket_ticket(
     *,
     user_id: str,
@@ -35,13 +39,20 @@ async def consume_websocket_ticket(
     *,
     ticket: str,
     origin: str,
+    additional_origins: tuple[str, ...] = (),
 ) -> str | None:
     now = utc_now()
+    origins = tuple(dict.fromkeys((origin, *additional_origins)))
+    origin_condition = (
+        WebSocketTicket.origin == origins[0]
+        if len(origins) == 1
+        else WebSocketTicket.origin.in_(origins)
+    )
     statement = (
         update(WebSocketTicket)
         .where(
             WebSocketTicket.ticket_hash == ticket_hash(ticket),
-            WebSocketTicket.origin == origin,
+            origin_condition,
             WebSocketTicket.expires_at > now,
             WebSocketTicket.consumed_at.is_(None),
         )

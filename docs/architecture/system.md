@@ -30,24 +30,29 @@ review 拒绝会使 ready plan 进入 `invalidated` 并 dismiss 影响；重新�
 
 CampusVoice 首版采用模块化单体，不拆分微服务：
 
-- `apps/web` 负责录音、交互状态、确认卡片以及任务、日历、通知和设置页面。
-- `services/api` 负责业务规则、模型适配、事务执行、数据库验证和审计。
+- `apps/web` 负责浏览器录音、交互状态、确认卡片以及任务、日历、通知和设置页面。
+- `apps/wechat-mini` 是原生微信小程序工程，负责微信登录、RecorderManager 录音和小程序页面生命周期；它不使用 `web-view`。
+- `services/api` 负责两类客户端共同的身份边界、业务规则、音频解码、模型适配、事务执行、数据库验证和审计。
 - SQLite 是首版唯一事实数据源；模型返回值不能作为操作成功的证据。
 - FunASR、Whisper、Embedding 和 LLM 都通过适配器接入，业务代码不绑定供应商 SDK。
 
 ## 身份与信任边界
 
-- `development/test` 可显式使用 demo authenticator；`production` 禁止 demo。校园浏览器使用服务端 OIDC Authorization Code + PKCE，校验 state、nonce、issuer、audience、JWKS 非对称签名、到期与必需 claims；非浏览器客户端可使用 Bearer JWT。内部用户 ID 由受验证的 issuer/subject 服务端映射。
-- REST 路由只从 `current_user` 依赖取得身份，repository 查询以内部用户 ID 约束；不存在可由客户端选择用户的 `X-User-ID`、路径或正文参数。跨用户记录统一表现为不存在。
-- OIDC access token、client secret、PKCE verifier 和 nonce 不进入浏览器；浏览器只持有 `HttpOnly` 随机会话 cookie，数据库只保存会话哈希。ASR 再用认证 REST 请求换取绑定用户与 Origin 的短时一次性 ticket，并通过 WebSocket 子协议提交。
-- production 不允许 demo 回退、数据库自动建表或短确认密钥。配置与可选 AI 依赖不匹配时在应用启动阶段失败。
+- `development/test` 可显式使用 demo authenticator；`production` 禁止 demo。浏览器单独部署使用 `oidc`，小程序单独部署可使用 `wechat`，同一 API 同时服务两者使用 `oidc_wechat`；通用非浏览器集成仍可选择独立 Bearer JWT。内部用户 ID 由受验证的 issuer/subject 或微信 AppID/OpenID 服务端映射。
+- `oidc_wechat` 中，无 `Authorization` 的请求只按 OIDC `HttpOnly` cookie 认证；带 Bearer 的请求必须是 `cvwx1.` 前缀的微信短期会话。错误 Bearer 不会回退到 cookie，OIDC 与微信 issuer 也不能互换。REST 路由只从 `current_user` 取得身份，repository 查询以内部用户 ID 约束；不存在可由客户端选择用户的 `X-User-ID`、路径或正文参数，跨用户记录统一表现为不存在。
+- OIDC access token、client secret、PKCE verifier 和 nonce 不进入浏览器；微信 AppSecret、`session_key`、OpenID 和 UnionID 不进入小程序。两类不透明会话都只在客户端持有随机值，数据库只保存哈希。
+- ASR ticket 由已认证主体签发并通过 WebSocket 子协议提交。浏览器 ticket 绑定精确允许的 Origin；微信 ticket 绑定服务端内部 `wechat-miniprogram://<AppID>` origin sentinel（不同于 `wechat:miniprogram:<AppID>` 会话 issuer），不依赖小程序携带浏览器 Origin。ticket 同时绑定用户、短期有效且只能原子消费一次。
+- production 不允许 demo 回退、数据库自动建表或短确认密钥。所选认证模式的 OIDC/微信配置缺失时启动失败；FFmpeg 或真实 ASR provider 不可用时小程序语音路径不能发布。
 
 ## 可靠操作流水线
 
 ```mermaid
 flowchart LR
-    A["浏览器 PCM 音频"] --> B["流式 ASR"]
+    A["浏览器 16 kHz PCM 流"] --> B["录制中流式 ASR"]
+    X["小程序 MP3 分帧"] --> Y["stop 后有界 FFmpeg 解码为 16 kHz mono s16le"]
+    Y --> Z["停止后最终 ASR"]
     B --> C["术语候选与关键字段保护"]
+    Z --> C
     C --> D["严格意图 Schema"]
     D --> E{"字段完整?"}
     E -- 否 --> F["一次只追问最关键字段"]
@@ -66,6 +71,8 @@ flowchart LR
     L -- 失败 --> N["返回失败与恢复选项"]
 ```
 
+浏览器 PCM 路径可在录制中产生 interim/final；微信 RecorderManager 的 MP3 分帧在录制期间仅有界聚合，不进入 provider，也不产生实时 partial。服务端收到 `stop` 后才以固定参数、非 shell 的 FFmpeg 子进程解码完整 MP3，并在输入、输出、时长和超时限制内完成最终识别。页面隐藏、中断或网络失败会停止并废弃当前小程序会话，旧 recorder、socket、timer、listener 和 callback 不能污染新 generation。
+
 ## 数据与时间规则
 
 - 数据库存储 UTC 时间，API 使用带时区的 ISO 8601；前端按用户时区显示，默认 `Asia/Shanghai`。
@@ -76,20 +83,20 @@ flowchart LR
 
 ## 可用性、资源与隐私边界
 
-- `/health/live` 只检查进程；`/health/ready` 检查数据库连接、Alembic head 和启用组件配置，不在探针中下载或加载模型。
+- `/health/live` 只检查进程；`/health/ready` 与 `/api/health/ready` 检查数据库连接、Alembic head 和启用组件配置，不在探针中下载、加载或实际推理模型。
 - `/api/metrics` 只暴露固定组件/操作和路由模板的进程内聚合，不包含用户、实体 ID、查询或供应商自由文本。ASR、意图、检索、LLM、动作执行和验证分别计时并计错。
 - ASR 单 worker 使用进程内租约；多 worker 必须使用 Redis 原子有期限额，Redis 不可用时不静默降级。隐私保留由单实例的一次性执行器或显式单 worker 调度器运行，并进行有界指数退避。
-- ASR 限制 Origin、单帧/控制帧大小、空闲时间、总会话、累计音频和单用户连接数；最外层清理保证模型、持久化会话和连接配额被释放。
+- ASR 对浏览器连接校验精确 Origin，对微信连接校验内部 AppID sentinel；两者都限制单帧/控制帧大小、空闲时间、总会话、累计音频和单用户连接数。MP3 路径另外限制累计压缩字节、FFmpeg 解码时间和 PCM 输出大小；最外层清理保证解码/模型进程、持久化会话和连接配额被释放。
 - 原始音频不持久化且配置无法开启。转写、纠错、对话、终态操作与审计按独立窗口清理；导出使用字段白名单；业务数据删除需要服务端一次性挑战并在提交后重新验证。
 - 外部意图 LLM 仅接收当前意图文本与必要上下文；外部通知问答仅接收检索到的编号证据。API key、内部凭据、音频与无关用户数据不进入模型请求。
 
 ## 可替换边界
 
-| 能力   | 首版实现                             | 替换接口                                |
-| ------ | ------------------------------------ | --------------------------------------- |
-| 数据库 | SQLite + SQLAlchemy                  | SQLAlchemy repository/session           |
-| ASR    | FunASR；Whisper 评测基线             | `AsrProvider`                           |
-| 意图   | 规则安全基线 + OpenAI-compatible LLM | `IntentProvider`                        |
-| 检索   | SQLite 文档块 + 本地评分/Embedding   | `ChunkRetriever`                        |
-| LLM    | 结构化意图 + 证据约束通知问答        | `IntentLlmClient` / `KnowledgeAnswerer` |
-| 身份   | demo + JWT/JWKS + 服务端 OIDC/PKCE   | `Authenticator` / `OidcClient`          |
+| 能力   | 首版实现                                   | 替换接口                                        |
+| ------ | ------------------------------------------ | ----------------------------------------------- |
+| 数据库 | SQLite + SQLAlchemy                        | SQLAlchemy repository/session                   |
+| ASR    | FunASR；Whisper 评测基线                   | `AsrProvider`                                   |
+| 意图   | 规则安全基线 + OpenAI-compatible LLM       | `IntentProvider`                                |
+| 检索   | SQLite 文档块 + 本地评分/Embedding         | `ChunkRetriever`                                |
+| LLM    | 结构化意图 + 证据约束通知问答              | `IntentLlmClient` / `KnowledgeAnswerer`         |
+| 身份   | demo + JWT/JWKS + OIDC/PKCE + 微信短期会话 | `Authenticator` / `OidcClient` / `WeChatClient` |

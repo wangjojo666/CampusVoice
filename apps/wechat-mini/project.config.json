@@ -1,0 +1,36 @@
+{
+  "appid": "wx3648488d39d15ff4",
+  "compileType": "miniprogram",
+  "projectname": "CampusVoice-WeChat",
+  "miniprogramRoot": "./",
+  "setting": {
+    "es6": true,
+    "postcss": true,
+    "minified": true,
+    "minifyWXML": true,
+    "urlCheck": true,
+    "useCompilerPlugins": false,
+    "useIsolateContext": true,
+    "usePrivacyCheck": true
+  },
+  "packOptions": {
+    "ignore": [
+      {
+        "type": "file",
+        "value": "README.md"
+      },
+      {
+        "type": "file",
+        "value": "package.json"
+      },
+      {
+        "type": "folder",
+        "value": "tests"
+      },
+      {
+        "type": "folder",
+        "value": "scripts"
+      }
+    ]
+  }
+}

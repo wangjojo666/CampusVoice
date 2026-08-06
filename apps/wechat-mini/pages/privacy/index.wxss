@@ -1,0 +1,36 @@
+.hero.compact {
+  padding: 32rpx;
+}
+.hero.compact .hero-title {
+  font-size: 42rpx;
+}
+.policy .card-title {
+  margin-bottom: 14rpx;
+}
+.action {
+  margin-top: 26rpx;
+}
+.danger-outline {
+  color: #a02f2a;
+  background: #fff;
+  border: 1rpx solid #d99b97;
+}
+.hint {
+  margin-top: 14rpx;
+  color: #8b681f;
+  text-align: center;
+}
+.success-box,
+.error-box {
+  margin-top: 20rpx;
+  padding: 20rpx 24rpx;
+  border-radius: 18rpx;
+}
+.success-box {
+  color: #00695d;
+  background: #dcf5ef;
+}
+.error-box {
+  color: #9f2d28;
+  background: #ffebe9;
+}

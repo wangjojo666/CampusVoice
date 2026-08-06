@@ -1,0 +1,83 @@
+.voice-page {
+  box-sizing: border-box;
+  min-height: 100vh;
+  padding: 36rpx 28rpx calc(40rpx + env(safe-area-inset-bottom));
+  background: linear-gradient(180deg, #e9f5f4, #f6f9fa 46%);
+}
+.voice-panel {
+  text-align: center;
+}
+.hero-kicker.dark {
+  color: #007d6e;
+}
+.voice-title {
+  margin: 14rpx 0 8rpx;
+  font-size: 48rpx;
+  font-weight: 800;
+}
+.status {
+  min-height: 82rpx;
+}
+.orb {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 270rpx;
+  height: 270rpx;
+  margin: 44rpx auto;
+  border-radius: 50%;
+  background: rgba(0, 125, 110, 0.1);
+  box-shadow: 0 0 0 28rpx rgba(0, 125, 110, 0.05);
+}
+.orb.active {
+  animation: pulse 1.4s ease-in-out infinite;
+  background: rgba(182, 61, 54, 0.14);
+  box-shadow: 0 0 0 28rpx rgba(182, 61, 54, 0.06);
+}
+.orb-core {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 170rpx;
+  height: 170rpx;
+  border-radius: 50%;
+  color: #fff;
+  background: #007d6e;
+  font-size: 54rpx;
+  font-weight: 900;
+}
+.orb.active .orb-core {
+  background: #b63d36;
+}
+.action {
+  width: 72%;
+}
+.transcript-card {
+  margin-top: 58rpx;
+  padding: 28rpx;
+  border-radius: 28rpx;
+  background: #fff;
+  box-shadow: 0 10rpx 34rpx rgba(21, 57, 70, 0.08);
+}
+.transcript {
+  min-height: 160rpx;
+  margin-top: 24rpx;
+  line-height: 1.8;
+  text-align: left;
+}
+.error-box {
+  margin-top: 18rpx;
+  padding: 18rpx;
+  border-radius: 16rpx;
+  color: #9f2d28;
+  background: #ffebe9;
+}
+@keyframes pulse {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.04);
+  }
+}

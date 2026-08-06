@@ -1,6 +1,7 @@
 from functools import lru_cache
 from importlib.util import find_spec
 from pathlib import Path
+from shutil import which
 
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
@@ -66,7 +67,18 @@ def _configured_component_checks(settings: Settings) -> dict[str, HealthCheck]:
             else "LLM integration is intentionally disabled"
         ),
     )
-    return {"asr": asr, "retriever": retriever, "llm": llm}
+    checks = {"asr": asr, "retriever": retriever, "llm": llm}
+    if settings.asr_provider != "disabled":
+        ffmpeg_available = which("ffmpeg") is not None
+        checks["ffmpeg"] = HealthCheck(
+            status="ok" if ffmpeg_available else "error",
+            message=(
+                "FFmpeg is available for MP3 decoding"
+                if ffmpeg_available
+                else "FFmpeg is unavailable for MP3 decoding"
+            ),
+        )
+    return checks
 
 
 async def readiness_report(

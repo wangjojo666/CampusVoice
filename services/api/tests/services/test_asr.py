@@ -12,6 +12,7 @@ import pytest
 from app.services.asr import AsrProviderError, AsrSessionConfig, TranscriptResult
 from app.services.asr import adapters as asr_adapters
 from app.services.asr.adapters import FunAsrAdapter, _FunAsrModelHandle
+from app.services.asr.audio import AudioDecodeError
 from app.services.asr.session import PcmEnergyVad, handle_asr_websocket
 
 
@@ -71,6 +72,52 @@ class BlockingSocket(StubSocket):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("accepted_subprotocol", [None, "campusvoice"])
+async def test_hanging_accept_returns_before_allocating_session_resources(
+    accepted_subprotocol: str | None,
+) -> None:
+    class HangingAcceptSocket(StubSocket):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.accept_calls: list[str | None] = []
+
+        async def accept(self, subprotocol: str | None = None) -> None:
+            self.accept_calls.append(subprotocol)
+            await asyncio.Event().wait()
+
+    socket = HangingAcceptSocket()
+    factory_calls = 0
+    close_calls = 0
+
+    def factory() -> StubAsrAdapter:
+        nonlocal factory_calls
+        factory_calls += 1
+        return StubAsrAdapter()
+
+    async def close_persistence(_session_id: str, _completed: bool) -> None:
+        nonlocal close_calls
+        close_calls += 1
+
+    await asyncio.wait_for(
+        handle_asr_websocket(  # type: ignore[arg-type]
+            socket,
+            factory,
+            close_hook=close_persistence,
+            accepted_subprotocol=accepted_subprotocol,
+            max_session_seconds=0.05,
+            cleanup_grace_seconds=0.01,
+        ),
+        timeout=0.2,
+    )
+
+    assert socket.accept_calls == [accepted_subprotocol]
+    assert factory_calls == 0
+    assert close_calls == 0
+    assert socket.sent == []
+    assert socket.close_code is None
+
+
+@pytest.mark.asyncio
 async def test_websocket_protocol_emits_interim_final_and_timing() -> None:
     adapter = StubAsrAdapter()
     socket = StubSocket(
@@ -109,6 +156,314 @@ async def test_websocket_protocol_emits_interim_final_and_timing() -> None:
     assert final["text"] == "机器学习"
     assert final["audio_duration_ms"] == 10.0
     assert completion_states == [True]
+
+
+@pytest.mark.asyncio
+async def test_mp3_frames_are_bounded_and_decoded_only_after_stop() -> None:
+    adapter = StubAsrAdapter()
+    socket = StubSocket(
+        [
+            {
+                "type": "websocket.receive",
+                "text": '{"type":"start","audio_format":"mp3"}',
+            },
+            {"type": "websocket.receive", "bytes": b"mp3-frame-a"},
+            {"type": "websocket.receive", "bytes": b"mp3-frame-b"},
+            {"type": "websocket.receive", "text": '{"type":"stop"}'},
+        ]
+    )
+    decode_calls: list[tuple[bytes, float]] = []
+
+    async def decode_mp3(payload: bytes, max_seconds: float) -> bytes:
+        decode_calls.append((payload, max_seconds))
+        assert adapter.started_with is not None
+        return b"\xff\x7f" * 160
+
+    await handle_asr_websocket(  # type: ignore[arg-type]
+        socket,
+        lambda: adapter,
+        mp3_decoder=decode_mp3,
+    )
+
+    assert decode_calls == [(b"mp3-frame-amp3-frame-b", 300.0)]
+    assert socket.close_code == 1000
+    assert adapter.closed is True
+    assert [item["type"] for item in socket.sent] == [
+        "ready",
+        "finalizing",
+        "speech_start",
+        "interim",
+        "final",
+        "speech_end",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mp3_finalization_heartbeats_are_ordered_and_not_persisted() -> None:
+    class HeartbeatSocket(StubSocket):
+        def __init__(self, incoming: list[dict[str, Any]]) -> None:
+            super().__init__(incoming)
+            self.two_heartbeats = asyncio.Event()
+
+        async def send_json(self, payload: dict[str, Any]) -> None:
+            await super().send_json(payload)
+            if sum(item["type"] == "finalizing" for item in self.sent) >= 2:
+                self.two_heartbeats.set()
+
+    decoder_started = asyncio.Event()
+    release_decoder = asyncio.Event()
+    socket = HeartbeatSocket(
+        [
+            {"type": "websocket.receive", "text": '{"type":"start","audio_format":"mp3"}'},
+            {"type": "websocket.receive", "bytes": b"mp3"},
+            {"type": "websocket.receive", "text": '{"type":"stop"}'},
+        ]
+    )
+    persisted: list[Any] = []
+
+    async def decode(_payload: bytes, _max_seconds: float) -> bytes:
+        decoder_started.set()
+        await release_decoder.wait()
+        return b"\xff\x7f" * 160
+
+    async def persist(event: Any) -> None:
+        persisted.append(event)
+
+    task = asyncio.create_task(
+        handle_asr_websocket(  # type: ignore[arg-type]
+            socket,
+            StubAsrAdapter,
+            event_hook=persist,
+            mp3_decoder=decode,
+            finalizing_heartbeat_seconds=0.001,
+        )
+    )
+    await decoder_started.wait()
+    await asyncio.wait_for(socket.two_heartbeats.wait(), timeout=0.2)
+    release_decoder.set()
+    await task
+
+    assert sum(item["type"] == "finalizing" for item in socket.sent) >= 2
+    assert all(event.type != "finalizing" for event in persisted)
+    assert [item["sequence"] for item in socket.sent] == list(range(len(socket.sent)))
+    assert socket.close_code == 1000
+
+
+@pytest.mark.asyncio
+async def test_mp3_encoded_audio_limit_rejects_before_decode() -> None:
+    adapter = StubAsrAdapter()
+    socket = StubSocket(
+        [
+            {
+                "type": "websocket.receive",
+                "text": '{"type":"start","audio_format":"mp3"}',
+            },
+            {"type": "websocket.receive", "bytes": b"12345"},
+        ]
+    )
+    decode_called = False
+
+    async def decode_mp3(_payload: bytes, _max_seconds: float) -> bytes:
+        nonlocal decode_called
+        decode_called = True
+        return b"\x00\x00"
+
+    await handle_asr_websocket(  # type: ignore[arg-type]
+        socket,
+        lambda: adapter,
+        max_audio_seconds=0.0001,
+        mp3_decoder=decode_mp3,
+    )
+
+    assert decode_called is False
+    assert socket.sent[-1]["code"] == "encoded_audio_too_large"
+    assert socket.sent[-1]["recoverable"] is False
+    assert socket.close_code == 1008
+    assert adapter.closed is True
+
+
+@pytest.mark.asyncio
+async def test_mp3_decode_cannot_outlive_total_session_deadline() -> None:
+    class CountingAdapter(StubAsrAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+            self.finish_calls = 0
+
+        async def finish(self) -> Sequence[TranscriptResult]:
+            self.finish_calls += 1
+            return await super().finish()
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            await super().close()
+
+    adapter = CountingAdapter()
+    socket = StubSocket(
+        [
+            {"type": "websocket.receive", "text": '{"type":"start","audio_format":"mp3"}'},
+            {"type": "websocket.receive", "bytes": b"mp3"},
+            {"type": "websocket.receive", "text": '{"type":"stop"}'},
+        ]
+    )
+    completion_states: list[bool] = []
+
+    async def blocked_decode(_payload: bytes, _max_seconds: float) -> bytes:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def close_persistence(_session_id: str, completed: bool) -> None:
+        completion_states.append(completed)
+
+    await handle_asr_websocket(  # type: ignore[arg-type]
+        socket,
+        lambda: adapter,
+        close_hook=close_persistence,
+        max_session_seconds=0.01,
+        mp3_decoder=blocked_decode,
+    )
+
+    assert socket.sent[-1]["code"] == "session_duration_exceeded"
+    assert socket.close_code == 1008
+    assert adapter.finish_calls == 0
+    assert adapter.close_calls == 1
+    assert completion_states == [False]
+
+
+@pytest.mark.asyncio
+async def test_mp3_feed_cannot_accumulate_past_total_session_deadline() -> None:
+    class SlowFeedAdapter(StubAsrAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+
+        async def feed(self, pcm_s16le: bytes) -> Sequence[TranscriptResult]:
+            del pcm_s16le
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            await super().close()
+
+    adapter = SlowFeedAdapter()
+    socket = StubSocket(
+        [
+            {"type": "websocket.receive", "text": '{"type":"start","audio_format":"mp3"}'},
+            {"type": "websocket.receive", "bytes": b"mp3"},
+            {"type": "websocket.receive", "text": '{"type":"stop"}'},
+        ]
+    )
+
+    async def decode(_payload: bytes, _max_seconds: float) -> bytes:
+        return b"\xff\x7f" * 160
+
+    await handle_asr_websocket(  # type: ignore[arg-type]
+        socket,
+        lambda: adapter,
+        max_session_seconds=0.01,
+        mp3_decoder=decode,
+    )
+
+    assert socket.sent[-1]["code"] == "session_duration_exceeded"
+    assert socket.close_code == 1008
+    assert adapter.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_mp3_decode_failure_and_disconnect_finalize_resources_once() -> None:
+    class CountingAdapter(StubAsrAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+            self.finish_calls = 0
+
+        async def finish(self) -> Sequence[TranscriptResult]:
+            self.finish_calls += 1
+            return await super().finish()
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            await super().close()
+
+    for terminal_message, expected_close in [
+        ({"type": "websocket.receive", "text": '{"type":"stop"}'}, 1003),
+        ({"type": "websocket.disconnect"}, None),
+    ]:
+        adapter = CountingAdapter()
+        socket = StubSocket(
+            [
+                {
+                    "type": "websocket.receive",
+                    "text": '{"type":"start","audio_format":"mp3"}',
+                },
+                {"type": "websocket.receive", "bytes": b"mp3"},
+                terminal_message,
+            ]
+        )
+        decode_calls = 0
+
+        async def reject_decode(_payload: bytes, _max_seconds: float) -> bytes:
+            nonlocal decode_calls
+            decode_calls += 1
+            raise AudioDecodeError("invalid_encoded_audio", "invalid")
+
+        await handle_asr_websocket(  # type: ignore[arg-type]
+            socket,
+            lambda adapter=adapter: adapter,
+            mp3_decoder=reject_decode,
+        )
+
+        assert socket.close_code == expected_close
+        assert adapter.close_calls == 1
+        assert adapter.finish_calls == 0
+        assert decode_calls == (1 if expected_close == 1003 else 0)
+        if expected_close == 1003:
+            assert socket.sent[-1]["code"] == "invalid_encoded_audio"
+
+
+@pytest.mark.asyncio
+async def test_mp3_flush_is_recoverable_and_explicit_pcm_remains_streaming() -> None:
+    mp3_adapter = StubAsrAdapter()
+    mp3_socket = StubSocket(
+        [
+            {"type": "websocket.receive", "text": '{"type":"start","audio_format":"mp3"}'},
+            {"type": "websocket.receive", "text": '{"type":"flush"}'},
+            {"type": "websocket.receive", "bytes": b"mp3"},
+            {"type": "websocket.receive", "text": '{"type":"stop"}'},
+        ]
+    )
+
+    async def decode(_payload: bytes, _max_seconds: float) -> bytes:
+        return b"\xff\x7f" * 160
+
+    await handle_asr_websocket(  # type: ignore[arg-type]
+        mp3_socket,
+        lambda: mp3_adapter,
+        mp3_decoder=decode,
+    )
+    assert mp3_socket.sent[1]["code"] == "flush_unsupported_for_mp3"
+    assert mp3_socket.sent[1]["recoverable"] is True
+    assert mp3_socket.close_code == 1000
+
+    pcm_adapter = StubAsrAdapter()
+    pcm_socket = StubSocket(
+        [
+            {
+                "type": "websocket.receive",
+                "text": '{"type":"start","audio_format":"pcm_s16le"}',
+            },
+            {"type": "websocket.receive", "bytes": b"\xff\x7f" * 160},
+            {"type": "websocket.receive", "text": '{"type":"stop"}'},
+        ]
+    )
+    await handle_asr_websocket(pcm_socket, lambda: pcm_adapter)  # type: ignore[arg-type]
+    assert pcm_socket.close_code == 1000
+    assert [event["type"] for event in pcm_socket.sent][:3] == [
+        "ready",
+        "speech_start",
+        "interim",
+    ]
 
 
 @pytest.mark.asyncio
@@ -335,6 +690,311 @@ async def test_session_time_limits_emit_stable_error_codes(
     assert socket.sent[-1]["recoverable"] is False
     assert socket.close_code == 1008
     assert adapter.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("incoming", "idle_timeout", "expected_code"),
+    [
+        ([], 0.01, "session_idle_timeout"),
+        ([{"type": "websocket.receive"}], 1.0, "invalid_frame"),
+    ],
+)
+async def test_backpressured_terminal_send_cannot_block_cleanup(
+    incoming: list[dict[str, Any]],
+    idle_timeout: float,
+    expected_code: str,
+) -> None:
+    class HangingTerminalSocket(BlockingSocket):
+        def __init__(self, messages: list[dict[str, Any]]) -> None:
+            super().__init__(messages)
+            self.close_calls = 0
+
+        async def send_json(self, payload: dict[str, Any]) -> None:
+            await super().send_json(payload)
+            if payload.get("code") == expected_code:
+                await asyncio.Event().wait()
+
+        async def close(self, code: int) -> None:
+            self.close_calls += 1
+            self.close_code = code
+            await asyncio.Event().wait()
+
+    class CountingAdapter(StubAsrAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            await super().close()
+
+    adapter = CountingAdapter()
+    socket = HangingTerminalSocket(incoming)
+    completion_states: list[bool] = []
+
+    async def close_persistence(_session_id: str, completed: bool) -> None:
+        completion_states.append(completed)
+
+    await asyncio.wait_for(
+        handle_asr_websocket(  # type: ignore[arg-type]
+            socket,
+            lambda: adapter,
+            close_hook=close_persistence,
+            idle_timeout_seconds=idle_timeout,
+            max_session_seconds=1.0,
+            cleanup_grace_seconds=0.01,
+        ),
+        timeout=0.2,
+    )
+
+    assert any(item.get("code") == expected_code for item in socket.sent)
+    assert socket.close_calls == 1
+    assert adapter.close_calls == 1
+    assert completion_states == [False]
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_failure_cancels_stalled_mp3_finalization() -> None:
+    class HangingHeartbeatSocket(StubSocket):
+        def __init__(self, incoming: list[dict[str, Any]]) -> None:
+            super().__init__(incoming)
+            self.close_calls = 0
+
+        async def send_json(self, payload: dict[str, Any]) -> None:
+            await super().send_json(payload)
+            if sum(item["type"] == "finalizing" for item in self.sent) >= 2:
+                await asyncio.Event().wait()
+
+        async def close(self, code: int) -> None:
+            self.close_calls += 1
+            await super().close(code)
+
+    class CountingAdapter(StubAsrAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            await super().close()
+
+    adapter = CountingAdapter()
+    socket = HangingHeartbeatSocket(
+        [
+            {"type": "websocket.receive", "text": '{"type":"start","audio_format":"mp3"}'},
+            {"type": "websocket.receive", "bytes": b"mp3"},
+            {"type": "websocket.receive", "text": '{"type":"stop"}'},
+        ]
+    )
+    completion_states: list[bool] = []
+
+    async def decode(_payload: bytes, _max_seconds: float) -> bytes:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def close_persistence(_session_id: str, completed: bool) -> None:
+        completion_states.append(completed)
+
+    started_at = time.monotonic()
+    await asyncio.wait_for(
+        handle_asr_websocket(  # type: ignore[arg-type]
+            socket,
+            lambda: adapter,
+            close_hook=close_persistence,
+            max_session_seconds=1.0,
+            finalizing_heartbeat_seconds=0.01,
+            cleanup_grace_seconds=0.01,
+            mp3_decoder=decode,
+        ),
+        timeout=0.2,
+    )
+
+    assert time.monotonic() - started_at < 0.2
+    assert sum(item["type"] == "finalizing" for item in socket.sent) == 2
+    assert socket.close_calls == 1
+    assert adapter.close_calls == 1
+    assert completion_states == [False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_stage", ["flush", "finish"])
+async def test_provider_error_reset_obeys_remaining_session_deadline(
+    failed_stage: str,
+) -> None:
+    class HangingResetAdapter(StubAsrAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+            self.reset_calls = 0
+
+        async def flush(self) -> Sequence[TranscriptResult]:
+            if failed_stage == "flush":
+                raise AsrProviderError("flush_failed", "flush failed", recoverable=True)
+            return await super().flush()
+
+        async def finish(self) -> Sequence[TranscriptResult]:
+            if failed_stage == "finish":
+                raise AsrProviderError("finish_failed", "finish failed", recoverable=False)
+            return await super().finish()
+
+        async def reset_utterance(self) -> None:
+            self.reset_calls += 1
+            await asyncio.Event().wait()
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            await super().close()
+
+    adapter = HangingResetAdapter()
+    incoming = (
+        [
+            {"type": "websocket.receive", "text": '{"type":"start"}'},
+            {"type": "websocket.receive", "text": '{"type":"flush"}'},
+        ]
+        if failed_stage == "flush"
+        else [
+            {"type": "websocket.receive", "text": '{"type":"start","audio_format":"mp3"}'},
+            {"type": "websocket.receive", "bytes": b"mp3"},
+            {"type": "websocket.receive", "text": '{"type":"stop"}'},
+        ]
+    )
+    socket = StubSocket(incoming)
+    completion_states: list[bool] = []
+
+    async def decode(_payload: bytes, _max_seconds: float) -> bytes:
+        return b"\xff\x7f" * 160
+
+    async def close_persistence(_session_id: str, completed: bool) -> None:
+        completion_states.append(completed)
+
+    await asyncio.wait_for(
+        handle_asr_websocket(  # type: ignore[arg-type]
+            socket,
+            lambda: adapter,
+            close_hook=close_persistence,
+            max_session_seconds=0.05,
+            cleanup_grace_seconds=0.01,
+            mp3_decoder=decode,
+        ),
+        timeout=0.2,
+    )
+
+    assert adapter.reset_calls == 1
+    assert adapter.close_calls == 1
+    assert socket.close_code == 1008
+    assert completion_states == [False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_stage", ["finish", "persist"])
+async def test_disconnect_salvage_obeys_remaining_session_deadline(
+    blocked_stage: str,
+) -> None:
+    class DeadlineAdapter(StubAsrAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.finish_calls = 0
+            self.close_calls = 0
+
+        async def finish(self) -> Sequence[TranscriptResult]:
+            self.finish_calls += 1
+            if blocked_stage == "finish":
+                await asyncio.Event().wait()
+            return await super().finish()
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            await super().close()
+
+    adapter = DeadlineAdapter()
+    socket = StubSocket(
+        [
+            {"type": "websocket.receive", "text": '{"type":"start"}'},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+    persisted_final_calls = 0
+    completion_states: list[bool] = []
+
+    async def persist(event: Any) -> None:
+        nonlocal persisted_final_calls
+        if event.type == "final":
+            persisted_final_calls += 1
+            if blocked_stage == "persist":
+                await asyncio.Event().wait()
+
+    async def close_persistence(_session_id: str, completed: bool) -> None:
+        completion_states.append(completed)
+
+    await asyncio.wait_for(
+        handle_asr_websocket(  # type: ignore[arg-type]
+            socket,
+            lambda: adapter,
+            event_hook=persist,
+            close_hook=close_persistence,
+            max_session_seconds=0.01,
+            cleanup_grace_seconds=0.01,
+        ),
+        timeout=0.2,
+    )
+
+    assert adapter.finish_calls == 1
+    assert adapter.close_calls == 1
+    assert persisted_final_calls == (1 if blocked_stage == "persist" else 0)
+    assert completion_states == [False]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_steps_have_independent_bounded_grace_and_run_once() -> None:
+    class HangingCleanupReportSocket(StubSocket):
+        async def send_json(self, payload: dict[str, Any]) -> None:
+            await super().send_json(payload)
+            if payload.get("code") == "session_cleanup_failed":
+                await asyncio.Event().wait()
+
+    class HangingCloseAdapter(StubAsrAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            await asyncio.Event().wait()
+
+    adapter = HangingCloseAdapter()
+    socket = HangingCleanupReportSocket(
+        [
+            {"type": "websocket.receive", "text": '{"type":"start"}'},
+            {"type": "websocket.receive", "text": '{"type":"stop"}'},
+        ]
+    )
+    persistence_close_calls = 0
+    completion_states: list[bool] = []
+
+    async def hanging_close_persistence(_session_id: str, completed: bool) -> None:
+        nonlocal persistence_close_calls
+        persistence_close_calls += 1
+        completion_states.append(completed)
+        await asyncio.Event().wait()
+
+    with pytest.raises(BaseExceptionGroup, match="ASR session cleanup failed") as caught:
+        await asyncio.wait_for(
+            handle_asr_websocket(  # type: ignore[arg-type]
+                socket,
+                lambda: adapter,
+                close_hook=hanging_close_persistence,
+                cleanup_grace_seconds=0.01,
+            ),
+            timeout=0.2,
+        )
+
+    assert [type(error) for error in caught.value.exceptions] == [TimeoutError, TimeoutError]
+    assert adapter.close_calls == 1
+    assert persistence_close_calls == 1
+    assert completion_states == [False]
+    assert socket.sent[-1]["code"] == "session_cleanup_failed"
+    assert socket.close_code == 1011
 
 
 @pytest.mark.asyncio

@@ -13,7 +13,11 @@ from app.api.router import api_router
 from app.api.routes import asr, health
 from app.core.config import Settings, get_settings
 from app.core.metrics import InMemoryMetrics
-from app.core.observability import RequestObservabilityMiddleware, request_id_from
+from app.core.observability import (
+    RequestObservabilityMiddleware,
+    configure_sensitive_transport_logging,
+    request_id_from,
+)
 from app.core.startup import validate_runtime_capabilities
 from app.db.base import Base
 from app.db.session import create_database_engine, create_session_factory
@@ -23,10 +27,13 @@ from app.security.csrf import OidcCsrfOriginMiddleware
 from app.security.oidc import OidcClient
 from app.security.request_limits import (
     DOCUMENT_UPLOAD_BODY_LIMIT,
+    WECHAT_LOGIN_BODY_LIMIT,
     DocumentUploadBodyLimitMiddleware,
     RequestBodyTooLarge,
-    document_too_large_response,
+    WeChatLoginBodyLimitMiddleware,
+    request_body_too_large_response,
 )
+from app.security.wechat import WeChatClient
 from app.services.asr.connections import build_asr_quota_registry
 from app.services.asr.worker import AsrProcessSupervisor
 from app.services.errors import DomainError
@@ -89,6 +96,7 @@ def create_app(
     initialize_schema: bool | None = None,
 ) -> FastAPI:
     settings = settings or get_settings()
+    configure_sensitive_transport_logging()
     validate_runtime_capabilities(settings)
     if settings.confirmation_secret is None or not settings.confirmation_secret.get_secret_value():
         settings = settings.model_copy(update={"confirmation_secret": SecretStr(token_urlsafe(48))})
@@ -153,7 +161,12 @@ def create_app(
     app.state.database_engine = database_engine
     app.state.settings = settings
     app.state.authenticator = build_authenticator(settings)
-    app.state.oidc_client = OidcClient(settings) if settings.auth_mode == "oidc" else None
+    app.state.oidc_client = (
+        OidcClient(settings) if settings.auth_mode in {"oidc", "oidc_wechat"} else None
+    )
+    app.state.wechat_client = (
+        WeChatClient(settings) if settings.auth_mode in {"wechat", "oidc_wechat"} else None
+    )
     app.state.asr_connections = build_asr_quota_registry(settings)
     app.state.asr_process_supervisor = AsrProcessSupervisor(
         max_workers=settings.asr_provider_worker_limit,
@@ -171,13 +184,21 @@ def create_app(
         path=f"{settings.api_prefix.rstrip('/')}/documents",
         max_body_bytes=DOCUMENT_UPLOAD_BODY_LIMIT,
     )
-    if settings.auth_mode == "oidc":
+    if settings.auth_mode in {"oidc", "oidc_wechat"}:
         # Registered before CORS/observability so those outer layers still attach
         # CORS and request-id headers. This also runs before request body parsing.
         app.add_middleware(
             OidcCsrfOriginMiddleware,
             allowed_origins=settings.cors_origins,
+            oidc_cookie_name=(
+                settings.oidc_session_cookie_name if settings.auth_mode == "oidc_wechat" else None
+            ),
         )
+    app.add_middleware(
+        WeChatLoginBodyLimitMiddleware,
+        path=f"{settings.api_prefix.rstrip('/')}/auth/wechat/login",
+        max_body_bytes=WECHAT_LOGIN_BODY_LIMIT,
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
@@ -199,16 +220,21 @@ def create_app(
 
     @app.exception_handler(RequestBodyTooLarge)
     async def request_body_too_large_handler(
-        request: Request, _exc: RequestBodyTooLarge
+        request: Request, exc: RequestBodyTooLarge
     ) -> JSONResponse:
-        return document_too_large_response(request)
+        return request_body_too_large_response(request, exc)
 
     @app.exception_handler(DomainError)
     async def domain_error_handler(request: Request, exc: DomainError) -> JSONResponse:
         request_id = request_id_from(request)
-        headers = {"X-Request-ID": request_id}
+        headers = {**exc.headers, "X-Request-ID": request_id}
         if exc.status_code == 401:
-            headers["WWW-Authenticate"] = "Bearer" if settings.auth_mode == "jwt" else "Session"
+            if settings.auth_mode == "oidc_wechat":
+                headers["WWW-Authenticate"] = "Session, Bearer"
+            else:
+                headers["WWW-Authenticate"] = (
+                    "Bearer" if settings.auth_mode in {"jwt", "wechat"} else "Session"
+                )
         return JSONResponse(
             status_code=exc.status_code,
             headers=headers,

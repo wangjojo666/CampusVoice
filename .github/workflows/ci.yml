@@ -34,6 +34,7 @@ jobs:
       - run: pnpm --filter @campusvoice/web exec playwright install --with-deps chromium webkit
       - run: pnpm test:e2e
       - run: pnpm build
+      - run: pnpm --filter @campusvoice/web test:pwa:standalone
 
   backend:
     runs-on: ubuntu-latest

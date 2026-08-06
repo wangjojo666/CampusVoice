@@ -90,8 +90,8 @@ class OidcClient:
     def __init__(
         self, settings: Settings, *, transport: httpx.AsyncBaseTransport | None = None
     ) -> None:
-        if settings.auth_mode != "oidc":
-            raise ValueError("OIDC client requires oidc auth mode")
+        if settings.auth_mode not in {"oidc", "oidc_wechat"}:
+            raise ValueError("OIDC client requires oidc or oidc_wechat auth mode")
         self._settings = settings
         self._transport = transport
         self._metadata: OidcMetadata | None = None

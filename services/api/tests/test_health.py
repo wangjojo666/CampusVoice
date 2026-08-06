@@ -2,11 +2,13 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy.engine import make_url
 
 from app import __version__ as package_version
+from app.services import health as health_module
 from app.services.health import expected_alembic_heads
 
 
@@ -54,6 +56,7 @@ def test_readiness_rejects_database_without_alembic_revision(client: TestClient)
     assert body["checks"]["asr"]["status"] == "disabled"
     assert body["checks"]["retriever"]["status"] == "ok"
     assert body["checks"]["llm"]["status"] == "disabled"
+    assert "ffmpeg" not in body["checks"]
 
 
 def test_readiness_accepts_database_at_current_alembic_head(client: TestClient) -> None:
@@ -107,3 +110,63 @@ def test_readiness_rejects_unreachable_shared_asr_quota(client: TestClient) -> N
         "status": "error",
         "message": "Redis ASR quota backend is unreachable",
     }
+
+
+@pytest.mark.parametrize(
+    ("ffmpeg_path", "expected_http_status", "expected_check_status"),
+    [
+        (None, 503, "error"),
+        ("/usr/bin/ffmpeg", 200, "ok"),
+    ],
+)
+@pytest.mark.parametrize("auth_mode", ["demo", "jwt", "oidc", "wechat", "oidc_wechat"])
+def test_asr_readiness_requires_ffmpeg_for_every_auth_mode(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    ffmpeg_path: str | None,
+    expected_http_status: int,
+    expected_check_status: str,
+    auth_mode: str,
+) -> None:
+    _stamp_revisions(client, expected_alembic_heads())
+    client.app.state.settings = client.app.state.settings.model_copy(
+        update={"auth_mode": auth_mode, "asr_provider": "funasr"}
+    )
+    monkeypatch.setattr(health_module, "_module_available", lambda _name: True)
+    monkeypatch.setattr(health_module, "which", lambda _name: ffmpeg_path)
+
+    response = client.get("/health/ready")
+
+    assert response.status_code == expected_http_status
+    assert response.json()["checks"]["asr"]["status"] == "ok"
+    assert response.json()["checks"]["ffmpeg"] == {
+        "status": expected_check_status,
+        "message": (
+            "FFmpeg is available for MP3 decoding"
+            if ffmpeg_path
+            else "FFmpeg is unavailable for MP3 decoding"
+        ),
+    }
+
+
+@pytest.mark.parametrize("auth_mode", ["demo", "jwt", "oidc", "wechat", "oidc_wechat"])
+def test_disabled_asr_omits_ffmpeg_for_every_auth_mode(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    auth_mode: str,
+) -> None:
+    _stamp_revisions(client, expected_alembic_heads())
+    client.app.state.settings = client.app.state.settings.model_copy(
+        update={"auth_mode": auth_mode, "asr_provider": "disabled"}
+    )
+
+    def unexpected_ffmpeg_probe(_name: str) -> None:
+        raise AssertionError("disabled ASR must not probe FFmpeg")
+
+    monkeypatch.setattr(health_module, "which", unexpected_ffmpeg_probe)
+
+    response = client.get("/health/ready")
+
+    assert response.status_code == 200
+    assert response.json()["checks"]["asr"]["status"] == "disabled"
+    assert "ffmpeg" not in response.json()["checks"]

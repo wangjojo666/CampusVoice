@@ -433,3 +433,25 @@ def test_websocket_ticket_is_origin_bound_and_single_use(
     assert asyncio.run(consume("https://attacker.invalid")) is None
     assert asyncio.run(consume(_ALLOWED_ORIGIN)) == "user_alice"
     assert asyncio.run(consume(_ALLOWED_ORIGIN)) is None
+
+    concurrent = client.post(
+        "/api/auth/ws-ticket",
+        headers=auth | {"Origin": _ALLOWED_ORIGIN},
+    )
+    assert concurrent.status_code == 200
+    concurrent_ticket = concurrent.json()["ticket"]
+
+    async def consume_concurrently() -> list[str | None]:
+        async def consume_once() -> str | None:
+            async with app.state.session_factory() as session:
+                return await consume_websocket_ticket(
+                    session,
+                    ticket=concurrent_ticket,
+                    origin=_ALLOWED_ORIGIN,
+                )
+
+        return list(await asyncio.gather(consume_once(), consume_once()))
+
+    outcomes = asyncio.run(consume_concurrently())
+    assert outcomes.count("user_alice") == 1
+    assert outcomes.count(None) == 1

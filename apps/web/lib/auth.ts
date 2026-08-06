@@ -1,7 +1,11 @@
 let accessToken: string | null = null;
 let redirectingToLogin = false;
 
-export const OIDC_ENABLED = process.env.NEXT_PUBLIC_AUTH_MODE === "oidc";
+export function oidcEnabledForAuthMode(mode: string | undefined): boolean {
+  return mode === "oidc" || mode === "oidc_wechat";
+}
+
+export const OIDC_ENABLED = oidcEnabledForAuthMode(process.env.NEXT_PUBLIC_AUTH_MODE);
 
 export function getAccessToken(): string | null {
   return accessToken;

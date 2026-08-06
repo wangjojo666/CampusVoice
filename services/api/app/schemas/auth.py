@@ -11,6 +11,24 @@ class WebSocketTicketResponse(StrictModel):
     expires_at: datetime
 
 
+class WeChatLoginRequest(StrictModel):
+    code: str = Field(min_length=8, max_length=256, pattern=r"^[A-Za-z0-9_-]+$")
+
+
+class WeChatLoginResponse(StrictModel):
+    session_token: str = Field(
+        min_length=38,
+        max_length=262,
+        pattern=r"^cvwx1\.[A-Za-z0-9_-]{32,256}$",
+    )
+    expires_at: datetime
+    display_name: str
+
+
+class WeChatLogoutResponse(StrictModel):
+    success: Literal[True] = True
+
+
 class WriteChallengeIssueRequest(StrictModel):
     method: Literal["POST", "PATCH", "DELETE"]
     path: str = Field(min_length=1, max_length=500)

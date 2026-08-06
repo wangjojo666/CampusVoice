@@ -47,8 +47,15 @@ def _origin_header_values(scope: Scope) -> list[str]:
 class OidcCsrfOriginMiddleware:
     """Reject unsafe OIDC-cookie requests that do not prove a trusted browser origin."""
 
-    def __init__(self, app: ASGIApp, *, allowed_origins: Sequence[str]) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        allowed_origins: Sequence[str],
+        oidc_cookie_name: str | None = None,
+    ) -> None:
         self._app = app
+        self._oidc_cookie_name = oidc_cookie_name
         self._allowed_origins = frozenset(
             origin for value in allowed_origins if (origin := _normalized_origin(value)) is not None
         )
@@ -57,6 +64,12 @@ class OidcCsrfOriginMiddleware:
         if scope["type"] != "http" or scope.get("method", "").upper() in _SAFE_METHODS:
             await self._app(scope, receive, send)
             return
+
+        if self._oidc_cookie_name is not None:
+            request = Request(scope, receive=receive)
+            if self._oidc_cookie_name not in request.cookies:
+                await self._app(scope, receive, send)
+                return
 
         origins = _origin_header_values(scope)
         origin = _normalized_origin(origins[0]) if len(origins) == 1 else None

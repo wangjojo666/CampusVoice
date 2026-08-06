@@ -5,7 +5,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import APIRouter, Header, Query, Request, Response
 from fastapi.responses import RedirectResponse
-from sqlalchemy import delete, or_, update
+from sqlalchemy import delete, or_, select, update
 
 from app.api.dependencies import (
     AuthPrincipalDependency,
@@ -16,14 +16,25 @@ from app.api.dependencies import (
 )
 from app.core.config import Settings
 from app.db.types import utc_now
-from app.models.entities import OidcLoginTransaction, OidcSession
+from app.models.entities import OidcLoginTransaction, OidcSession, User
 from app.schemas.auth import (
     OidcLogoutResponse,
     OidcSessionResponse,
     WebSocketTicketResponse,
+    WeChatLoginRequest,
+    WeChatLoginResponse,
+    WeChatLogoutResponse,
     WriteChallengeAdvanceRequest,
     WriteChallengeIssueRequest,
     WriteChallengeResponse,
+)
+from app.security.authentication import (
+    WECHAT_BEARER_PREFIX,
+    AuthenticationError,
+    AuthPrincipal,
+    internal_user_id,
+    wechat_bearer_from_authorization,
+    wechat_session_issuer,
 )
 from app.security.oidc import (
     OidcClient,
@@ -31,7 +42,8 @@ from app.security.oidc import (
     consume_oidc_transaction,
     token_hash,
 )
-from app.security.websocket_tickets import issue_websocket_ticket
+from app.security.websocket_tickets import issue_websocket_ticket, wechat_miniprogram_origin
+from app.security.wechat import WeChatClient, WeChatError
 from app.security.write_challenges import (
     IssuedWriteChallenge,
     advance_write_challenge,
@@ -42,6 +54,17 @@ from app.services.errors import DomainError
 router = APIRouter(prefix="/auth", tags=["authentication"])
 
 
+def _wechat_client(request: Request) -> WeChatClient:
+    client: WeChatClient | None = getattr(request.app.state, "wechat_client", None)
+    if client is None:
+        raise DomainError(
+            "wechat_not_configured",
+            "WeChat Mini Program authentication is not enabled",
+            status_code=404,
+        )
+    return client
+
+
 def _oidc_client(request: Request) -> OidcClient:
     client: OidcClient | None = getattr(request.app.state, "oidc_client", None)
     if client is None:
@@ -49,6 +72,144 @@ def _oidc_client(request: Request) -> OidcClient:
             "oidc_not_configured", "OIDC authentication is not enabled", status_code=404
         )
     return client
+
+
+@router.post("/wechat/login", response_model=WeChatLoginResponse)
+async def wechat_login(
+    body: WeChatLoginRequest,
+    request: Request,
+    response: Response,
+    session: SessionDependency,
+    settings: SettingsDependency,
+) -> WeChatLoginResponse:
+    if settings.auth_mode not in {"wechat", "oidc_wechat"}:
+        raise DomainError(
+            "wechat_not_configured",
+            "WeChat Mini Program authentication is not enabled",
+            status_code=404,
+        )
+    try:
+        identity = await _wechat_client(request).exchange_code(body.code)
+    except WeChatError as exc:
+        if exc.code in {
+            "wechat_exchange_capacity_exceeded",
+            "wechat_exchange_rate_exceeded",
+        }:
+            retry_after = exc.retry_after_seconds or 1
+            raise DomainError(
+                exc.code,
+                "The WeChat identity service is busy",
+                status_code=429,
+                details={"retry_after_seconds": retry_after},
+                headers={
+                    "Retry-After": str(retry_after),
+                    "Cache-Control": "no-store",
+                    "Pragma": "no-cache",
+                },
+            ) from exc
+        unavailable = exc.code in {
+            "wechat_service_unavailable",
+            "wechat_transport_rejected",
+            "wechat_response_too_large",
+            "wechat_response_invalid",
+            "wechat_identity_invalid",
+        }
+        raise DomainError(
+            exc.code,
+            (
+                "The WeChat identity service is unavailable"
+                if unavailable
+                else "The WeChat login code was rejected"
+            ),
+            status_code=503 if unavailable else 401,
+        ) from exc
+
+    assert settings.wechat_app_id is not None
+    issuer = wechat_session_issuer(settings.wechat_app_id)
+    principal_user_id = internal_user_id(issuer, identity.openid)
+    principal = AuthPrincipal(
+        user_id=principal_user_id,
+        subject=principal_user_id,
+        issuer=issuer,
+        display_name="微信用户",
+        authentication_method="wechat_code",
+    )
+    await provision_principal(session, principal, settings)
+    now = utc_now()
+    expires_at = now + timedelta(seconds=settings.wechat_session_ttl_seconds)
+    raw_session = WECHAT_BEARER_PREFIX + token_urlsafe(48)
+    # Serialize rotation on the stable user row. PostgreSQL honors FOR UPDATE;
+    # SQLite serializes the following write transaction at the database level.
+    locked_user_id = await session.scalar(
+        select(User.id).where(User.id == principal.user_id).with_for_update()
+    )
+    if locked_user_id is None:
+        await session.rollback()
+        raise DomainError(
+            "wechat_session_provisioning_failed",
+            "The WeChat session could not be provisioned",
+            status_code=503,
+        )
+    await session.execute(
+        delete(OidcSession).where(
+            OidcSession.user_id == principal.user_id,
+            OidcSession.issuer == issuer,
+        )
+    )
+    session.add(
+        OidcSession(
+            session_hash=token_hash(raw_session),
+            user_id=principal.user_id,
+            subject=principal.subject,
+            issuer=principal.issuer,
+            display_name=principal.display_name,
+            roles=[],
+            expires_at=expires_at,
+            last_seen_at=now,
+            created_at=now,
+        )
+    )
+    await session.commit()
+    _disable_credential_caching(response)
+    return WeChatLoginResponse(
+        session_token=raw_session,
+        expires_at=expires_at,
+        display_name=principal.display_name,
+    )
+
+
+@router.post("/wechat/logout", response_model=WeChatLogoutResponse)
+async def wechat_logout(
+    response: Response,
+    session: SessionDependency,
+    settings: SettingsDependency,
+    authorization: Annotated[str | None, Header(alias="Authorization")] = None,
+) -> WeChatLogoutResponse:
+    if settings.auth_mode not in {"wechat", "oidc_wechat"}:
+        raise DomainError(
+            "wechat_not_configured",
+            "WeChat Mini Program authentication is not enabled",
+            status_code=404,
+        )
+    assert settings.wechat_app_id is not None
+    raw = wechat_bearer_from_authorization(authorization)
+    if raw is None:
+        raise AuthenticationError(
+            "authentication_required" if authorization is None else "invalid_session_type",
+            "A prefixed WeChat bearer session is required",
+        )
+    await session.execute(
+        update(OidcSession)
+        .where(
+            OidcSession.session_hash == token_hash(raw),
+            OidcSession.issuer == wechat_session_issuer(settings.wechat_app_id),
+            OidcSession.revoked_at.is_(None),
+        )
+        .values(revoked_at=utc_now())
+    )
+    await session.commit()
+    _disable_credential_caching(response)
+    return WeChatLogoutResponse()
 
 
 @router.get("/login", include_in_schema=False)
@@ -178,13 +339,18 @@ async def oidc_session_status(
     request: Request,
     response: Response,
     session: SessionDependency,
-    settings: SettingsDependency,
 ) -> OidcSessionResponse:
     _disable_credential_caching(response)
     expires_at = None
-    if settings.auth_mode == "oidc":
-        raw = request.cookies.get(settings.oidc_session_cookie_name)
-        record = await session.get(OidcSession, token_hash(raw or "")) if raw else None
+    raw = getattr(request.state, "session_token", None)
+    expected_issuer = getattr(request.state, "session_issuer", None)
+    if isinstance(raw, str) and isinstance(expected_issuer, str):
+        record = await session.scalar(
+            select(OidcSession).where(
+                OidcSession.session_hash == token_hash(raw),
+                OidcSession.issuer == expected_issuer,
+            )
+        )
         expires_at = record.expires_at if record else None
     return OidcSessionResponse(
         authenticated=True,
@@ -203,7 +369,7 @@ async def oidc_logout(
     settings: SettingsDependency,
     origin: Annotated[str | None, Header(alias="Origin")] = None,
 ) -> OidcLogoutResponse:
-    if settings.auth_mode != "oidc":
+    if settings.auth_mode not in {"oidc", "oidc_wechat"}:
         raise DomainError(
             "oidc_not_configured", "OIDC authentication is not enabled", status_code=404
         )
@@ -213,11 +379,16 @@ async def oidc_logout(
             "A configured browser Origin is required for logout",
             status_code=403,
         )
+    assert settings.oidc_issuer is not None
     raw = request.cookies.get(settings.oidc_session_cookie_name)
     if raw:
         await session.execute(
             update(OidcSession)
-            .where(OidcSession.session_hash == token_hash(raw), OidcSession.revoked_at.is_(None))
+            .where(
+                OidcSession.session_hash == token_hash(raw),
+                OidcSession.issuer == settings.oidc_issuer,
+                OidcSession.revoked_at.is_(None),
+            )
             .values(revoked_at=utc_now())
         )
         await session.commit()
@@ -233,6 +404,7 @@ async def oidc_logout(
 
 @router.post("/ws-ticket", response_model=WebSocketTicketResponse)
 async def create_websocket_ticket(
+    principal: AuthPrincipalDependency,
     user_id: UserIdDependency,
     session: SessionDependency,
     settings: SettingsDependency,
@@ -240,15 +412,20 @@ async def create_websocket_ticket(
     origin: Annotated[str | None, Header(alias="Origin")] = None,
 ) -> WebSocketTicketResponse:
     _disable_credential_caching(response)
-    if origin is None or origin not in settings.cors_origins:
+    ticket_origin = origin
+    if principal.authentication_method == "wechat_session":
+        assert settings.wechat_app_id is not None
+        ticket_origin = wechat_miniprogram_origin(settings.wechat_app_id)
+    elif origin is None or origin not in settings.cors_origins:
         raise DomainError(
             "origin_not_allowed",
             "A configured browser Origin is required for a WebSocket ticket",
             status_code=403,
         )
+    assert ticket_origin is not None
     raw, record = issue_websocket_ticket(
         user_id=user_id,
-        origin=origin,
+        origin=ticket_origin,
         ttl_seconds=settings.websocket_ticket_ttl_seconds,
     )
     session.add(record)

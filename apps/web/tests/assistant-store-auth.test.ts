@@ -10,6 +10,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   getAccessToken,
   loginRedirectForUnauthorized,
+  oidcEnabledForAuthMode,
   setAccessToken,
   websocketProtocols,
 } from "@/lib/auth";
@@ -133,6 +134,14 @@ describe("in-memory browser authentication", () => {
       "campusvoice",
       "campusvoice.ticket.one-time-ticket",
     ]);
+  });
+
+  it("enables browser OIDC for both dedicated and hybrid auth modes", () => {
+    expect(oidcEnabledForAuthMode("oidc")).toBe(true);
+    expect(oidcEnabledForAuthMode("oidc_wechat")).toBe(true);
+    expect(oidcEnabledForAuthMode("wechat")).toBe(false);
+    expect(oidcEnabledForAuthMode("demo")).toBe(false);
+    expect(oidcEnabledForAuthMode(undefined)).toBe(false);
   });
 
   it("redirects OIDC 401 responses without looping on a callback error", () => {

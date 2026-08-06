@@ -121,6 +121,8 @@ importers:
         specifier: 4.1.10
         version: 4.1.10(@types/node@24.10.13)(@vitest/coverage-v8@4.1.10)(jsdom@29.1.1)(vite@8.1.4(@types/node@24.10.13)(jiti@2.7.0))
 
+  apps/wechat-mini: {}
+
   packages/shared-types:
     devDependencies:
       typescript:

@@ -43,6 +43,7 @@ data/evaluation/generated/
 # Editors and operating systems
 .idea/
 .vscode/
+project.private.config.json
 .DS_Store
 Thumbs.db
 

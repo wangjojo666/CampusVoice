@@ -1,0 +1,13 @@
+{
+  "name": "@campusvoice/wechat-mini",
+  "version": "0.3.0",
+  "license": "Apache-2.0",
+  "private": true,
+  "scripts": {
+    "build": "node scripts/static-check.js --build && node --test tests/module-smoke.test.js",
+    "lint": "node scripts/static-check.js",
+    "typecheck": "node scripts/static-check.js && node --test tests/module-smoke.test.js",
+    "test": "node --test tests/*.test.js",
+    "test:coverage": "node --test --experimental-test-coverage --test-coverage-include=app.js --test-coverage-include=config.js --test-coverage-include=pages/**/*.js --test-coverage-include=utils/**/*.js --test-coverage-lines=70 --test-coverage-branches=73 --test-coverage-functions=73 tests/*.test.js"
+  }
+}

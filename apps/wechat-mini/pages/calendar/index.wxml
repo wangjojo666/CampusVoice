@@ -1,0 +1,38 @@
+<view class="page">
+  <view class="row-between heading">
+    <view><view class="page-title">校园日历</view><view class="muted">创建前自动检查时间冲突</view></view>
+    <button class="primary mini-button" disabled="{{!configured}}" bindtap="toggleEditor">{{editorOpen ? '收起' : '新建'}}</button>
+  </view>
+
+  <view wx:if="{{!configured}}" class="banner">配置 HTTPS 服务后才能同步日历。</view>
+  <view wx:if="{{error}}" class="banner">{{error}}</view>
+
+  <view wx:if="{{editorOpen}}" class="card editor">
+    <view class="card-title">新增一小时日程</view>
+    <input class="field" maxlength="200" placeholder="日程标题（必填）" value="{{form.title}}" data-field="title" bindinput="updateField" />
+    <input class="field" maxlength="120" placeholder="课程（选填）" value="{{form.course}}" data-field="course" bindinput="updateField" />
+    <input class="field" maxlength="200" placeholder="地点（选填）" value="{{form.location}}" data-field="location" bindinput="updateField" />
+    <view class="form-row">
+      <picker class="picker" mode="date" value="{{form.date}}" data-field="date" bindchange="updateField">
+        <view class="field">{{form.date}}</view>
+      </picker>
+      <picker class="picker" mode="time" value="{{form.time}}" data-field="time" bindchange="updateField">
+        <view class="field">{{form.time}}</view>
+      </picker>
+    </view>
+    <button class="primary save-button" loading="{{busy}}" disabled="{{busy}}" bindtap="createEvent">检查冲突并创建</button>
+  </view>
+
+  <view wx:if="{{loading}}" class="loading">正在加载日程…</view>
+  <view wx:elif="{{events.length}}">
+    <view class="timeline-item" wx:for="{{events}}" wx:key="id">
+      <view class="timeline-dot"></view>
+      <view class="card event-card">
+        <view class="row-between"><view class="card-title">{{item.title}}</view><view class="pill">{{item.course || '日程'}}</view></view>
+        <view class="event-time">{{item.startText}}</view>
+        <view class="muted">至 {{item.endText}} · {{item.location || '地点待定'}}</view>
+      </view>
+    </view>
+  </view>
+  <view wx:else class="card empty">{{configured ? '近期暂无日程' : '服务配置后显示日程'}}</view>
+</view>

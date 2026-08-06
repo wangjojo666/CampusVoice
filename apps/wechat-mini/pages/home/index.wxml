@@ -1,0 +1,51 @@
+<view class="page">
+  <view class="hero">
+    <view class="hero-kicker">CAMPUSVOICE</view>
+    <view class="hero-title">{{greeting}}</view>
+    <view class="hero-copy">把校园里的通知、任务与日程，整理成清楚可执行的下一步。</view>
+  </view>
+
+  <view wx:if="{{!configured}}" class="banner">
+    当前为界面预览状态，尚未配置 HTTPS 服务。请在“设置”中填写开发地址；正式发布前必须写入已备案且已配置为微信合法域名的生产地址。
+  </view>
+  <view wx:if="{{error}}" class="banner">{{error}}</view>
+
+  <view class="section-title">快捷入口</view>
+  <view class="quick-grid">
+    <navigator class="quick-card voice" url="/pages/voice/index" open-type="switchTab">
+      <view class="quick-symbol">声</view><view class="quick-title">语音输入</view><view class="muted">说出任务或日程</view>
+    </navigator>
+    <navigator class="quick-card" url="/pages/tasks/index" open-type="switchTab">
+      <view class="quick-symbol">办</view><view class="quick-title">待办任务</view><view class="muted">核对下一步行动</view>
+    </navigator>
+    <navigator class="quick-card" url="/pages/calendar/index" open-type="switchTab">
+      <view class="quick-symbol">历</view><view class="quick-title">校园日历</view><view class="muted">查看时间与冲突</view>
+    </navigator>
+    <navigator class="quick-card" url="/pages/notices/index" open-type="switchTab">
+      <view class="quick-symbol">知</view><view class="quick-title">通知雷达</view><view class="muted">跟踪版本变化</view>
+    </navigator>
+  </view>
+
+  <view class="section-title">待办概览</view>
+  <view wx:if="{{loading}}" class="loading">正在同步…</view>
+  <view wx:elif="{{pendingTasks.length}}">
+    <view class="card" wx:for="{{pendingTasks}}" wx:key="id">
+      <view class="row-between"><view class="card-title">{{item.title}}</view><view class="pill">{{item.priority}}</view></view>
+      <view class="muted">截止：{{item.dueText}}</view>
+    </view>
+  </view>
+  <view wx:else class="card empty">{{configured ? '暂无待办任务' : '配置服务后显示你的待办任务'}}</view>
+
+  <view class="section-title">近期日程</view>
+  <view wx:if="{{upcomingEvents.length}}">
+    <view class="card" wx:for="{{upcomingEvents}}" wx:key="id">
+      <view class="card-title">{{item.title}}</view><view class="muted">{{item.startText}} · {{item.location || '地点待定'}}</view>
+    </view>
+  </view>
+  <view wx:else class="card empty">{{configured ? '近期暂无日程' : '配置服务后显示近期日程'}}</view>
+
+  <view class="row footer-links">
+    <button class="secondary footer-button" bindtap="openSettings">设置</button>
+    <button class="secondary footer-button" bindtap="openPrivacy">隐私说明</button>
+  </view>
+</view>

@@ -1,0 +1,32 @@
+<view class="page">
+  <view class="hero compact">
+    <view class="hero-kicker">SETTINGS</view>
+    <view class="hero-title">发布与连接</view>
+    <view class="hero-copy">AppID、环境和服务域名必须与微信公众平台配置一致。</view>
+  </view>
+
+  <view wx:if="{{message}}" class="success-box">{{message}}</view>
+  <view wx:if="{{error}}" class="error-box">{{error}}</view>
+
+  <view class="section-title">小程序信息</view>
+  <view class="card">
+    <view class="setting-row"><text class="muted">AppID</text><text selectable="true">{{appId}}</text></view>
+    <view class="setting-row"><text class="muted">运行环境</text><text>{{environment}}</text></view>
+    <view class="setting-row"><text class="muted">服务状态</text><text class="{{configured ? 'ok' : 'warn'}}">{{configured ? '已配置' : '未配置'}}</text></view>
+    <view class="setting-row"><text class="muted">登录状态</text><text>{{signedIn ? displayName || '已登录' : '未登录'}}</text></view>
+  </view>
+
+  <view class="section-title">CampusVoice API</view>
+  <view class="card">
+    <view class="muted">正式版仅使用代码中固定的 HTTPS 域名；开发版可在这里临时覆盖，凭据不会写入代码。</view>
+    <input class="field" disabled="{{release}}" value="{{apiInput}}" placeholder="https://api.example.edu" bindinput="updateApi" />
+    <button wx:if="{{!release}}" class="secondary action" bindtap="saveApi">保存开发地址</button>
+    <button class="primary action" loading="{{checking}}" disabled="{{!configured || checking}}" bindtap="checkConnection">检查服务连接</button>
+  </view>
+
+  <view class="section-title">账号与隐私</view>
+  <view class="card">
+    <button class="secondary action" bindtap="openPrivacy">查看隐私保护说明</button>
+    <button wx:if="{{signedIn}}" class="danger-outline action" bindtap="signOut">清除本机登录凭证</button>
+  </view>
+</view>

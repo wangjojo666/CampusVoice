@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
     database_url: str = "sqlite+aiosqlite:///./data/campusvoice.db"
     database_auto_create: bool = False
-    auth_mode: Literal["demo", "jwt", "oidc"] = "demo"
+    auth_mode: Literal["demo", "jwt", "oidc", "wechat", "oidc_wechat"] = "demo"
     demo_user_id: str = "user_demo"
     jwt_issuer: str | None = None
     jwt_audience: str | None = None
@@ -88,6 +88,13 @@ class Settings(BaseSettings):
     oidc_flow_cookie_name: str = Field(
         default="campusvoice_oidc_flow", pattern=r"^[A-Za-z0-9_-]{1,64}$"
     )
+    wechat_app_id: str | None = Field(default=None, pattern=r"^wx[a-fA-F0-9]{16}$")
+    wechat_app_secret: SecretStr | None = None
+    wechat_session_ttl_seconds: int = Field(default=28_800, ge=300, le=86_400)
+    wechat_http_timeout_seconds: float = Field(default=10.0, ge=1.0, le=30.0)
+    wechat_code_exchange_max_concurrency: int = Field(default=8, ge=1, le=64)
+    wechat_code_exchange_rate_per_second: float = Field(default=2.0, ge=0.1, le=100.0)
+    wechat_code_exchange_burst: int = Field(default=8, ge=1, le=256)
     websocket_ticket_ttl_seconds: int = Field(default=30, ge=10, le=120)
     confirmation_secret: SecretStr | None = None
     confirmation_challenge_ttl_seconds: int = Field(default=120, ge=30, le=600)
@@ -161,12 +168,26 @@ class Settings(BaseSettings):
                 assert self.jwt_jwks_url is not None
                 _require_production_https_url("jwt_issuer", self.jwt_issuer, issuer=True)
                 _require_production_https_url("jwt_jwks_url", self.jwt_jwks_url)
+        if self.auth_mode in {"wechat", "oidc_wechat"}:
+            app_secret = self.wechat_app_secret.get_secret_value() if self.wechat_app_secret else ""
+            missing = [
+                name
+                for name, value in (
+                    ("wechat_app_id", self.wechat_app_id),
+                    ("wechat_app_secret", app_secret),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError(f"WeChat authentication requires: {', '.join(missing)}")
+            if len(app_secret) != 32 or not app_secret.isascii() or not app_secret.isalnum():
+                raise ValueError("WeChat AppSecret must contain exactly 32 ASCII letters or digits")
         if "*" in self.cors_origins:
             raise ValueError(
                 "Credentialed browser requests forbid wildcard CORS origins; "
                 "configure exact origins"
             )
-        if self.auth_mode == "oidc":
+        if self.auth_mode in {"oidc", "oidc_wechat"}:
             missing = [
                 name
                 for name, value in (
@@ -214,7 +235,9 @@ class Settings(BaseSettings):
             )
         if self.env == "production":
             if self.auth_mode == "demo":
-                raise ValueError("production requires CAMPUSVOICE_AUTH_MODE=jwt or oidc")
+                raise ValueError(
+                    "production requires CAMPUSVOICE_AUTH_MODE=jwt, oidc, wechat, or oidc_wechat"
+                )
             if len(confirmation_secret) < 32:
                 raise ValueError(
                     "production requires CAMPUSVOICE_CONFIRMATION_SECRET "

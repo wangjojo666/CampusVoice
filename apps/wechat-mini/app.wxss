@@ -1,0 +1,132 @@
+page {
+  min-height: 100%;
+  background: #f3f7f9;
+  color: #102a3a;
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 28rpx;
+}
+
+button {
+  border-radius: 20rpx;
+  font-weight: 600;
+}
+button::after {
+  border: 0;
+}
+.page {
+  box-sizing: border-box;
+  min-height: 100vh;
+  padding: 28rpx 28rpx calc(40rpx + env(safe-area-inset-bottom));
+}
+.hero {
+  overflow: hidden;
+  position: relative;
+  padding: 36rpx;
+  border-radius: 34rpx;
+  color: #f8ffff;
+  background: linear-gradient(145deg, #071a2b 0%, #0b4350 55%, #007d6e 100%);
+  box-shadow: 0 18rpx 50rpx rgba(8, 42, 55, 0.2);
+}
+.hero-kicker {
+  font-size: 22rpx;
+  letter-spacing: 5rpx;
+  color: #89e8d5;
+}
+.hero-title {
+  margin-top: 12rpx;
+  font-size: 48rpx;
+  line-height: 1.18;
+  font-weight: 800;
+}
+.hero-copy {
+  margin-top: 16rpx;
+  color: rgba(248, 255, 255, 0.78);
+  line-height: 1.7;
+}
+.section-title {
+  margin: 38rpx 4rpx 20rpx;
+  font-size: 32rpx;
+  font-weight: 800;
+}
+.card {
+  box-sizing: border-box;
+  margin-bottom: 20rpx;
+  padding: 28rpx;
+  border: 1rpx solid #dbe7eb;
+  border-radius: 26rpx;
+  background: #ffffff;
+  box-shadow: 0 8rpx 26rpx rgba(21, 57, 70, 0.06);
+}
+.card-title {
+  color: #102a3a;
+  font-size: 30rpx;
+  font-weight: 750;
+}
+.muted {
+  color: #6a7f8b;
+  line-height: 1.65;
+}
+.pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 8rpx 16rpx;
+  border-radius: 999rpx;
+  color: #00695d;
+  background: #dcf5ef;
+  font-size: 22rpx;
+}
+.danger-pill {
+  color: #9f2d28;
+  background: #ffebe9;
+}
+.primary {
+  color: #ffffff;
+  background: #007d6e;
+}
+.secondary {
+  color: #075e55;
+  background: #e1f4ef;
+}
+.danger {
+  color: #ffffff;
+  background: #b63d36;
+}
+.field {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 88rpx;
+  margin-top: 14rpx;
+  padding: 22rpx 24rpx;
+  border: 1rpx solid #cddde2;
+  border-radius: 18rpx;
+  background: #f9fbfc;
+}
+.row {
+  display: flex;
+  align-items: center;
+  gap: 16rpx;
+}
+.row-between {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20rpx;
+}
+.empty {
+  padding: 70rpx 30rpx;
+  text-align: center;
+  color: #708590;
+}
+.loading {
+  padding: 46rpx 0;
+  text-align: center;
+  color: #607985;
+}
+.banner {
+  margin: 20rpx 0;
+  padding: 20rpx 24rpx;
+  border-radius: 18rpx;
+  color: #744600;
+  background: #fff2cf;
+  line-height: 1.55;
+}

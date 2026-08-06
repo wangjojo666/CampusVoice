@@ -354,7 +354,7 @@ export interface AsrTranscriptReference {
 
 export type AsrServerMessage = AsrServerMetadata &
   (
-    | { type: "ready" }
+    | { type: "ready" | "finalizing" }
     | { type: "speech_start"; timestamp_ms?: number }
     | {
         type: "interim" | "final";

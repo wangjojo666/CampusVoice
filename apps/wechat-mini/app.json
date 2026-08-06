@@ -1,0 +1,44 @@
+{
+  "pages": [
+    "pages/home/index",
+    "pages/voice/index",
+    "pages/tasks/index",
+    "pages/calendar/index",
+    "pages/notices/index",
+    "pages/settings/index",
+    "pages/privacy/index"
+  ],
+  "window": {
+    "navigationBarTitleText": "声程 CampusVoice",
+    "navigationBarBackgroundColor": "#071a2b",
+    "navigationBarTextStyle": "white",
+    "backgroundColor": "#f3f7f9",
+    "backgroundTextStyle": "dark"
+  },
+  "tabBar": {
+    "color": "#6b7b88",
+    "selectedColor": "#007d6e",
+    "backgroundColor": "#ffffff",
+    "borderStyle": "black",
+    "list": [
+      { "pagePath": "pages/home/index", "text": "首页" },
+      { "pagePath": "pages/voice/index", "text": "语音" },
+      { "pagePath": "pages/tasks/index", "text": "任务" },
+      { "pagePath": "pages/calendar/index", "text": "日历" },
+      { "pagePath": "pages/notices/index", "text": "通知" }
+    ]
+  },
+  "permission": {
+    "scope.record": {
+      "desc": "用于将你主动录制的语音发送到服务端，并在停止后识别；仅在点击开始后采集"
+    }
+  },
+  "networkTimeout": {
+    "request": 15000,
+    "connectSocket": 15000,
+    "uploadFile": 30000,
+    "downloadFile": 30000
+  },
+  "lazyCodeLoading": "requiredComponents",
+  "sitemapLocation": "sitemap.json"
+}

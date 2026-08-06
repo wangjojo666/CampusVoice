@@ -1,0 +1,44 @@
+.hero.compact {
+  padding: 32rpx;
+}
+.hero.compact .hero-title {
+  font-size: 42rpx;
+}
+.setting-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 24rpx;
+  padding: 18rpx 0;
+  border-bottom: 1rpx solid #edf2f4;
+}
+.setting-row:last-child {
+  border-bottom: 0;
+}
+.action {
+  margin-top: 22rpx;
+}
+.ok {
+  color: #007d6e;
+}
+.warn {
+  color: #9f5228;
+}
+.success-box,
+.error-box {
+  margin-top: 20rpx;
+  padding: 20rpx 24rpx;
+  border-radius: 18rpx;
+}
+.success-box {
+  color: #00695d;
+  background: #dcf5ef;
+}
+.error-box {
+  color: #9f2d28;
+  background: #ffebe9;
+}
+.danger-outline {
+  color: #a02f2a;
+  background: #fff;
+  border: 1rpx solid #d99b97;
+}

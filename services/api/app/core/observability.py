@@ -13,6 +13,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from app.core.metrics import InMemoryMetrics
 
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{8,128}$")
+_SENSITIVE_TRANSPORT_QUERY_PATTERN = re.compile(r"(?i)([?&](?:secret|js_code)=)[^&\s\"']+")
 _LOGGER = logging.getLogger("campusvoice.request")
 _SHORT_LIVED_CREDENTIAL_ROUTES = (
     "/auth/ws-ticket",
@@ -20,6 +21,38 @@ _SHORT_LIVED_CREDENTIAL_ROUTES = (
     "/auth/write-challenges/advance",
     "/actions/{action_id}/challenge",
 )
+
+
+def _redact_transport_value(value: object) -> object:
+    if isinstance(value, str):
+        return _SENSITIVE_TRANSPORT_QUERY_PATTERN.sub(r"\1<redacted>", value)
+    rendered = str(value)
+    if "api.weixin.qq.com/sns/jscode2session" in rendered:
+        return _SENSITIVE_TRANSPORT_QUERY_PATTERN.sub(r"\1<redacted>", rendered)
+    return value
+
+
+class _SensitiveTransportLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = _redact_transport_value(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(_redact_transport_value(value) for value in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {
+                key: _redact_transport_value(value) for key, value in record.args.items()
+            }
+        return True
+
+
+def configure_sensitive_transport_logging() -> None:
+    """Keep outbound auth credentials out of dependency request logs."""
+
+    for name in ("httpx", "httpcore"):
+        logger = logging.getLogger(name)
+        if logger.level < logging.WARNING:
+            logger.setLevel(logging.WARNING)
+        if not any(isinstance(item, _SensitiveTransportLogFilter) for item in logger.filters):
+            logger.addFilter(_SensitiveTransportLogFilter())
 
 
 def request_id_from(request: Request) -> str:

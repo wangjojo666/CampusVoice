@@ -106,10 +106,11 @@ source/inference 字段、许可校验、speaker-disjoint 约束和 `NOT_RUN` �
 ## 已实现能力
 
 - 浏览器 AudioWorklet 采集 16 kHz 单声道 PCM，通过 `/ws/asr` 实时传输。
+- 原生微信小程序使用 RecorderManager 的 MP3 分帧；服务端在停止后有界聚合，并用固定 FFmpeg 命令转为 16 kHz 单声道 s16le，再执行最终识别。小程序录制中不承诺实时 partial。
 - FunASR 流式中文识别、FSMN-VAD、CT-Punc、热词和 Whisper 离线基线。
 - 创建/修改/删除任务与日历、冲突与重复检测、乐观版本检查和撤销。
 - 严格 Pydantic 意图 Schema、一次结构化修复、缺失字段追问和低置信度保护。
-- development/test 显式 demo 身份、Bearer JWT 适配器，以及服务端校园 OIDC Authorization Code + PKCE 会话边界。
+- development/test 显式 demo 身份、Bearer JWT 适配器、服务端校园 OIDC Authorization Code + PKCE 会话边界，以及微信小程序 `wx.login`、`cvwx1.` Bearer 短期会话。
 - 确定性风险分级：服务端签发并绑定用户、操作、请求内容、阶段和过期时间的一次性挑战；高风险删除需要两次分离交互。
 - ASR 使用短时、一次性 WebSocket ticket，不在 URL、日志或数据库中保存长期访问令牌，并限制帧、空闲、会话、音频与并发配额。
 - PDF、DOCX、TXT、Markdown 通知库、中文向量检索、证据约束 LLM 问答、真实页码和证据不足拒答。
@@ -125,7 +126,7 @@ source/inference 字段、许可校验、speaker-disjoint 约束和 `NOT_RUN` �
 - Node.js 20.9 以上；本项目验证版本为 Node.js 24。
 - pnpm 11.7。
 - Python 3.11。不要使用当前仍可能缺少 AI wheel 的 Python 3.13/3.14。
-- FFmpeg。
+- FFmpeg；微信小程序 MP3 录音的服务端解码路径必须可执行。
 - 可选：支持 CUDA 的 NVIDIA GPU。本机验证组合为 PyTorch/Torchaudio 2.11.0 + CUDA 13.0。
 - Docker 部署需要 Docker Desktop/Engine 和 Compose；Windows 家庭版使用 WSL 2 Linux 容器。
 
@@ -164,9 +165,11 @@ if (-not (Test-Path apps/web/.env.local)) {
 }
 ```
 
-根目录 `.env` 供 API 运行时和 Compose 使用；其中的 `NEXT_PUBLIC_API_BASE_URL` 只作为 Compose 构建 Web 镜像的参数。原生 Next.js 不读取仓库根 `.env`；它按 Next.js 优先级读取进程环境及 `apps/web` 下的 `.env*`，本文以 `apps/web/.env.local` 为本地模板。不要在任何 `NEXT_PUBLIC_` 变量中存放密钥。
+根目录 `.env` 供 API 运行时和 Compose 使用；其中的 `NEXT_PUBLIC_API_BASE_URL` 只作为 Compose 构建 Web 镜像的参数。原生 Next.js 不读取仓库根 `.env`；它按 Next.js 优先级读取进程环境及 `apps/web` 下的 `.env*`，本文以 `apps/web/.env.local` 为本地模板。不要在任何 `NEXT_PUBLIC_` 变量中存放密钥。非 Compose 的原生或 CI Web 构建还必须让 `NEXT_PUBLIC_AUTH_MODE` 与浏览器认证拓扑一致：浏览器单独使用校园 OIDC 时设为 `oidc`，Web 与微信小程序共用混合 API 时设为 `oidc_wechat`；若仍保留模板的 `demo`，浏览器收到 401 后不会发起 OIDC 登录，因此不得发布该构建。
 
-本地默认仅在 `development` 下显式启用 demo auth。校园试点使用 `CAMPUSVOICE_ENV=production` 与 `CAMPUSVOICE_AUTH_MODE=oidc`，并配置 HTTPS issuer、client ID、API 回调地址、登录/登出跳转地址、`openid` scope、非对称 ID-token 算法，以及至少 32 字符的 `CAMPUSVOICE_CONFIRMATION_SECRET`；缺项会启动失败且绝不回退到 `user_demo`。PKCE verifier、state、nonce、可选 client secret 和 code exchange 全在 API 端；浏览器只持有 `HttpOnly` 随机会话 cookie，不接收或持久化 access token。非浏览器客户端仍可使用 `jwt` 模式。详见 [`docs/decisions/0004-oidc-authorization-code-pkce.md`](docs/decisions/0004-oidc-authorization-code-pkce.md)。
+本地默认仅在 `development` 下显式启用 demo auth；production 缺少所选认证模式的完整配置时启动失败，绝不回退到 `user_demo`。校园浏览器单独部署使用 `CAMPUSVOICE_AUTH_MODE=oidc`；微信小程序单独部署可使用 `wechat`；同一 API 同时服务 Web 与小程序必须使用 `oidc_wechat`。在共存模式中，不带 `Authorization` 的请求只按 OIDC `HttpOnly` cookie 认证，带 `Bearer cvwx1.…` 的请求只按微信小程序会话认证；错误或非 `cvwx1.` Bearer 不会回退并借用浏览器 cookie。`oidc_wechat` 必须同时配置完整的 OIDC HTTPS issuer/client/callback 参数、微信 AppID/AppSecret，以及至少 32 字符的 `CAMPUSVOICE_CONFIRMATION_SECRET`。
+
+OIDC 的 PKCE verifier、state、nonce、可选 client secret 和 code exchange 全在 API 端；浏览器不接收或持久化 access token。微信 AppSecret 与 `code2session` 交换也只存在于 API 端；API 对交换实施单进程持续速率和并发限制，并在同一 AppID 用户重新登录时轮换旧会话，小程序只持有当前短期随机 `cvwx1.` Bearer。多实例生产部署仍必须在 Ingress 配置共享的来源限流，不能把进程内闸门当作分布式配额。非浏览器通用集成仍可选择独立 `jwt` 模式。浏览器认证详见 [`docs/decisions/0004-oidc-authorization-code-pkce.md`](docs/decisions/0004-oidc-authorization-code-pkce.md)，小程序部署、平台配置与发布门禁见 [`docs/wechat-miniprogram.md`](docs/wechat-miniprogram.md)。
 
 生产 ASR 不使用浏览器 `SpeechRecognition`。在 `.env` 中启用真实 FunASR：
 
@@ -179,6 +182,8 @@ CAMPUSVOICE_ASR_PUNC_MODEL=ct-punc
 ```
 
 没有 GPU 时把设备改为 `cpu`。Whisper 基线需设置 `CAMPUSVOICE_ASR_PROVIDER=whisper`、`CAMPUSVOICE_ASR_MODEL=small`，不能沿用 Paraformer 模型名。首次使用会下载模型，请预留数 GB 空间。
+
+浏览器 PCM 路径可在录制中产生流式结果；微信 RecorderManager 路径发送有界 MP3 分帧，服务端不会在录制中把这些压缩帧交给 ASR，也不会返回实时 partial。收到 `stop` 后，服务端才以固定参数、非 shell 的 FFmpeg 子进程将完整 MP3 解码为 16 kHz、单声道、s16le PCM，并在解码字节数、时长和超时限制内送入 provider 完成最终识别。因此，微信小程序生产发布必须同时满足：FFmpeg 可执行文件可用、镜像已安装对应 AI 依赖、真实 `funasr` 或 `whisper` provider 及模型已就绪；默认 `disabled` provider 只能用于非语音功能验证。
 
 FunASR 和 Whisper 的模型执行位于 `spawn` 启动的受监督子进程中；finish 或其他模型操作超时、请求取消及服务关闭都会先 terminate/join，必要时再 kill/join。默认每个 API 进程最多运行 1 个 provider worker，最多排队 8 个会话，排队 5 秒、常规模型操作 120 秒、finish 30 秒后失败。可通过 `CAMPUSVOICE_ASR_PROVIDER_WORKER_LIMIT`、`CAMPUSVOICE_ASR_PROVIDER_QUEUE_LIMIT`、`CAMPUSVOICE_ASR_PROVIDER_ADMISSION_TIMEOUT_SECONDS`、`CAMPUSVOICE_ASR_PROVIDER_OPERATION_TIMEOUT_SECONDS` 和 `CAMPUSVOICE_ASR_PROVIDER_FINISH_TIMEOUT_SECONDS` 调整；terminate/kill 的 join 上限分别由 `CAMPUSVOICE_ASR_PROVIDER_TERMINATE_TIMEOUT_SECONDS` 和 `CAMPUSVOICE_ASR_PROVIDER_KILL_TIMEOUT_SECONDS` 控制。
 
@@ -213,7 +218,7 @@ python -m uvicorn app.main:app --reload --port 8000
 pnpm dev:web
 ```
 
-打开 <http://localhost:3000>。API 文档位于 <http://localhost:8000/docs>。`/health/live` 只表示进程存活；`/health/ready` 还检查数据库、Alembic head 与已启用组件配置。兼容入口 `/api/health` 保留，运行指标位于 `/api/metrics`。
+打开 <http://localhost:3000>。API 文档位于 <http://localhost:8000/docs>。`/health/live` 只表示进程存活；`/health/ready` 和 `/api/health/ready` 检查数据库、Alembic head 与已启用组件配置。兼容入口 `/api/health` 保留，运行指标位于 `/api/metrics`。
 
 浏览器麦克风只允许在 `localhost` 或 HTTPS 安全上下文使用。拒绝权限、WebSocket 断线和模型未配置都会显示真实错误，不会回退为伪造转写。
 
@@ -225,7 +230,7 @@ API 启动后运行：
 python scripts/seed_demo.py
 ```
 
-在 `development/test + demo auth` 下，应用会创建固定演示身份 `user_demo`；它只用于本地合成数据，不是生产账户。JWT/OIDC 模式下用户 ID 由服务端根据受验证的 issuer 与 subject 稳定映射，客户端不能通过请求头、路径或正文选择用户。种子脚本通过 REST 接口写入合成课程、热词、待办、考试日程和两份校园通知，可安全重复运行。
+在 `development/test + demo auth` 下，应用会创建固定演示身份 `user_demo`；它只用于本地合成数据，不是生产账户。JWT、OIDC 和微信模式下，用户 ID 均由服务端根据受验证的 issuer 与 subject/OpenID 稳定映射，客户端不能通过请求头、路径或正文选择用户。种子脚本通过 REST 接口写入合成课程、热词、待办、考试日程和两份校园通知，可安全重复运行。
 
 ## Docker Compose
 
@@ -267,9 +272,9 @@ if ($LASTEXITCODE -ne 0) { throw "API recreation failed; keep external writes is
 已经使用 `/data/campusvoice.db` 的部署无需迁移。升级必须带 `--build`，避免新
 `working_dir` 与旧镜像的相对入口组合导致启动失败。
 
-默认 Compose 镜像不安装 AI 额外依赖，并明确使用 `ASR=disabled` 与 `knowledge=lexical`；它适合先验证任务、日历、确认、事务和引用链路，不会伪造语音转写结果。若手动把检索器切到 `embedding`，必须同时构建 AI 镜像。
+默认 Compose 镜像不安装 AI 额外依赖，并明确使用 `ASR=disabled` 与 `knowledge=lexical`；它适合先验证任务、日历、确认、事务和引用链路，不会伪造语音转写结果，也不满足微信小程序语音发布条件。小程序发布镜像必须包含 FFmpeg、所选 ASR provider 的 AI 依赖与可用模型。若手动把检索器切到 `embedding`，同样必须构建 AI 镜像。
 
-默认的 `demo` 身份不是网络认证，因此 Compose 只把 Web `3000` 和 API `8000` 发布到 `127.0.0.1`，不会无意暴露给局域网。若确需从其他设备访问，先切换到完整配置的 `jwt` 或 `oidc` 认证、设置精确的 CORS origin，并在构建 Web 镜像前把 `NEXT_PUBLIC_API_BASE_URL` 改为该设备可访问的 API 地址；随后显式设置 `CAMPUSVOICE_BIND_HOST=0.0.0.0`。不要把默认 demo 栈直接暴露到不受信网络。
+默认的 `demo` 身份不是网络认证，因此 Compose 只把 Web `3000` 和 API `8000` 发布到 `127.0.0.1`，不会无意暴露给局域网。若确需从其他设备访问，先切换到完整配置的 `jwt`、`oidc`、`wechat` 或 `oidc_wechat` 认证并部署受信任 HTTPS/WSS；Web 与小程序共用 API 时选择 `oidc_wechat` 并设置精确的浏览器 CORS origin，只有小程序时可选择 `wechat` 并仅部署 API。构建 Web 镜像前还要把 `NEXT_PUBLIC_API_BASE_URL` 改为设备可访问的 HTTPS API 地址；随后按反向代理拓扑显式配置绑定地址。不要把默认 demo 栈直接暴露到不受信网络。
 
 可在本地检查默认绑定、SQLite 卷路径、`.env.example` 和显式覆盖的解析结果：
 

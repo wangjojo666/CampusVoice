@@ -1,0 +1,41 @@
+.quick-grid {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+}
+.quick-card {
+  box-sizing: border-box;
+  width: 48.6%;
+  min-height: 210rpx;
+  margin-bottom: 18rpx;
+  padding: 26rpx;
+  border: 1rpx solid #dbe7eb;
+  border-radius: 26rpx;
+  background: #fff;
+}
+.quick-card.voice {
+  background: linear-gradient(145deg, #e1f8f2, #fff);
+}
+.quick-symbol {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 66rpx;
+  height: 66rpx;
+  margin-bottom: 18rpx;
+  border-radius: 22rpx;
+  color: #fff;
+  background: #007d6e;
+  font-weight: 800;
+}
+.quick-title {
+  margin-bottom: 6rpx;
+  font-weight: 800;
+}
+.footer-links {
+  margin-top: 32rpx;
+}
+.footer-button {
+  flex: 1;
+  font-size: 26rpx;
+}

@@ -10,7 +10,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.core.config import Settings
 from app.core.metrics import InMemoryMetrics
 from app.models.entities import User, UserSettings
-from app.security.authentication import Authenticator, AuthPrincipal, authenticate_oidc_session
+from app.security.authentication import (
+    AuthenticationError,
+    Authenticator,
+    AuthPrincipal,
+    authenticate_stored_session,
+    wechat_bearer_from_authorization,
+    wechat_session_issuer,
+)
 from app.security.write_challenges import consume_write_challenge
 from app.services.errors import DomainError
 
@@ -55,11 +62,32 @@ async def current_principal(
     authenticator: Annotated[Authenticator, Depends(get_authenticator)],
     credentials: Annotated[HTTPAuthorizationCredentials | None, Security(_BEARER)],
 ) -> AuthPrincipal:
-    if settings.auth_mode == "oidc":
-        principal = await authenticate_oidc_session(
+    mode = settings.auth_mode
+    if mode in {"oidc", "wechat", "oidc_wechat"}:
+        authorization = request.headers.get("authorization")
+        if mode == "oidc" or (mode == "oidc_wechat" and authorization is None):
+            token = request.cookies.get(settings.oidc_session_cookie_name)
+            assert settings.oidc_issuer is not None
+            expected_issuer = settings.oidc_issuer
+            authentication_method = "oidc_session"
+        else:
+            token = wechat_bearer_from_authorization(authorization)
+            if authorization is not None and token is None:
+                raise AuthenticationError(
+                    "invalid_session_type",
+                    "A prefixed WeChat bearer session is required",
+                )
+            assert settings.wechat_app_id is not None
+            expected_issuer = wechat_session_issuer(settings.wechat_app_id)
+            authentication_method = "wechat_session"
+        principal = await authenticate_stored_session(
             session,
-            request.cookies.get(settings.oidc_session_cookie_name),
+            token,
+            expected_issuer=expected_issuer,
+            authentication_method=authentication_method,
         )
+        request.state.session_token = token
+        request.state.session_issuer = expected_issuer
     else:
         token = credentials.credentials if credentials is not None else None
         principal = await authenticator.authenticate(token)

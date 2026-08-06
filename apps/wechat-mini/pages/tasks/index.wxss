@@ -1,0 +1,36 @@
+.heading {
+  margin-bottom: 28rpx;
+}
+.page-title {
+  font-size: 44rpx;
+  font-weight: 850;
+}
+.mini-button {
+  min-width: 136rpx;
+  margin: 0;
+  font-size: 26rpx;
+}
+.editor {
+  border-color: #a9d9d1;
+}
+.form-row {
+  display: flex;
+  justify-content: space-between;
+}
+.picker {
+  width: 48%;
+}
+.save-button {
+  margin-top: 24rpx;
+}
+.task.completed {
+  opacity: 0.66;
+}
+.task-main {
+  flex: 1;
+  min-width: 0;
+}
+.complete-button {
+  margin-top: 22rpx;
+  font-size: 25rpx;
+}
