@@ -26,7 +26,11 @@ class DocumentRepository:
             await session.scalars(
                 select(Document)
                 .where(Document.user_id == user_id)
-                .order_by(Document.publish_date.desc().nullslast(), Document.created_at.desc())
+                .order_by(
+                    Document.publish_date.is_(None).asc(),
+                    Document.publish_date.desc(),
+                    Document.created_at.desc(),
+                )
             )
         )
 
@@ -42,7 +46,11 @@ class DocumentRepository:
         rows = await session.execute(
             select(Document, chunk_count)
             .where(Document.user_id == user_id)
-            .order_by(Document.publish_date.desc().nullslast(), Document.created_at.desc())
+            .order_by(
+                Document.publish_date.is_(None).asc(),
+                Document.publish_date.desc(),
+                Document.created_at.desc(),
+            )
         )
         return [(document, int(count)) for document, count in rows]
 

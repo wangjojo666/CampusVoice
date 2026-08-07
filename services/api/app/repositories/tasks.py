@@ -32,7 +32,8 @@ class TaskRepository:
             select(Task)
             .where(*filters)
             .order_by(
-                Task.due_at.asc().nullslast(),
+                Task.due_at.is_(None).asc(),
+                Task.due_at.asc(),
                 Task.created_at.desc(),
                 Task.id.asc(),
             )
@@ -68,7 +69,11 @@ class TaskRepository:
             await session.scalars(
                 select(Task)
                 .where(Task.user_id == user_id, func.lower(Task.title) == normalized)
-                .order_by(Task.due_at.asc().nullslast(), Task.created_at.desc())
+                .order_by(
+                    Task.due_at.is_(None).asc(),
+                    Task.due_at.asc(),
+                    Task.created_at.desc(),
+                )
                 .limit(20)
             )
         )
