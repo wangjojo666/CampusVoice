@@ -10,22 +10,47 @@
   ],
   "window": {
     "navigationBarTitleText": "声程 CampusVoice",
-    "navigationBarBackgroundColor": "#071a2b",
-    "navigationBarTextStyle": "white",
-    "backgroundColor": "#f3f7f9",
+    "navigationBarBackgroundColor": "#f6f8f6",
+    "navigationBarTextStyle": "black",
+    "backgroundColor": "#f6f8f6",
     "backgroundTextStyle": "dark"
   },
   "tabBar": {
-    "color": "#6b7b88",
-    "selectedColor": "#007d6e",
-    "backgroundColor": "#ffffff",
-    "borderStyle": "black",
+    "color": "#5e6f6a",
+    "selectedColor": "#0c7a6c",
+    "backgroundColor": "#fbfcfa",
+    "borderStyle": "white",
     "list": [
-      { "pagePath": "pages/home/index", "text": "首页" },
-      { "pagePath": "pages/voice/index", "text": "语音" },
-      { "pagePath": "pages/tasks/index", "text": "任务" },
-      { "pagePath": "pages/calendar/index", "text": "日历" },
-      { "pagePath": "pages/notices/index", "text": "通知" }
+      {
+        "pagePath": "pages/home/index",
+        "text": "首页",
+        "iconPath": "assets/tab/home.png",
+        "selectedIconPath": "assets/tab/home-active.png"
+      },
+      {
+        "pagePath": "pages/voice/index",
+        "text": "语音",
+        "iconPath": "assets/tab/voice.png",
+        "selectedIconPath": "assets/tab/voice-active.png"
+      },
+      {
+        "pagePath": "pages/tasks/index",
+        "text": "任务",
+        "iconPath": "assets/tab/tasks.png",
+        "selectedIconPath": "assets/tab/tasks-active.png"
+      },
+      {
+        "pagePath": "pages/calendar/index",
+        "text": "日历",
+        "iconPath": "assets/tab/calendar.png",
+        "selectedIconPath": "assets/tab/calendar-active.png"
+      },
+      {
+        "pagePath": "pages/notices/index",
+        "text": "通知",
+        "iconPath": "assets/tab/notices.png",
+        "selectedIconPath": "assets/tab/notices-active.png"
+      }
     ]
   },
   "permission": {

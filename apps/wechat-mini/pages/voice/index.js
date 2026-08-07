@@ -1,3 +1,4 @@
+const { currentAccountBoundary } = require("../../utils/auth");
 const { request } = require("../../utils/request");
 const { configuredApiBase, websocketBase } = require("../../utils/config");
 const { friendlyError } = require("../../utils/format");
@@ -46,11 +47,48 @@ Page({
       },
     };
     voiceSession.attach(this.voiceObserver);
-    this.setData({ configured: Boolean(configuredApiBase()) });
+    this.syncConfiguration();
   },
 
   onShow() {
-    this.setData({ configured: Boolean(configuredApiBase()) });
+    this.syncConfiguration();
+  },
+
+  syncConfiguration() {
+    let apiBase;
+    let boundary;
+    try {
+      apiBase = configuredApiBase();
+      boundary = apiBase ? currentAccountBoundary(apiBase) : { accountId: "", logoutGeneration: 0 };
+    } catch (_error) {
+      const snapshot = voiceSession.snapshot();
+      if (["idle", "done"].includes(snapshot.phase)) voiceSession.reset();
+      else voiceSession.discard("本地配置读取异常，录音已安全停止");
+      this._activeApiBase = "";
+      this._activeAccountId = "";
+      this._activeLogoutGeneration = -1;
+      this.setData({
+        configured: false,
+        transcript: "",
+        error: "无法安全读取本地配置，请重试",
+      });
+      return;
+    }
+    const hasPreviousScope = this._activeApiBase !== undefined;
+    const scopeChanged =
+      hasPreviousScope &&
+      (this._activeApiBase !== apiBase ||
+        (this._activeAccountId && this._activeAccountId !== boundary.accountId) ||
+        this._activeLogoutGeneration !== boundary.logoutGeneration);
+    const snapshot = voiceSession.snapshot();
+    if (scopeChanged || (!apiBase && snapshot.transcript)) {
+      if (["idle", "done"].includes(snapshot.phase)) voiceSession.reset();
+      else voiceSession.discard("账号或服务已变化，录音已安全停止");
+    }
+    this._activeApiBase = apiBase;
+    this._activeAccountId = boundary.accountId;
+    this._activeLogoutGeneration = boundary.logoutGeneration;
+    this.setData({ configured: Boolean(apiBase) });
   },
 
   onHide() {

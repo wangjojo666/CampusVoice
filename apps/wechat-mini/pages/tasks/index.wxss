@@ -1,36 +1,145 @@
-.heading {
-  margin-bottom: 28rpx;
+.task-section {
+  margin-top: 34rpx;
 }
-.page-title {
-  font-size: 44rpx;
-  font-weight: 850;
+
+.required-mark {
+  color: #a9443d;
 }
-.mini-button {
-  min-width: 136rpx;
-  margin: 0;
-  font-size: 26rpx;
-}
-.editor {
-  border-color: #a9d9d1;
-}
-.form-row {
+
+.picker-field {
   display: flex;
+  align-items: center;
   justify-content: space-between;
 }
-.picker {
-  width: 48%;
+
+.picker-arrow {
+  flex-shrink: 0;
+  margin-left: 16rpx;
+  color: #607771;
+  font-size: 26rpx;
 }
-.save-button {
-  margin-top: 24rpx;
+
+.task {
+  display: flex;
+  align-items: flex-start;
+  padding: 24rpx;
 }
-.task.completed {
-  opacity: 0.66;
+
+.task-status {
+  box-sizing: border-box;
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 40rpx;
+  height: 40rpx;
+  margin-top: 3rpx;
+  border: 3rpx solid #9fb7b1;
+  border-radius: 50%;
+  color: #ffffff;
+  font-size: 22rpx;
+  font-weight: 700;
 }
+
+.task-status.done {
+  border-color: #0c7a6c;
+  background: #0c7a6c;
+}
+
+.task-body,
 .task-main {
   flex: 1;
   min-width: 0;
 }
+
+.task-body {
+  margin-left: 20rpx;
+}
+
+.task-heading {
+  align-items: flex-start;
+}
+
+.task-title,
+.task-meta,
+.status-copy,
+.empty-copy {
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+
+.task-meta {
+  margin-top: 8rpx;
+  font-size: 24rpx;
+}
+
+.task.completed .task-title {
+  color: #60756f;
+  text-decoration: line-through;
+}
+
 .complete-button {
-  margin-top: 22rpx;
+  width: auto;
+  margin: 20rpx 0 0;
+}
+
+.empty-action {
+  min-width: 220rpx;
+  margin: 26rpx auto 0;
   font-size: 25rpx;
+}
+
+.retry-icon {
+  color: #976029;
+  background: #fff0d5;
+}
+
+@media (max-width: 360px) {
+  .page-header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .form-row {
+    display: block;
+  }
+
+  .picker {
+    display: block;
+    width: 100%;
+  }
+
+  .picker + .picker {
+    margin-top: 14rpx;
+    margin-left: 0;
+  }
+
+  .task-body {
+    margin-left: 20rpx;
+  }
+
+  .task-heading {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+}
+.task-badges {
+  display: flex;
+  flex-shrink: 0;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.task-badges .pill + .pill {
+  margin-top: 8rpx;
+}
+
+.priority-pill,
+.status-pill {
+  white-space: nowrap;
+}
+
+.status-pill {
+  color: #405d57;
+  background: #eef4f2;
 }

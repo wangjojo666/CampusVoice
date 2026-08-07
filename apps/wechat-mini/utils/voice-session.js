@@ -596,6 +596,14 @@ class VoiceSessionController {
     } catch (_error) {}
   }
 
+  discard(message) {
+    const wasStopping = this.phase === "stopping";
+    this.finalSegments = [];
+    this.interimTranscript = "";
+    this.failClosed(message);
+    if (wasStopping) this.notify();
+  }
+
   reset() {
     if (!["idle", "done"].includes(this.phase)) return false;
     this.generation += 1;

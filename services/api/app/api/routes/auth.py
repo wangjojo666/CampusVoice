@@ -172,6 +172,7 @@ async def wechat_login(
     await session.commit()
     _disable_credential_caching(response)
     return WeChatLoginResponse(
+        account_id=principal.user_id,
         session_token=raw_session,
         expires_at=expires_at,
         display_name=principal.display_name,

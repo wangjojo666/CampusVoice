@@ -501,6 +501,24 @@ test("fails closed when the completed MP3 file is not prefixed by sent frames", 
   assert.equal(socket.closeCalls.length, 1);
 });
 
+test("discard clears transcript and releases active resources once", () => {
+  const context = setup();
+  const { socket } = openReady(context);
+  socket.emitMessage({ type: "interim", text: "上一账号的敏感转写" });
+  assert.equal(context.controller.snapshot().transcript, "上一账号的敏感转写");
+
+  context.controller.discard("账号边界已变化");
+  context.controller.discard("重复清理不应重复释放");
+
+  assert.equal(context.controller.snapshot().transcript, "");
+  assert.equal(context.controller.snapshot().phase, "stopping");
+  assert.equal(context.recorder.stopCount, 1);
+  assert.equal(socket.closeCalls.length, 1);
+
+  context.recorder.emit("stop");
+  assert.equal(context.controller.snapshot().phase, "idle");
+  assert.equal(context.controller.snapshot().transcript, "");
+});
 test("finalization progress refreshes idle time but cannot extend the hard deadline", () => {
   const context = setup();
   const { socket } = openReady(context);

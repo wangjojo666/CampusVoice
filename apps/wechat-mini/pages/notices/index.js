@@ -9,6 +9,8 @@ const {
   unloadPage,
 } = require("../../utils/page-lifecycle");
 
+const LOCAL_CONFIG_ERROR = "无法安全读取本地配置，请重试";
+
 const typeLabels = {
   new_notice: "新通知",
   version_change: "版本变化",
@@ -26,9 +28,23 @@ Page({
 
   onShow() {
     showPage(this);
-    const configured = Boolean(configuredApiBase());
-    this.setData({ configured, loading: false });
-    if (configured) this.load();
+    this.retryLoad();
+  },
+
+  retryLoad() {
+    let configured = false;
+    try {
+      configured = Boolean(configuredApiBase());
+    } catch (_error) {
+      this.setData({ configured: false, loading: false, cards: [], error: LOCAL_CONFIG_ERROR });
+      return Promise.resolve();
+    }
+    if (!configured) {
+      this.setData({ configured: false, loading: false, cards: [], error: "" });
+      return Promise.resolve();
+    }
+    this.setData({ configured: true, loading: false });
+    return this.load();
   },
 
   onHide() {
@@ -40,13 +56,13 @@ Page({
   },
 
   onPullDownRefresh() {
-    this.load().finally(() => wx.stopPullDownRefresh());
+    this.retryLoad().finally(() => wx.stopPullDownRefresh());
   },
 
   load() {
     if (!this.data.configured || this.data.loading) return Promise.resolve();
     const generation = pageGeneration(this);
-    this.setData({ loading: true, error: "" });
+    this.setData({ loading: true, cards: [], error: "" });
     return request("/api/notice-radar?limit=30")
       .then(({ data }) => {
         if (!isPageCurrent(this, generation)) return;
@@ -62,13 +78,12 @@ Page({
                 : "",
           }),
         );
-        this.setData({ cards });
+        this.setData({ cards, loading: false });
       })
       .catch((reason) => {
-        if (isPageCurrent(this, generation)) this.setData({ error: friendlyError(reason) });
-      })
-      .finally(() => {
-        if (isPageCurrent(this, generation)) this.setData({ loading: false });
+        if (isPageCurrent(this, generation)) {
+          this.setData({ error: friendlyError(reason), loading: false });
+        }
       });
   },
 });

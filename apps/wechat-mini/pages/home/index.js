@@ -9,6 +9,8 @@ const {
   unloadPage,
 } = require("../../utils/page-lifecycle");
 
+const LOCAL_CONFIG_ERROR = "无法安全读取本地配置，请重试";
+
 Page({
   data: {
     configured: false,
@@ -21,9 +23,37 @@ Page({
 
   onShow() {
     showPage(this);
-    const configured = Boolean(configuredApiBase());
-    this.setData({ configured, loading: false });
-    if (configured) this.load();
+    this.retryLoad();
+  },
+
+  retryLoad() {
+    let configured = false;
+    try {
+      configured = Boolean(configuredApiBase());
+    } catch (_error) {
+      this.setData({
+        configured: false,
+        loading: false,
+        greeting: "你好",
+        pendingTasks: [],
+        upcomingEvents: [],
+        error: LOCAL_CONFIG_ERROR,
+      });
+      return Promise.resolve();
+    }
+    if (!configured) {
+      this.setData({
+        configured: false,
+        loading: false,
+        greeting: "你好",
+        pendingTasks: [],
+        upcomingEvents: [],
+        error: "",
+      });
+      return Promise.resolve();
+    }
+    this.setData({ configured: true, loading: false });
+    return this.load();
   },
 
   onHide() {
@@ -37,7 +67,13 @@ Page({
   load() {
     if (this.data.loading) return Promise.resolve();
     const generation = pageGeneration(this);
-    this.setData({ loading: true, error: "" });
+    this.setData({
+      loading: true,
+      greeting: "你好",
+      pendingTasks: [],
+      upcomingEvents: [],
+      error: "",
+    });
     return Promise.all([
       request("/api/auth/session"),
       request("/api/tasks?status=pending&limit=5"),
@@ -48,6 +84,7 @@ Page({
       .then(([session, tasks, events]) => {
         if (!isPageCurrent(this, generation)) return;
         this.setData({
+          loading: false,
           greeting: "你好，" + (session.data.display_name || "同学"),
           pendingTasks: (tasks.data.items || []).map((item) =>
             Object.assign({}, item, {
@@ -62,10 +99,9 @@ Page({
         });
       })
       .catch((reason) => {
-        if (isPageCurrent(this, generation)) this.setData({ error: friendlyError(reason) });
-      })
-      .finally(() => {
-        if (isPageCurrent(this, generation)) this.setData({ loading: false });
+        if (isPageCurrent(this, generation)) {
+          this.setData({ error: friendlyError(reason), loading: false });
+        }
       });
   },
 

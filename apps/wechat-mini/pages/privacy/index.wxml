@@ -1,36 +1,59 @@
 <view class="page">
-  <view class="hero compact">
-    <view class="hero-kicker">PRIVACY</view>
-    <view class="hero-title">隐私保护说明</view>
-    <view class="hero-copy">版本 {{privacyVersion}}。我们只在实现你主动使用的功能时处理必要信息。</view>
+  <view class="page-heading">
+    <view class="heading-label"><view class="heading-dot" aria-hidden="true"></view><text>隐私与安全</text></view>
+    <view class="page-title" aria-role="heading">你的信息，由你掌控</view>
+    <view class="page-subtitle">我们只在提供你主动使用的功能时处理必要信息。</view>
+    <view class="version-chip">版本 {{privacyVersion}}</view>
   </view>
 
-  <view wx:if="{{message}}" class="success-box">{{message}}</view>
-  <view wx:if="{{error}}" class="error-box">{{error}}</view>
+  <view wx:if="{{message}}" class="feedback-strip success-state" aria-label="操作成功：{{message}}" aria-live="polite" aria-atomic="true"><view class="feedback-symbol" aria-hidden="true">✓</view><view class="feedback-copy">{{message}}</view></view>
+  <view wx:if="{{error}}" class="feedback-strip error-state" aria-label="操作失败：{{error}}" aria-live="assertive" aria-atomic="true"><view class="feedback-symbol" aria-hidden="true">!</view><view class="feedback-copy">{{error}}</view></view>
+  <view wx:if="{{localStateError}}" class="feedback-strip error-state" aria-label="本地配置读取失败：{{localStateError}}" aria-live="assertive" aria-atomic="true"><view class="feedback-symbol" aria-hidden="true">!</view><view class="feedback-copy">{{localStateError}}</view></view>
+  <button wx:if="{{localStateError}}" class="secondary action" aria-label="重新读取本地配置" bindtap="retryLocalState">重新读取本地配置</button>
 
-  <view class="section-title">我们处理的信息</view>
-  <view class="card policy">
-    <view class="card-title">微信身份凭证</view>
-    <view class="muted">使用 wx.login 的短期 code 在服务端换取 OpenID。AppSecret 与 session_key 只保存在服务端；小程序仅保存有期限的随机会话凭证。</view>
-  </view>
-  <view class="card policy">
-    <view class="card-title">麦克风与语音转写</view>
-    <view class="muted">仅在你点击“开始录音”并授权后采集。录音过程中，音频帧实时发送给 CampusVoice ASR，并在停止后由服务端解码识别；默认不持久化原始音频。转写文本按服务端保留策略保存，用于你确认的任务、日程或查询。</view>
-  </view>
-  <view class="card policy">
-    <view class="card-title">任务、日程与校园通知</view>
-    <view class="muted">用于同步你的待办、日历、通知证据及可靠操作记录。不同用户的数据在服务端按身份隔离。</view>
+  <view class="section-heading">
+    <view class="section-name" aria-role="heading">我们如何处理信息</view>
+    <view class="section-copy">每类信息都有明确用途，并受到身份隔离和保留规则保护。</view>
   </view>
 
-  <view class="section-title">你的控制权</view>
-  <view class="card">
-    <view class="muted">你可以拒绝或在微信设置中撤销麦克风权限。离开录音页、进入后台或网络中断时，当前录音会停止且不会自动恢复。</view>
-    <button class="danger-outline action" loading="{{deleting}}" disabled="{{!configured || deleting}}" bindtap="requestDeletion">永久删除我的业务数据</button>
-    <view wx:if="{{!configured}}" class="hint">配置服务后可使用在线删除功能。</view>
+  <view class="card policy-card">
+    <view class="policy-head"><view class="policy-index" aria-hidden="true">01</view><view class="policy-heading"><view class="policy-title">微信身份信息</view><view class="policy-tag">仅用于安全登录</view></view></view>
+    <view class="policy-copy">登录时，微信提供的临时凭证会发送到服务端确认你的身份。AppSecret、session_key、OpenID 和 UnionID 不保存在小程序中；本机仅保存显示名称、有期限的随机登录凭证、不含微信原始标识的账号边界与退出代次。网络结果不确定时，还会保存不含业务正文的幂等恢复标识，用于防止重复写入。</view>
   </view>
 
-  <view class="card">
-    <view class="card-title">发布前平台配置</view>
-    <view class="muted">运营者还必须在微信公众平台补充并发布《小程序用户隐私保护指引》，准确声明麦克风、网络请求和所收集字段；本页面不能替代平台指引。</view>
+  <view class="card policy-card">
+    <view class="policy-head"><view class="policy-index" aria-hidden="true">02</view><view class="policy-heading"><view class="policy-title">麦克风与语音转写</view><view class="policy-tag">主动授权后采集</view></view></view>
+    <view class="policy-copy">只有在你点击“开始录音”并授权后才会采集声音。音频实时发送到语音识别服务，并在停止后完成转写；原始录音默认不保存。转写文字按服务端保留规则保存，用于你确认的任务、日程或查询。</view>
   </view>
+
+  <view class="card policy-card">
+    <view class="policy-head"><view class="policy-index" aria-hidden="true">03</view><view class="policy-heading"><view class="policy-title">任务、日程与通知</view><view class="policy-tag">按账号隔离</view></view></view>
+    <view class="policy-copy">这些信息用于同步你的待办、日历、校园通知和操作记录。服务端会按登录身份隔离数据，不同用户之间不能互相访问。</view>
+  </view>
+
+  <view class="section-heading"><view class="section-name" aria-role="heading">你的控制权</view></view>
+  <view class="card control-card">
+    <view class="control-row">
+      <view class="control-symbol" aria-hidden="true">✓</view>
+      <view class="control-content"><view class="control-title">麦克风由你决定</view><view class="control-copy">你可以拒绝授权，也可以随时在微信设置中撤销麦克风权限。</view></view>
+    </view>
+    <view class="control-row">
+      <view class="control-symbol" aria-hidden="true">✓</view>
+      <view class="control-content"><view class="control-title">录音不会自行恢复</view><view class="control-copy">离开录音页、进入后台或网络中断时，当前录音会停止且不会自动继续。</view></view>
+    </view>
+  </view>
+
+  <view class="section-heading danger-heading">
+    <view class="section-name" aria-role="heading">删除业务数据</view>
+    <view class="section-copy">这项操作不可撤销，请确认不再需要相关任务、日程、通知和转写记录。</view>
+  </view>
+  <view class="danger-zone">
+    <view class="danger-label">不可撤销</view>
+    <view class="danger-title">永久删除我的业务数据</view>
+    <view class="danger-copy">提交后，服务端将按删除流程清除与你账号关联的业务数据。本机登录凭证与账号边界需在设置页另行清除；网络结果不确定时留下的无正文恢复标识会保留到成功核对，退出后如需移除可清理小程序存储。</view>
+    <button class="danger-outline action" hover-class="button-pressed" loading="{{deleting}}" disabled="{{!configured || deleting}}" aria-label="永久删除我的业务数据，此操作不可撤销" bindtap="requestDeletion">永久删除我的业务数据</button>
+    <view wx:if="{{!configured && !localStateError}}" class="hint">服务连接后才能提交在线删除请求。</view>
+  </view>
+
+  <view class="privacy-footnote">本页说明与小程序内公开的《小程序用户隐私保护指引》共同帮助你了解信息处理方式。</view>
 </view>

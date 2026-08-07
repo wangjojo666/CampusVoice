@@ -35,6 +35,17 @@ Stable failures include `version_confirmation_required`, `ambiguous_version_chai
 All OIDC responses are `no-store`. Production cookies are `Secure`; the supported browser
 deployment is same-site HTTPS behind a reverse proxy.
 
+## WeChat Mini Program session
+
+- `POST /api/auth/wechat/login` exchanges a one-time WeChat code server-side and returns
+  `{account_id, session_token, expires_at, display_name}` with `Cache-Control: no-store` and
+  `Pragma: no-cache`.
+- `account_id` is the stable, irreversible internal principal identifier matching
+  `^usr_[0-9a-f]{48}$`; it is not the WeChat OpenID. OpenID, UnionID, session key and AppSecret
+  are never returned to the client.
+- Repeated login for the same WeChat identity keeps the same `account_id` while rotating the
+  short-lived `cvwx1.` Bearer session.
+
 ## Permission boundary and errors
 
 Every `/api/**` business endpoint resolves `AuthPrincipal` from the configured authenticator.

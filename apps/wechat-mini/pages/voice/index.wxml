@@ -1,20 +1,81 @@
 <view class="voice-page">
-  <view class="voice-panel">
-    <view class="hero-kicker dark">VOICE CAPTURE</view>
-    <view class="voice-title">把想法说出来</view>
-    <view class="muted status">{{statusText}}</view>
-    <view wx:if="{{!configured}}" class="banner">配置 HTTPS 服务后，可将录音发送到服务端并在停止后识别。</view>
-    <view wx:if="{{error}}" class="error-box">{{error}}</view>
-    <view class="orb {{phase === 'recording' ? 'active' : ''}}">
-      <view class="orb-core">{{phase === 'recording' ? '录' : '声'}}</view>
-    </view>
-    <button wx:if="{{phase === 'idle'}}" class="primary action" disabled="{{!configured}}" bindtap="start">开始录音</button>
-    <button wx:elif="{{phase === 'recording'}}" class="danger action" bindtap="stop">停止并识别</button>
-    <button wx:elif="{{phase === 'done'}}" class="secondary action" bindtap="reset">重新录音</button>
-    <button wx:else class="secondary action" loading="true" disabled="true">处理中</button>
+  <view class="voice-header">
+    <view class="page-kicker">VOICE</view>
+    <view class="voice-title" aria-role="heading">把想法说出来</view>
+    <view class="voice-subtitle">说出任务、日程或校园问题，停下后即可查看文字</view>
   </view>
+
+  <view wx:if="{{!configured && !error}}" class="status-note voice-note" aria-label="语音服务尚未连接，连接服务器后即可开始录音识别">
+    <view class="status-icon" aria-hidden="true">!</view>
+    <view class="status-content">
+      <view class="status-title">语音服务尚未连接</view>
+      <view class="status-copy">连接服务器后即可开始录音识别。</view>
+    </view>
+  </view>
+  <view wx:if="{{error}}" class="status-note error voice-note" aria-live="assertive" aria-atomic="true" aria-label="语音操作未完成：{{error}}">
+    <view class="status-icon" aria-hidden="true">×</view>
+    <view class="status-content">
+      <view class="status-title">语音操作未完成</view>
+      <view class="status-copy">{{error}}</view>
+    </view>
+  </view>
+
+  <view class="voice-stage">
+    <view class="voice-status" aria-live="polite" aria-atomic="true" aria-label="{{statusText}}">
+      <view class="status-dot {{phase === 'recording' ? 'recording' : ''}}" aria-hidden="true"></view>
+      <view>{{statusText}}</view>
+    </view>
+
+    <view class="orb {{phase === 'recording' ? 'active' : ''}}" aria-hidden="true">
+      <view class="orbit-ring orbit-ring-outer"></view>
+      <view class="orbit-ring orbit-ring-inner"></view>
+      <view class="orb-core">
+        <view class="waveform">
+          <view class="wave-bar bar-one"></view>
+          <view class="wave-bar bar-two"></view>
+          <view class="wave-bar bar-three"></view>
+          <view class="wave-bar bar-four"></view>
+          <view class="wave-bar bar-five"></view>
+          <view class="wave-bar bar-six"></view>
+          <view class="wave-bar bar-seven"></view>
+        </view>
+      </view>
+    </view>
+
+    <button
+      wx:if="{{phase === 'idle'}}"
+      class="primary action voice-action"
+      aria-label="开始录音"
+      disabled="{{!configured}}"
+      bindtap="start"
+    >开始录音</button>
+    <button
+      wx:elif="{{phase === 'recording'}}"
+      class="danger action voice-action"
+      aria-label="停止录音并开始识别"
+      bindtap="stop"
+    >停止并识别</button>
+    <button
+      wx:elif="{{phase === 'done'}}"
+      class="secondary action voice-action"
+      aria-label="清除当前结果并重新录音"
+      bindtap="reset"
+    >重新录音</button>
+    <button wx:else class="secondary action voice-action" aria-label="正在处理录音" loading="true" disabled="true">处理中</button>
+  </view>
+
+  <view class="voice-privacy">
+    <view class="privacy-mark" aria-hidden="true">✓</view>
+    <view>录音仅在你主动开始后采集；离开本页或进入后台会立即停止。</view>
+  </view>
+
   <view class="transcript-card">
-    <view class="row-between"><view class="card-title">识别内容</view><view class="pill">仅当前会话</view></view>
-    <view class="transcript {{transcript ? '' : 'muted'}}">{{transcript || '识别结果会显示在这里。离开页面或进入后台时，录音会立即停止且不会自动恢复。'}}</view>
+    <view class="row-between transcript-heading">
+      <view class="card-title" aria-role="heading">识别内容</view>
+      <view class="pill">仅当前会话</view>
+    </view>
+    <view class="transcript {{transcript ? '' : 'muted'}}">
+      <text selectable="true">{{transcript || '识别结果会显示在这里。你可以完整滚动页面阅读较长的转写内容。'}}</text>
+    </view>
   </view>
 </view>

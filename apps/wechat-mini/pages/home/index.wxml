@@ -1,51 +1,108 @@
-<view class="page">
-  <view class="hero">
-    <view class="hero-kicker">CAMPUSVOICE</view>
-    <view class="hero-title">{{greeting}}</view>
-    <view class="hero-copy">把校园里的通知、任务与日程，整理成清楚可执行的下一步。</view>
+<view class="page home-page">
+  <view class="hero home-hero">
+    <view class="hero-topline">
+      <view class="hero-kicker">CAMPUSVOICE</view>
+      <view class="hero-chip">校园效率助手</view>
+    </view>
+    <view class="hero-title" aria-role="heading">{{greeting}}</view>
+    <view class="hero-copy">把通知、任务与日程整理成清楚可执行的下一步。</view>
   </view>
 
-  <view wx:if="{{!configured}}" class="banner">
-    当前为界面预览状态，尚未配置 HTTPS 服务。请在“设置”中填写开发地址；正式发布前必须写入已备案且已配置为微信合法域名的生产地址。
+  <view wx:if="{{!configured && !error}}" class="status-note home-status" aria-live="polite" aria-atomic="true">
+    <view class="status-icon" aria-hidden="true">!</view>
+    <view class="status-content">
+      <view class="status-title">校园服务尚未连接</view>
+      <view class="status-copy">完成服务配置后，即可同步你的任务、日程与校园通知。</view>
+      <navigator class="status-link" url="/pages/settings/index" hover-class="status-link-active">
+        去设置 <text class="status-link-arrow" aria-hidden="true">→</text>
+      </navigator>
+    </view>
   </view>
-  <view wx:if="{{error}}" class="banner">{{error}}</view>
+  <view wx:if="{{error}}" class="status-note error" aria-live="assertive" aria-atomic="true">
+    <view class="status-icon" aria-hidden="true">!</view>
+    <view class="status-content">
+      <view class="status-title">同步遇到问题</view>
+      <view class="status-copy">{{error}}</view>
+      <button class="secondary status-action" aria-label="重新加载首页数据" bindtap="retryLoad">重新加载</button>
+    </view>
+  </view>
 
-  <view class="section-title">快捷入口</view>
+  <view class="section-heading">
+    <view class="section-title" aria-role="heading">快捷入口</view>
+    <view class="section-caption">高效整理校园事务</view>
+  </view>
   <view class="quick-grid">
-    <navigator class="quick-card voice" url="/pages/voice/index" open-type="switchTab">
-      <view class="quick-symbol">声</view><view class="quick-title">语音输入</view><view class="muted">说出任务或日程</view>
+    <navigator class="quick-card voice" aria-label="语音输入，说出任务或日程" url="/pages/voice/index" open-type="switchTab" hover-class="quick-card-active">
+      <view class="quick-icon-wrap"><image aria-hidden="true" class="quick-icon" src="/assets/tab/voice-active.png" mode="aspectFit" /></view>
+      <view class="quick-title">语音输入</view>
+      <view class="quick-copy">说出任务或日程</view>
+      <view class="quick-arrow" aria-hidden="true">›</view>
     </navigator>
-    <navigator class="quick-card" url="/pages/tasks/index" open-type="switchTab">
-      <view class="quick-symbol">办</view><view class="quick-title">待办任务</view><view class="muted">核对下一步行动</view>
+    <navigator class="quick-card task" aria-label="待办任务，核对下一步行动" url="/pages/tasks/index" open-type="switchTab" hover-class="quick-card-active">
+      <view class="quick-icon-wrap"><image aria-hidden="true" class="quick-icon" src="/assets/tab/tasks-active.png" mode="aspectFit" /></view>
+      <view class="quick-title">待办任务</view>
+      <view class="quick-copy">核对下一步行动</view>
+      <view class="quick-arrow" aria-hidden="true">›</view>
     </navigator>
-    <navigator class="quick-card" url="/pages/calendar/index" open-type="switchTab">
-      <view class="quick-symbol">历</view><view class="quick-title">校园日历</view><view class="muted">查看时间与冲突</view>
+    <navigator class="quick-card calendar" aria-label="校园日历，查看时间与冲突" url="/pages/calendar/index" open-type="switchTab" hover-class="quick-card-active">
+      <view class="quick-icon-wrap"><image aria-hidden="true" class="quick-icon" src="/assets/tab/calendar-active.png" mode="aspectFit" /></view>
+      <view class="quick-title">校园日历</view>
+      <view class="quick-copy">查看时间与冲突</view>
+      <view class="quick-arrow" aria-hidden="true">›</view>
     </navigator>
-    <navigator class="quick-card" url="/pages/notices/index" open-type="switchTab">
-      <view class="quick-symbol">知</view><view class="quick-title">通知雷达</view><view class="muted">跟踪版本变化</view>
+    <navigator class="quick-card notice" aria-label="通知雷达，跟踪通知变化" url="/pages/notices/index" open-type="switchTab" hover-class="quick-card-active">
+      <view class="quick-icon-wrap"><image aria-hidden="true" class="quick-icon" src="/assets/tab/notices-active.png" mode="aspectFit" /></view>
+      <view class="quick-title">通知雷达</view>
+      <view class="quick-copy">跟踪版本变化</view>
+      <view class="quick-arrow" aria-hidden="true">›</view>
     </navigator>
   </view>
 
-  <view class="section-title">待办概览</view>
-  <view wx:if="{{loading}}" class="loading">正在同步…</view>
+  <view wx:if="{{!error}}" class="section-heading">
+    <view class="section-title" aria-role="heading">待办概览</view>
+    <view class="section-caption">优先处理临近事项</view>
+  </view>
+  <view wx:if="{{loading && !error}}" class="loading" aria-live="polite" aria-atomic="true">正在同步…</view>
   <view wx:elif="{{pendingTasks.length}}">
-    <view class="card" wx:for="{{pendingTasks}}" wx:key="id">
-      <view class="row-between"><view class="card-title">{{item.title}}</view><view class="pill">{{item.priority}}</view></view>
-      <view class="muted">截止：{{item.dueText}}</view>
+    <view class="card home-list-card" wx:for="{{pendingTasks}}" wx:key="id">
+      <view class="list-marker" aria-hidden="true"></view>
+      <view class="list-content">
+        <view class="row-between">
+          <view class="card-title list-title">{{item.title}}</view>
+          <view class="pill">{{item.priority === 'high' ? '高优先级' : item.priority === 'low' ? '低优先级' : '中优先级'}}</view>
+        </view>
+        <view class="muted list-meta">截止：{{item.dueText}}</view>
+      </view>
     </view>
   </view>
-  <view wx:else class="card empty">{{configured ? '暂无待办任务' : '配置服务后显示你的待办任务'}}</view>
+  <view wx:elif="{{!loading && !error}}" class="card empty home-empty">
+    <view class="empty-icon" aria-hidden="true">办</view>
+    <view class="empty-title">{{configured ? '暂无待办任务' : '连接服务后显示待办任务'}}</view>
+    <view class="empty-copy">重要事项会按优先级显示在这里</view>
+  </view>
 
-  <view class="section-title">近期日程</view>
-  <view wx:if="{{upcomingEvents.length}}">
-    <view class="card" wx:for="{{upcomingEvents}}" wx:key="id">
-      <view class="card-title">{{item.title}}</view><view class="muted">{{item.startText}} · {{item.location || '地点待定'}}</view>
+  <view wx:if="{{!loading && !error}}" class="section-heading">
+    <view class="section-title" aria-role="heading">近期日程</view>
+    <view class="section-caption">提前安排，不错过节点</view>
+  </view>
+  <view wx:if="{{!loading && upcomingEvents.length}}">
+    <view class="card home-list-card" wx:for="{{upcomingEvents}}" wx:key="id">
+      <view class="date-tile"><view class="date-dot" aria-hidden="true"></view><text>日程</text></view>
+      <view class="list-content">
+        <view class="card-title list-title">{{item.title}}</view>
+        <view class="muted list-meta">{{item.startText}} · {{item.location || '地点待定'}}</view>
+      </view>
     </view>
   </view>
-  <view wx:else class="card empty">{{configured ? '近期暂无日程' : '配置服务后显示近期日程'}}</view>
+  <view wx:elif="{{!loading && !error}}" class="card empty home-empty">
+    <view class="empty-icon" aria-hidden="true">历</view>
+    <view class="empty-title">{{configured ? '近期暂无日程' : '连接服务后显示近期日程'}}</view>
+    <view class="empty-copy">课程和活动会按时间顺序汇总</view>
+  </view>
 
-  <view class="row footer-links">
-    <button class="secondary footer-button" bindtap="openSettings">设置</button>
-    <button class="secondary footer-button" bindtap="openPrivacy">隐私说明</button>
+  <view class="footer-links">
+    <button class="footer-link" bindtap="openSettings">设置</button>
+    <view class="footer-divider" aria-hidden="true"></view>
+    <button class="footer-link" bindtap="openPrivacy">隐私说明</button>
   </view>
 </view>

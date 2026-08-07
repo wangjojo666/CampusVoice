@@ -16,13 +16,18 @@ class WeChatLoginRequest(StrictModel):
 
 
 class WeChatLoginResponse(StrictModel):
+    account_id: str = Field(
+        min_length=52,
+        max_length=52,
+        pattern=r"^usr_[0-9a-f]{48}$",
+    )
     session_token: str = Field(
         min_length=38,
         max_length=262,
         pattern=r"^cvwx1\.[A-Za-z0-9_-]{32,256}$",
     )
     expires_at: datetime
-    display_name: str
+    display_name: str = Field(min_length=1, max_length=120, pattern=r"^.*\S.*$")
 
 
 class WeChatLogoutResponse(StrictModel):
@@ -49,7 +54,7 @@ class WriteChallengeResponse(StrictModel):
 class OidcSessionResponse(StrictModel):
     authenticated: bool
     user_id: str
-    display_name: str
+    display_name: str = Field(min_length=1, max_length=120, pattern=r"^.*\S.*$")
     roles: list[str]
     expires_at: datetime | None = None
 

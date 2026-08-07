@@ -1,3 +1,4 @@
+const { currentAccountBoundary } = require("../../utils/auth");
 const { configuredApiBase } = require("../../utils/config");
 const { request, verifiedRequest } = require("../../utils/request");
 const { dateTime, friendlyError } = require("../../utils/format");
@@ -8,6 +9,23 @@ const {
   showPage,
   unloadPage,
 } = require("../../utils/page-lifecycle");
+
+function handleAccountBoundaryError(page, reason, generation) {
+  if (
+    !reason ||
+    (reason.code !== "ACCOUNT_BOUNDARY_CHANGED" && reason.code !== "ACCOUNT_BOUNDARY_UNAVAILABLE")
+  ) {
+    return false;
+  }
+  if (reason.code === "ACCOUNT_BOUNDARY_UNAVAILABLE") {
+    page._activeApiBase = "";
+    page._activeAccountId = "";
+    page._activeLogoutGeneration = -1;
+  }
+  page._accountBoundaryResetGeneration = generation;
+  page.onShow();
+  return true;
+}
 
 function today() {
   const now = new Date();
@@ -32,9 +50,63 @@ Page({
 
   onShow() {
     showPage(this);
-    const configured = Boolean(configuredApiBase());
-    this.setData({ configured, loading: false, busy: Boolean(this._writePending) });
-    if (configured) this.load();
+    let apiBase;
+    let boundary;
+    try {
+      apiBase = configuredApiBase();
+      boundary = apiBase ? currentAccountBoundary(apiBase) : { accountId: "", logoutGeneration: 0 };
+    } catch (_error) {
+      this._activeApiBase = "";
+      this._activeAccountId = "";
+      this._activeLogoutGeneration = -1;
+      this.setData({
+        configured: false,
+        loading: false,
+        busy: Boolean(this._writePending),
+        events: [],
+        error: "无法安全读取本机会话，请重试",
+        editorOpen: false,
+        form: { title: "", course: "", location: "", date: today(), time: "09:00" },
+      });
+      return;
+    }
+    const configured = Boolean(apiBase);
+    const accountId = boundary.accountId;
+    const hasPreviousScope = this._activeApiBase !== undefined;
+    const baseChanged = hasPreviousScope && this._activeApiBase !== apiBase;
+    const accountChanged =
+      hasPreviousScope &&
+      this._activeApiBase === apiBase &&
+      Boolean(this._activeAccountId) &&
+      this._activeAccountId !== accountId;
+    const logoutChanged =
+      hasPreviousScope && this._activeLogoutGeneration !== boundary.logoutGeneration;
+    const scopeChanged = baseChanged || accountChanged || logoutChanged;
+    this._activeApiBase = apiBase;
+    this._activeAccountId = accountId;
+    this._activeLogoutGeneration = boundary.logoutGeneration;
+    const busy = Boolean(this._writePending);
+    if (!configured) {
+      this.setData({
+        configured: false,
+        loading: false,
+        busy,
+        events: [],
+        error: "",
+        editorOpen: false,
+        form: { title: "", course: "", location: "", date: today(), time: "09:00" },
+      });
+      return;
+    }
+    const nextState = { configured: true, loading: false, busy };
+    if (scopeChanged) {
+      Object.assign(nextState, {
+        editorOpen: false,
+        form: { title: "", course: "", location: "", date: today(), time: "09:00" },
+      });
+    }
+    this.setData(nextState);
+    this.load();
   },
 
   onHide() {
@@ -49,13 +121,17 @@ Page({
     this.load().finally(() => wx.stopPullDownRefresh());
   },
 
+  retryLoad() {
+    this.onShow();
+  },
+
   load() {
     if (!this.data.configured || this.data.loading) return Promise.resolve();
     const generation = pageGeneration(this);
-    this.setData({ loading: true, error: "" });
+    this.setData({ loading: true, events: [], error: "" });
     const after = encodeURIComponent(new Date().toISOString());
     return request("/api/events?starts_after=" + after + "&limit=100")
-      .then(({ data }) => {
+      .then(({ accountBoundary, data }) => {
         if (!isPageCurrent(this, generation)) return;
         const events = (data.items || []).map((item) =>
           Object.assign({}, item, {
@@ -63,10 +139,32 @@ Page({
             endText: dateTime(item.end_at),
           }),
         );
-        this.setData({ events });
+        const nextState = { events };
+        if (accountBoundary) {
+          const accountChanged =
+            Boolean(this._activeAccountId) && this._activeAccountId !== accountBoundary.accountId;
+          const logoutChanged = this._activeLogoutGeneration !== accountBoundary.logoutGeneration;
+          if (accountChanged || logoutChanged) {
+            Object.assign(nextState, {
+              editorOpen: false,
+              form: {
+                title: "",
+                course: "",
+                location: "",
+                date: today(),
+                time: "09:00",
+              },
+            });
+          }
+          this._activeAccountId = accountBoundary.accountId;
+          this._activeLogoutGeneration = accountBoundary.logoutGeneration;
+        }
+        this.setData(nextState);
       })
       .catch((reason) => {
-        if (isPageCurrent(this, generation)) this.setData({ error: friendlyError(reason) });
+        if (!isPageCurrent(this, generation)) return;
+        if (handleAccountBoundaryError(this, reason, generation)) return;
+        this.setData({ error: friendlyError(reason) });
       })
       .finally(() => {
         if (!isPageCurrent(this, generation)) return;
@@ -87,6 +185,7 @@ Page({
   },
 
   createEvent() {
+    if (!this.data.configured) return;
     const title = this.data.form.title.trim();
     if (!title || this.data.busy) {
       if (!title) this.setData({ error: "请输入日程标题" });
@@ -108,9 +207,16 @@ Page({
       source_type: "manual",
     };
     const generation = pageGeneration(this);
+    const expectedApiBase = this._activeApiBase;
+    const expectedAccountBoundary = {
+      accountId: this._activeAccountId || "",
+      logoutGeneration: this._activeLogoutGeneration,
+    };
     this._writePending = true;
     this.setData({ busy: true, error: "" });
     request("/api/events/check-conflict", {
+      expectedApiBase,
+      expectedAccountBoundary,
       method: "POST",
       data: { start_at: body.start_at, end_at: body.end_at },
     })
@@ -121,7 +227,10 @@ Page({
           throw error;
         }
         if (data.has_conflict) throw new Error("该时段与已有日程冲突，请先调整时间");
-        return verifiedRequest("POST", "/api/events", body);
+        return verifiedRequest("POST", "/api/events", body, {
+          expectedApiBase,
+          expectedAccountBoundary,
+        });
       })
       .then(() => {
         if (!isPageCurrent(this, generation)) return;
@@ -133,13 +242,19 @@ Page({
         return this.load();
       })
       .catch((reason) => {
-        if (isPageCurrent(this, generation)) this.setData({ error: friendlyError(reason) });
+        if (!isPageCurrent(this, generation)) return;
+        if (handleAccountBoundaryError(this, reason, generation)) return;
+        this.setData({ error: friendlyError(reason) });
       })
       .finally(() => {
         this._writePending = false;
         const activeGeneration = pageGeneration(this);
         if (!isPageCurrent(this, activeGeneration)) return;
         this.setData({ busy: false });
+        if (this._accountBoundaryResetGeneration === generation) {
+          delete this._accountBoundaryResetGeneration;
+          return;
+        }
         if (activeGeneration !== generation) {
           if (this.data.loading) this._reloadAfterLoad = true;
           else this.load();

@@ -8,6 +8,7 @@ dist/
 coverage/
 playwright-report/
 test-results/
+.wechat-preview/
 *.tsbuildinfo
 
 # Python

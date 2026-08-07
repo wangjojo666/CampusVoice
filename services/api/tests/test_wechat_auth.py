@@ -1,5 +1,7 @@
 import asyncio
+import re
 from collections.abc import AsyncIterator, Iterator, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -13,6 +15,7 @@ import app.main as main_module
 from app.core.config import Settings
 from app.main import create_app
 from app.models.entities import OidcSession
+from app.schemas.auth import WeChatLoginResponse
 from app.security.authentication import wechat_session_issuer
 from app.security.wechat import WeChatError, WeChatIdentity
 from app.services.asr import AsrSessionConfig, TranscriptResult
@@ -82,6 +85,7 @@ def login(client: TestClient) -> str:
     assert payload["display_name"] == "微信用户"
     assert payload["session_token"].startswith("cvwx1.")
     assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
     serialized = response.text
     assert "openid-private-value" not in serialized
     assert "unionid-private-value" not in serialized
@@ -107,6 +111,22 @@ def test_wechat_login_provisions_bounded_session_and_authenticates(
     tasks = wechat_client.get("/api/tasks", headers=bearer(token))
     assert tasks.status_code == 200, tasks.text
     assert tasks.json() == {"items": [], "total": 0}
+
+
+def test_wechat_login_returns_stable_non_raw_account_id(
+    wechat_client: TestClient,
+) -> None:
+    first = wechat_client.post("/api/auth/wechat/login", json={"code": _LOGIN_CODE})
+    second = wechat_client.post("/api/auth/wechat/login", json={"code": _LOGIN_CODE})
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    first_account_id = first.json()["account_id"]
+    second_account_id = second.json()["account_id"]
+    assert re.fullmatch(r"usr_[0-9a-f]{48}", first_account_id)
+    assert second_account_id == first_account_id
+    assert "openid-private-value" not in first.text
+    assert "openid-private-value" not in second.text
 
 
 def test_wechat_authentication_failures_are_bounded(wechat_client: TestClient) -> None:
@@ -273,6 +293,17 @@ def test_wechat_configuration_fails_closed() -> None:
     assert valid.wechat_app_id == _APP_ID
     assert valid.wechat_app_secret is not None
     assert valid.wechat_app_secret.get_secret_value() == _APP_SECRET
+
+
+@pytest.mark.parametrize("display_name", ["", " \t\r\n", "名" * 121])
+def test_wechat_login_response_rejects_invalid_display_names(display_name: str) -> None:
+    with pytest.raises(ValidationError):
+        WeChatLoginResponse(
+            account_id="usr_" + ("a" * 48),
+            session_token="cvwx1." + ("a" * 32),
+            expires_at=datetime.now(UTC),
+            display_name=display_name,
+        )
 
 
 @pytest.mark.parametrize(

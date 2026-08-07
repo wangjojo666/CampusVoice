@@ -4,5 +4,5 @@ module.exports = Object.freeze({
   appId: "wx3648488d39d15ff4",
   apiBaseUrl: "",
   appName: "声程",
-  privacyVersion: "2026-08-06",
+  privacyVersion: "2026-08-07",
 });

@@ -1,56 +1,154 @@
-.heading {
-  margin-bottom: 28rpx;
+.calendar-section {
+  margin-top: 34rpx;
 }
-.page-title {
-  font-size: 44rpx;
-  font-weight: 850;
+
+.required-mark {
+  color: #a9443d;
 }
-.mini-button {
-  min-width: 136rpx;
-  margin: 0;
-  font-size: 26rpx;
-}
-.editor {
-  border-color: #a9d9d1;
-}
-.form-row {
+
+.picker-field {
   display: flex;
+  align-items: center;
   justify-content: space-between;
 }
-.picker {
-  width: 48%;
+
+.picker-arrow {
+  flex-shrink: 0;
+  margin-left: 16rpx;
+  color: #607771;
+  font-size: 26rpx;
 }
-.save-button {
-  margin-top: 24rpx;
-}
+
 .timeline-item {
   position: relative;
-  padding-left: 38rpx;
+  padding-left: 42rpx;
 }
+
 .timeline-item::before {
   content: "";
   position: absolute;
-  top: 20rpx;
-  bottom: -20rpx;
-  left: 11rpx;
+  top: 30rpx;
+  bottom: -22rpx;
+  left: 12rpx;
   width: 2rpx;
-  background: #bddbd7;
+  background: #c8d9d4;
 }
+
+.timeline-item:last-child::before {
+  display: none;
+}
+
 .timeline-dot {
   position: absolute;
-  top: 26rpx;
+  z-index: 1;
+  top: 27rpx;
   left: 0;
-  width: 24rpx;
-  height: 24rpx;
-  border: 5rpx solid #ddf4ef;
+  box-sizing: border-box;
+  width: 26rpx;
+  height: 26rpx;
+  border: 6rpx solid #e2f2ee;
   border-radius: 50%;
-  background: #007d6e;
+  background: #0c7a6c;
 }
+
 .event-card {
   margin-bottom: 22rpx;
+  padding: 26rpx;
 }
+
+.event-heading {
+  align-items: flex-start;
+}
+
+.event-title {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+
+.event-course {
+  max-width: 42%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .event-time {
-  margin: 16rpx 0 4rpx;
-  color: #007d6e;
-  font-weight: 750;
+  margin-top: 18rpx;
+  color: #0b766b;
+  font-size: 27rpx;
+  font-weight: 700;
+}
+
+.event-meta {
+  margin-top: 4rpx;
+  font-size: 24rpx;
+}
+
+.location-row {
+  display: flex;
+  align-items: flex-start;
+  margin-top: 16rpx;
+  color: #526d67;
+  font-size: 24rpx;
+  line-height: 1.55;
+}
+
+.location-dot {
+  flex-shrink: 0;
+  width: 13rpx;
+  height: 13rpx;
+  margin-top: 10rpx;
+  margin-right: 10rpx;
+  border: 3rpx solid #7f9d96;
+  border-radius: 50%;
+}
+
+.location-text,
+.status-copy,
+.empty-copy {
+  min-width: 0;
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+
+.empty-action {
+  min-width: 220rpx;
+  margin: 26rpx auto 0;
+  font-size: 25rpx;
+}
+
+.retry-icon {
+  color: #976029;
+  background: #fff0d5;
+}
+
+@media (max-width: 360px) {
+  .page-header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .form-row {
+    display: block;
+  }
+
+  .picker {
+    display: block;
+    width: 100%;
+  }
+
+  .picker + .picker {
+    margin-top: 14rpx;
+    margin-left: 0;
+  }
+
+  .event-heading {
+    flex-wrap: wrap;
+  }
+
+  .event-course {
+    max-width: 100%;
+  }
 }

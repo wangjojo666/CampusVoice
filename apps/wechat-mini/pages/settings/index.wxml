@@ -1,32 +1,57 @@
 <view class="page">
-  <view class="hero compact">
-    <view class="hero-kicker">SETTINGS</view>
-    <view class="hero-title">发布与连接</view>
-    <view class="hero-copy">AppID、环境和服务域名必须与微信公众平台配置一致。</view>
+  <view class="page-heading">
+    <view class="heading-label"><view class="heading-dot" aria-hidden="true"></view><text>连接与账号</text></view>
+    <view class="page-title" aria-role="heading">设置</view>
+    <view class="page-subtitle">管理服务地址、连接状态和本机登录信息。</view>
   </view>
 
-  <view wx:if="{{message}}" class="success-box">{{message}}</view>
-  <view wx:if="{{error}}" class="error-box">{{error}}</view>
+  <view wx:if="{{message}}" class="feedback-strip success-state" aria-label="操作成功：{{message}}" aria-live="polite" aria-atomic="true"><view class="feedback-symbol" aria-hidden="true">✓</view><view class="feedback-copy">{{message}}</view></view>
+  <view wx:if="{{error && !localStateReadFailed}}" class="feedback-strip error-state" aria-label="操作失败：{{error}}" aria-live="assertive" aria-atomic="true"><view class="feedback-symbol" aria-hidden="true">!</view><view class="feedback-copy">{{error}}</view></view>
 
-  <view class="section-title">小程序信息</view>
-  <view class="card">
-    <view class="setting-row"><text class="muted">AppID</text><text selectable="true">{{appId}}</text></view>
-    <view class="setting-row"><text class="muted">运行环境</text><text>{{environment}}</text></view>
-    <view class="setting-row"><text class="muted">服务状态</text><text class="{{configured ? 'ok' : 'warn'}}">{{configured ? '已配置' : '未配置'}}</text></view>
-    <view class="setting-row"><text class="muted">登录状态</text><text>{{signedIn ? displayName || '已登录' : '未登录'}}</text></view>
+  <view wx:if="{{localStateReadFailed}}" class="card api-card" aria-label="本地状态暂不可用：{{error}}" aria-live="assertive" aria-atomic="true">
+    <view class="field-label" aria-role="heading">本地状态暂不可用</view>
+    <view class="field-help">{{error || '暂时无法安全读取运行环境、服务地址或本机登录信息。'}}</view>
+    <button class="primary action" hover-class="button-pressed" aria-label="重新读取本地配置" bindtap="retryLocalState">重新读取本地配置</button>
+    <button class="secondary action" hover-class="button-pressed" aria-label="查看隐私保护说明" bindtap="openPrivacy">查看隐私保护说明</button>
   </view>
 
-  <view class="section-title">CampusVoice API</view>
-  <view class="card">
-    <view class="muted">正式版仅使用代码中固定的 HTTPS 域名；开发版可在这里临时覆盖，凭据不会写入代码。</view>
-    <input class="field" disabled="{{release}}" value="{{apiInput}}" placeholder="https://api.example.edu" bindinput="updateApi" />
-    <button wx:if="{{!release}}" class="secondary action" bindtap="saveApi">保存开发地址</button>
-    <button class="primary action" loading="{{checking}}" disabled="{{!configured || checking}}" bindtap="checkConnection">检查服务连接</button>
-  </view>
+  <block wx:else>
+    <view class="section-heading">
+      <view class="section-name" aria-role="heading">服务连接</view>
+      <view class="section-copy">语音识别和数据同步都需要连接 CampusVoice 服务。</view>
+    </view>
+    <view class="card connection-card {{configured ? 'ready' : 'pending'}}">
+      <view class="connection-symbol" aria-hidden="true">{{configured ? '✓' : '!'}}</view>
+      <view class="connection-content">
+        <view class="connection-title">{{configured ? '服务地址已配置' : '尚未配置服务地址'}}</view>
+        <view class="connection-copy">{{configured ? '可以检查服务是否在线，并在需要时更新开发地址。' : '填写可用的 HTTPS 地址后，才能登录、同步和使用语音功能。'}}</view>
+      </view>
+      <view class="connection-badge {{configured ? 'ok' : 'warn'}}">{{configured ? '已配置' : '待配置'}}</view>
+    </view>
 
-  <view class="section-title">账号与隐私</view>
-  <view class="card">
-    <button class="secondary action" bindtap="openPrivacy">查看隐私保护说明</button>
-    <button wx:if="{{signedIn}}" class="danger-outline action" bindtap="signOut">清除本机登录凭证</button>
-  </view>
+    <view class="card api-card">
+      <view class="field-label">API 地址</view>
+      <view class="field-help">{{release ? '正式版地址由应用配置提供，不能在这里修改。' : '开发版可临时填写 HTTPS 地址，内容只保存在本机。'}}</view>
+      <input class="field api-field" disabled="{{release || checking}}" value="{{apiInput}}" placeholder="https://api.example.edu" aria-label="CampusVoice API 地址" bindinput="updateApi" />
+      <button wx:if="{{!release}}" class="secondary action" hover-class="button-pressed" disabled="{{checking}}" aria-label="保存开发环境 API 地址" bindtap="saveApi">保存开发地址</button>
+      <button class="primary action" hover-class="button-pressed" loading="{{operation === 'check'}}" disabled="{{!configured || checking}}" aria-label="检查 CampusVoice 服务连接" bindtap="checkConnection">检查服务连接</button>
+    </view>
+
+    <view class="section-heading"><view class="section-name" aria-role="heading">应用信息</view></view>
+    <view class="card information-card">
+      <view class="setting-row"><text class="setting-label">AppID</text><text class="setting-value break-value" selectable="true">{{appId}}</text></view>
+      <view class="setting-row"><text class="setting-label">运行环境</text><text class="setting-value">{{environment === 'develop' ? '开发版' : environment === 'trial' ? '体验版' : environment === 'release' ? '正式版' : '未知环境'}}</text></view>
+      <view class="setting-row"><text class="setting-label">服务状态</text><text class="setting-value status-value {{configured ? 'ok' : 'warn'}}">{{configured ? '已配置' : '未配置'}}</text></view>
+      <view class="setting-row"><text class="setting-label">登录状态</text><text class="setting-value">{{signedIn ? displayName || '已登录' : '未登录'}}</text></view>
+    </view>
+
+    <view class="section-heading">
+      <view class="section-name" aria-role="heading">账号与隐私</view>
+      <view class="section-copy">查看信息处理方式，或清除保存在这台设备上的登录凭证。</view>
+    </view>
+    <view class="card account-card">
+      <button class="secondary action first-action" hover-class="button-pressed" aria-label="查看隐私保护说明" bindtap="openPrivacy">查看隐私保护说明</button>
+      <button wx:if="{{signedIn}}" class="danger-outline action" hover-class="button-pressed" loading="{{operation === 'signOut'}}" disabled="{{checking}}" aria-label="清除本机登录凭证" bindtap="signOut">清除本机登录凭证</button>
+    </view>
+  </block>
 </view>

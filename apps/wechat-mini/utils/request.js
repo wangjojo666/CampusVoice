@@ -1,4 +1,4 @@
-const { ensureSession, clearSession } = require("./auth");
+const { clearSession, currentAccountBoundary, ensureSession } = require("./auth");
 const { configuredApiBase, normalizeApiBase } = require("./config");
 
 const PENDING_WRITE_STORAGE_KEY = "campusvoice.pendingWriteIntents.v1";
@@ -42,6 +42,28 @@ function request(path, options) {
       error.outcomeUncertain = false;
       throw error;
     }
+    let requestBoundary = null;
+    if (session) {
+      try {
+        requestBoundary = currentAccountBoundary(base);
+      } catch (_error) {
+        const error = new Error("无法安全读取本机账号边界");
+        error.code = "ACCOUNT_BOUNDARY_UNAVAILABLE";
+        error.outcomeUncertain = false;
+        throw error;
+      }
+      const expectedBoundary = settings.expectedAccountBoundary;
+      if (
+        expectedBoundary &&
+        (expectedBoundary.logoutGeneration !== requestBoundary.logoutGeneration ||
+          (expectedBoundary.accountId && expectedBoundary.accountId !== session.accountId))
+      ) {
+        const error = new Error("账号状态已变化，请重新确认后再试");
+        error.code = "ACCOUNT_BOUNDARY_CHANGED";
+        error.outcomeUncertain = false;
+        throw error;
+      }
+    }
     return new Promise((resolve, reject) => {
       const headers = Object.assign({ "content-type": "application/json" }, settings.header || {});
       if (session) headers.Authorization = "Bearer " + session.token;
@@ -53,10 +75,35 @@ function request(path, options) {
         timeout: settings.timeout || 15000,
         success: ({ statusCode, data, header }) => {
           if (statusCode >= 200 && statusCode < 300) {
-            resolve({ data, header, statusCode });
+            let completionBoundary = requestBoundary;
+            if (session) {
+              try {
+                completionBoundary = currentAccountBoundary(base);
+              } catch (_error) {
+                const error = new Error("无法安全读取本机账号边界");
+                error.code = "ACCOUNT_BOUNDARY_UNAVAILABLE";
+                error.outcomeUncertain = true;
+                reject(error);
+                return;
+              }
+              if (
+                completionBoundary.accountId !== session.accountId ||
+                completionBoundary.accountId !== requestBoundary.accountId ||
+                completionBoundary.logoutGeneration !== requestBoundary.logoutGeneration
+              ) {
+                const error = new Error("账号状态已变化，已忽略旧请求结果");
+                error.code = "ACCOUNT_BOUNDARY_CHANGED";
+                error.outcomeUncertain = true;
+                reject(error);
+                return;
+              }
+            }
+            resolve({ accountBoundary: completionBoundary, data, header, statusCode });
             return;
           }
-          if (statusCode === 401 && session) clearSession(session);
+          if (statusCode === 401 && session) {
+            clearSession(session, { preserveAccountScope: true });
+          }
           const message = data && data.error && data.error.message;
           const error = new Error(message || "请求失败（" + statusCode + "）");
           error.statusCode = statusCode;
@@ -107,9 +154,19 @@ function shortFingerprint(value) {
   );
 }
 
-function writeFingerprint(apiBase, method, path, data) {
+function writeFingerprint(apiBase, accountId, logoutGeneration, method, path, data) {
   return shortFingerprint(
-    apiBase + "\n" + String(method).toUpperCase() + "\n" + path + "\n" + canonicalValue(data),
+    apiBase +
+      "\n" +
+      accountId +
+      "\n" +
+      String(logoutGeneration) +
+      "\n" +
+      String(method).toUpperCase() +
+      "\n" +
+      path +
+      "\n" +
+      canonicalValue(data),
   );
 }
 
@@ -123,12 +180,19 @@ function pendingStorageError() {
 
 function validStoredIntent(value, now) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  if (Object.keys(value).sort().join(",") !== "apiBase,createdAt,fingerprint,key") return false;
+  if (
+    Object.keys(value).sort().join(",") !==
+    "accountId,apiBase,createdAt,fingerprint,key,logoutGeneration"
+  ) {
+    return false;
+  }
   try {
     if (normalizeApiBase(value.apiBase, true) !== value.apiBase) return false;
   } catch (_error) {
     return false;
   }
+  if (!/^usr_[0-9a-f]{48}$/.test(value.accountId || "")) return false;
+  if (!Number.isSafeInteger(value.logoutGeneration) || value.logoutGeneration < 0) return false;
   if (typeof value.fingerprint !== "string" || !/^[0-9a-f]{16}-\d{1,12}$/.test(value.fingerprint)) {
     return false;
   }
@@ -178,8 +242,15 @@ function loadPendingIntents(now) {
   }
   return [...unique.values()].sort((left, right) => left.createdAt - right.createdAt);
 }
-function writeIntent(apiBase, method, path, data) {
-  const fingerprint = writeFingerprint(apiBase, method, path, data);
+function writeIntent(apiBase, accountBoundary, method, path, data) {
+  const fingerprint = writeFingerprint(
+    apiBase,
+    accountBoundary.accountId,
+    accountBoundary.logoutGeneration,
+    method,
+    path,
+    data,
+  );
   const now = Date.now();
   const entries = loadPendingIntents(now);
   const existing = entries.find((entry) => entry.fingerprint === fingerprint);
@@ -201,7 +272,14 @@ function writeIntent(apiBase, method, path, data) {
     throw error;
   }
 
-  const intent = { apiBase, fingerprint, key: idempotencyKey(), createdAt: now };
+  const intent = {
+    accountId: accountBoundary.accountId,
+    apiBase,
+    fingerprint,
+    key: idempotencyKey(),
+    logoutGeneration: accountBoundary.logoutGeneration,
+    createdAt: now,
+  };
   const next = [...entries, intent];
   persistPendingIntents(next, true);
   runtimeRetryableKeys.add(intent.key);
@@ -223,53 +301,82 @@ function clearWriteIntent(fingerprint, key) {
   return true;
 }
 
-function verifiedRequest(method, path, data) {
+function verifiedRequest(method, path, data, options) {
   const normalizedMethod = String(method).toUpperCase();
+  const settings = options || {};
   let base;
+  let startingBoundary;
+  let configuredBase;
   try {
-    base = configuredApiBase();
+    configuredBase = configuredApiBase();
+    base = settings.expectedApiBase || configuredBase;
+    startingBoundary =
+      settings.expectedAccountBoundary || (base ? currentAccountBoundary(base) : null);
   } catch (_error) {
     return Promise.reject(pendingStorageError());
   }
   if (!base) return Promise.reject(new Error("尚未配置 CampusVoice HTTPS 服务地址"));
-  let intent;
-  try {
-    intent = writeIntent(base, normalizedMethod, path, data);
-  } catch (error) {
-    return Promise.reject(error);
-  }
-  const operation = request("/api/auth/write-challenges", {
-    expectedApiBase: base,
-    method: "POST",
-    data: { method: normalizedMethod, path, body: data == null ? null : data },
-  }).then(({ data: issued }) => {
-    if (issued.required_stages !== 1) {
-      const error = new Error("此操作需要额外人工确认，请在网页版完成");
+  if (configuredBase !== base) return Promise.reject(new Error("服务地址已变化，请重试"));
+
+  return ensureSession(false, base).then((session) => {
+    let establishedBoundary;
+    try {
+      establishedBoundary = currentAccountBoundary(base);
+    } catch (_error) {
+      throw pendingStorageError();
+    }
+    if (
+      !session ||
+      establishedBoundary.accountId !== session.accountId ||
+      establishedBoundary.logoutGeneration !== startingBoundary.logoutGeneration ||
+      (startingBoundary.accountId && startingBoundary.accountId !== establishedBoundary.accountId)
+    ) {
+      const error = new Error("账号状态已变化，请重新确认后再试");
+      error.code = "ACCOUNT_BOUNDARY_CHANGED";
       error.outcomeUncertain = false;
       throw error;
     }
-    return request(path, {
-      expectedApiBase: base,
-      method: normalizedMethod,
-      data,
-      header: {
-        "X-Write-Challenge": issued.challenge,
-        "Idempotency-Key": intent.key,
-      },
-    });
-  });
-  return operation.then(
-    (response) => {
-      clearWriteIntent(intent.fingerprint, intent.key);
-      return response;
-    },
-    (error) => {
-      if (!error || error.outcomeUncertain !== true) {
-        clearWriteIntent(intent.fingerprint, intent.key);
-      }
-      throw error;
-    },
-  );
-}
 
+    let intent;
+    try {
+      intent = writeIntent(base, establishedBoundary, normalizedMethod, path, data);
+    } catch (error) {
+      throw error;
+    }
+    const operation = request("/api/auth/write-challenges", {
+      expectedApiBase: base,
+      expectedAccountBoundary: establishedBoundary,
+      method: "POST",
+      data: { method: normalizedMethod, path, body: data == null ? null : data },
+    }).then(({ data: issued }) => {
+      if (issued.required_stages !== 1) {
+        const error = new Error("此操作需要额外人工确认，请在网页版完成");
+        error.outcomeUncertain = false;
+        throw error;
+      }
+      return request(path, {
+        expectedApiBase: base,
+        expectedAccountBoundary: establishedBoundary,
+        method: normalizedMethod,
+        data,
+        header: {
+          "X-Write-Challenge": issued.challenge,
+          "Idempotency-Key": intent.key,
+        },
+      });
+    });
+    return operation.then(
+      (response) => {
+        clearWriteIntent(intent.fingerprint, intent.key);
+        return response;
+      },
+      (error) => {
+        if (!error || error.outcomeUncertain !== true) {
+          clearWriteIntent(intent.fingerprint, intent.key);
+        }
+        throw error;
+      },
+    );
+  });
+}
 module.exports = { idempotencyKey, request, verifiedRequest };

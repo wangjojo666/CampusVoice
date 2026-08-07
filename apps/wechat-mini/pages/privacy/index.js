@@ -10,6 +10,8 @@ const {
   unloadPage,
 } = require("../../utils/page-lifecycle");
 
+const LOCAL_CONFIG_ERROR = "无法安全读取本地配置，请重试";
+
 let activeDeletionOperation = null;
 let deletionOperationSequence = 0;
 let pendingDeletionResult = null;
@@ -22,6 +24,7 @@ Page({
     deleting: false,
     message: "",
     error: "",
+    localStateError: "",
   },
 
   onShow() {
@@ -29,15 +32,36 @@ Page({
     visiblePrivacyPage = this;
     const result = pendingDeletionResult || {};
     pendingDeletionResult = null;
+    let configured = false;
+    let localStateError = "";
+    try {
+      configured = Boolean(configuredApiBase());
+    } catch (_error) {
+      localStateError = LOCAL_CONFIG_ERROR;
+    }
     this.setData(
       Object.assign(
         {
-          configured: Boolean(configuredApiBase()),
+          configured,
           deleting: activeDeletionOperation !== null,
+          message: "",
+          error: "",
+          localStateError,
         },
         result,
       ),
     );
+  },
+
+  retryLocalState() {
+    try {
+      this.setData({
+        configured: Boolean(configuredApiBase()),
+        localStateError: "",
+      });
+    } catch (_error) {
+      this.setData({ configured: false, localStateError: LOCAL_CONFIG_ERROR });
+    }
   },
 
   onHide() {

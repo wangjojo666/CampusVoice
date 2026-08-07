@@ -1,31 +1,52 @@
 <view class="page">
-  <view class="hero compact">
-    <view class="hero-kicker">NOTICE RADAR</view>
-    <view class="hero-title">校园通知雷达</view>
-    <view class="hero-copy">追踪通知版本、截止时间和对现有任务日程的影响。任何迁移仍需人工审核。</view>
+  <view class="page-header">
+    <view class="page-header-main">
+      <view class="page-kicker">NOTICES</view>
+      <view class="page-title" aria-role="heading">通知雷达</view>
+      <view class="page-subtitle">集中查看通知变化、截止时间和需要你确认的影响</view>
+    </view>
   </view>
 
-  <view wx:if="{{!configured}}" class="banner">配置 HTTPS 服务后显示与你相关的校园通知。</view>
-  <view wx:if="{{error}}" class="banner">{{error}}</view>
-  <view wx:if="{{loading}}" class="loading">正在扫描通知变化…</view>
+  <view wx:if="{{!configured && !error}}" class="state-strip warning-state" aria-label="服务尚未连接">
+    <view class="state-symbol" aria-hidden="true">!</view>
+    <view class="state-content"><view class="state-title">服务尚未连接</view><view class="state-copy">配置服务后即可同步与你相关的校园通知。</view></view>
+    <navigator class="state-action" url="/pages/settings/index" aria-label="前往设置页面配置服务">去设置</navigator>
+  </view>
+  <view wx:if="{{error}}" class="state-strip error-state" aria-label="通知加载失败：{{error}}" aria-live="assertive" aria-atomic="true">
+    <view class="state-symbol" aria-hidden="true">!</view>
+    <view class="state-content"><view class="state-title">暂时无法获取通知</view><view class="state-copy">{{error}}</view></view>
+    <button class="state-action error-retry" aria-label="重新加载通知" bindtap="retryLoad">重试</button>
+  </view>
+  <view wx:if="{{loading && !error}}" class="loading-state" aria-label="正在扫描通知变化" aria-live="polite" aria-atomic="true"><view class="loading-dot" aria-hidden="true"></view><text>正在扫描通知变化…</text></view>
 
   <view wx:elif="{{cards.length}}" class="notice-list">
     <view class="card notice-card {{item.needs_review ? 'review' : ''}}" wx:for="{{cards}}" wx:key="series_id">
-      <view class="row-between">
-        <view class="pill {{item.needs_review ? 'danger-pill' : ''}}">{{item.typeLabel}}</view>
+      <view class="notice-accent" aria-hidden="true"></view>
+      <view class="notice-meta">
+        <view class="notice-tags">
+          <view class="pill notice-type {{item.needs_review ? 'danger-pill' : ''}}">{{item.typeLabel}}</view>
+          <view wx:if="{{item.needs_review}}" class="review-chip" aria-label="该通知需要人工核对">需核对</view>
+        </view>
         <view class="muted time">{{item.createdText}}</view>
       </view>
       <view class="notice-title">{{item.title}}</view>
       <view class="notice-message">{{item.message}}</view>
       <view wx:if="{{item.changeSummary || item.impactSummary}}" class="meta-box">
-        <text wx:if="{{item.changeSummary}}">{{item.changeSummary}}</text>
-        <text wx:if="{{item.changeSummary && item.impactSummary}}"> · </text>
-        <text wx:if="{{item.impactSummary}}">{{item.impactSummary}}</text>
+        <view class="meta-label">变更影响</view>
+        <view class="meta-copy">
+          <text wx:if="{{item.changeSummary}}">{{item.changeSummary}}</text>
+          <text wx:if="{{item.changeSummary && item.impactSummary}}" class="meta-separator"> / </text>
+          <text wx:if="{{item.impactSummary}}">{{item.impactSummary}}</text>
+        </view>
       </view>
-      <view wx:if="{{item.deadlineText}}" class="deadline">截止：{{item.deadlineText}}</view>
-      <view wx:if="{{item.needs_review}}" class="review-note">需要在完整变更详情中人工核对后再执行。</view>
+      <view wx:if="{{item.deadlineText}}" class="deadline"><text class="deadline-label">截止</text><text class="deadline-value">{{item.deadlineText}}</text></view>
+      <view wx:if="{{item.needs_review}}" class="review-note"><text class="review-mark" aria-hidden="true">!</text><text>请先核对完整变更详情，再执行相关操作。</text></view>
     </view>
   </view>
 
-  <view wx:else class="card empty">{{configured ? '当前没有新的通知变化' : '服务配置后显示通知雷达'}}</view>
+  <view wx:elif="{{!error}}" class="card empty-state" aria-label="{{configured ? '当前没有新的通知变化' : '服务配置后显示通知'}}">
+    <view class="empty-symbol" aria-hidden="true">○</view>
+    <view class="empty-title">{{configured ? '暂时没有新变化' : '通知尚未同步'}}</view>
+    <view class="empty-copy">{{configured ? '有新的校园通知或截止时间变化时，会显示在这里。' : '完成服务配置后，这里会显示与你相关的通知。'}}</view>
+  </view>
 </view>

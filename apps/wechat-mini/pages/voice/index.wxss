@@ -1,83 +1,314 @@
 .voice-page {
   box-sizing: border-box;
   min-height: 100vh;
-  padding: 36rpx 28rpx calc(40rpx + env(safe-area-inset-bottom));
-  background: linear-gradient(180deg, #e9f5f4, #f6f9fa 46%);
+  padding: 34rpx 28rpx 48rpx;
+  padding: 34rpx 28rpx calc(48rpx + env(safe-area-inset-bottom));
+  background:
+    radial-gradient(circle at 88% 4%, rgba(255, 203, 129, 0.24), transparent 31%),
+    linear-gradient(180deg, #edf7f4 0%, #f7faf9 47%, #f4f7f6 100%);
 }
-.voice-panel {
+
+.voice-header {
+  margin: 6rpx 4rpx 28rpx;
+}
+
+.voice-title {
+  color: #153733;
+  font-size: 48rpx;
+  line-height: 1.18;
+  font-weight: 700;
+  letter-spacing: -1rpx;
+}
+
+.voice-subtitle {
+  max-width: 620rpx;
+  margin-top: 12rpx;
+  color: #526b66;
+  font-size: 26rpx;
+  line-height: 1.6;
+}
+
+.voice-note {
+  margin: 20rpx 0;
+}
+
+.voice-note .status-copy {
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+
+.voice-stage {
+  box-sizing: border-box;
+  margin-top: 24rpx;
+  padding: 30rpx 28rpx 32rpx;
+  border: 1rpx solid rgba(45, 94, 87, 0.1);
+  border-radius: 34rpx;
+  background: rgba(255, 255, 255, 0.86);
+  box-shadow: 0 18rpx 48rpx rgba(28, 69, 63, 0.09);
   text-align: center;
 }
-.hero-kicker.dark {
-  color: #007d6e;
+
+.voice-status {
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  max-width: 100%;
+  min-height: 54rpx;
+  padding: 8rpx 18rpx;
+  border-radius: 999rpx;
+  color: #526d67;
+  background: #edf4f2;
+  font-size: 24rpx;
+  line-height: 1.5;
 }
-.voice-title {
-  margin: 14rpx 0 8rpx;
-  font-size: 48rpx;
-  font-weight: 800;
+
+.voice-status > view:last-child {
+  min-width: 0;
+  overflow-wrap: break-word;
+  word-break: break-word;
 }
-.status {
-  min-height: 82rpx;
+
+.status-dot {
+  flex-shrink: 0;
+  width: 13rpx;
+  height: 13rpx;
+  border-radius: 50%;
+  margin-right: 12rpx;
+  background: #6d8b84;
 }
+
+.status-dot.recording {
+  background: #b54941;
+}
+
 .orb {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 270rpx;
-  height: 270rpx;
-  margin: 44rpx auto;
+  width: 286rpx;
+  height: 286rpx;
+  margin: 34rpx auto 38rpx;
   border-radius: 50%;
-  background: rgba(0, 125, 110, 0.1);
-  box-shadow: 0 0 0 28rpx rgba(0, 125, 110, 0.05);
 }
-.orb.active {
-  animation: pulse 1.4s ease-in-out infinite;
-  background: rgba(182, 61, 54, 0.14);
-  box-shadow: 0 0 0 28rpx rgba(182, 61, 54, 0.06);
+
+.orbit-ring {
+  position: absolute;
+  border-radius: 50%;
+  pointer-events: none;
 }
+
+.orbit-ring-outer {
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  border: 2rpx solid rgba(15, 135, 118, 0.14);
+  background: rgba(17, 151, 130, 0.04);
+}
+
+.orbit-ring-inner {
+  top: 30rpx;
+  right: 30rpx;
+  bottom: 30rpx;
+  left: 30rpx;
+  border: 2rpx solid rgba(15, 135, 118, 0.18);
+  background: rgba(17, 151, 130, 0.07);
+}
+
 .orb-core {
+  z-index: 1;
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 170rpx;
-  height: 170rpx;
+  width: 172rpx;
+  height: 172rpx;
   border-radius: 50%;
-  color: #fff;
-  background: #007d6e;
-  font-size: 54rpx;
-  font-weight: 900;
+  background: linear-gradient(145deg, #0a7065, #15a48c);
+  box-shadow:
+    0 18rpx 40rpx rgba(11, 118, 103, 0.27),
+    inset 0 2rpx 0 rgba(255, 255, 255, 0.25);
 }
+
+.waveform {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 74rpx;
+}
+
+.wave-bar {
+  width: 7rpx;
+  border-radius: 99rpx;
+  background: rgba(255, 255, 255, 0.94);
+}
+
+.wave-bar + .wave-bar {
+  margin-left: 8rpx;
+}
+
+.bar-one,
+.bar-seven {
+  height: 24rpx;
+}
+
+.bar-two,
+.bar-six {
+  height: 42rpx;
+}
+
+.bar-three,
+.bar-five {
+  height: 58rpx;
+}
+
+.bar-four {
+  height: 74rpx;
+}
+
+.orb.active {
+  animation: recording-pulse 1.5s ease-in-out infinite;
+}
+
+.orb.active .orbit-ring-outer {
+  border-color: rgba(181, 73, 65, 0.2);
+  background: rgba(181, 73, 65, 0.05);
+}
+
+.orb.active .orbit-ring-inner {
+  border-color: rgba(181, 73, 65, 0.24);
+  background: rgba(181, 73, 65, 0.08);
+}
+
 .orb.active .orb-core {
-  background: #b63d36;
+  background: linear-gradient(145deg, #a43e38, #cf6156);
+  box-shadow:
+    0 18rpx 42rpx rgba(169, 68, 61, 0.28),
+    inset 0 2rpx 0 rgba(255, 255, 255, 0.22);
 }
-.action {
-  width: 72%;
+
+.orb.active .wave-bar {
+  animation: recording-wave 0.9s ease-in-out infinite alternate;
 }
+
+.orb.active .bar-two,
+.orb.active .bar-six {
+  animation-delay: -0.18s;
+}
+
+.orb.active .bar-three,
+.orb.active .bar-five {
+  animation-delay: -0.36s;
+}
+
+.orb.active .bar-four {
+  animation-delay: -0.54s;
+}
+
+.voice-action {
+  width: 100%;
+  min-height: 88rpx;
+  margin: 0;
+}
+
+.voice-privacy {
+  display: flex;
+  align-items: flex-start;
+  margin: 22rpx 4rpx 0;
+  color: #526d67;
+  font-size: 23rpx;
+  line-height: 1.6;
+}
+
+.privacy-mark {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 34rpx;
+  height: 34rpx;
+  margin-top: 2rpx;
+  margin-right: 14rpx;
+  border-radius: 50%;
+  color: #ffffff;
+  background: #0c7a6c;
+  font-size: 20rpx;
+  font-weight: 700;
+}
+
 .transcript-card {
-  margin-top: 58rpx;
+  margin-top: 36rpx;
   padding: 28rpx;
+  border: 1rpx solid rgba(45, 94, 87, 0.1);
   border-radius: 28rpx;
-  background: #fff;
-  box-shadow: 0 10rpx 34rpx rgba(21, 57, 70, 0.08);
+  background: #ffffff;
+  box-shadow: 0 10rpx 34rpx rgba(21, 57, 70, 0.075);
 }
+
+.transcript-heading {
+  align-items: flex-start;
+}
+
 .transcript {
-  min-height: 160rpx;
+  min-height: 150rpx;
   margin-top: 24rpx;
-  line-height: 1.8;
+  color: #294b45;
+  font-size: 28rpx;
+  line-height: 1.85;
+  overflow-wrap: break-word;
   text-align: left;
+  word-break: break-word;
 }
-.error-box {
-  margin-top: 18rpx;
-  padding: 18rpx;
-  border-radius: 16rpx;
-  color: #9f2d28;
-  background: #ffebe9;
+
+.transcript.muted {
+  color: #607771;
 }
-@keyframes pulse {
+
+@keyframes recording-pulse {
   0%,
   100% {
     transform: scale(1);
   }
   50% {
-    transform: scale(1.04);
+    transform: scale(1.035);
+  }
+}
+
+@keyframes recording-wave {
+  from {
+    transform: scaleY(0.56);
+  }
+  to {
+    transform: scaleY(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .orb.active,
+  .orb.active .wave-bar {
+    animation: none;
+  }
+}
+
+@media (max-width: 360px) {
+  .voice-action {
+    min-height: 104rpx;
+  }
+
+  .voice-stage {
+    padding-right: 22rpx;
+    padding-left: 22rpx;
+  }
+
+  .orb {
+    width: 250rpx;
+    height: 250rpx;
+  }
+
+  .orb-core {
+    width: 152rpx;
+    height: 152rpx;
   }
 }
